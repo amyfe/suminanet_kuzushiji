@@ -3,6 +3,9 @@ A reasonably compact implementation to serve as encoder/decoder.
 """
 import torch
 import torch.nn as nn
+
+
+from .utils import make_gn
 import torch.nn.functional as F
 
 class ConvBlock(nn.Module):
@@ -10,10 +13,10 @@ class ConvBlock(nn.Module):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            make_gn(out_ch),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            make_gn(out_ch),
         )
         self.relu = nn.ReLU(inplace=True)
         self.residual_conv = None
@@ -39,15 +42,30 @@ class Down(nn.Module):
 class FusionBlock(nn.Module):
     def __init__(self, ch):
         super().__init__()
-        self.conv = nn.Conv2d(ch * 2, ch, 1, bias=False)
-        self.bn = nn.BatchNorm2d(ch)
+        # We don't know the incoming channel sizes for `high` and `low`
+        # at init time (they may differ). Create the 1x1 conv lazily
+        # on first forward pass based on the concatenated channel size.
+        self.conv: nn.Module | None = None
+        self.out_ch = ch
+        self.gn: nn.Module | None = None
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, high, low):
         # Upsample 'low' to same spatial size as 'high'
         low_up = F.interpolate(low, size=high.shape[2:], mode="bilinear", align_corners=False)
         fused = torch.cat([high, low_up], dim=1)
-        return self.conv(fused)
+        # create conv + gn lazily to handle differing input channel sizes
+        if self.conv is None:
+            in_ch = fused.size(1)
+            self.conv = nn.Conv2d(in_ch, self.out_ch, 1, bias=False)
+            self.gn = make_gn(self.out_ch)
+            # move created modules to the same device as fused
+            self.conv.to(fused.device)
+            self.gn.to(fused.device)
+        out = self.conv(fused)
+        assert self.gn is not None
+        out = self.gn(out)
+        return self.relu(out)
 
 
 class Up(nn.Module):

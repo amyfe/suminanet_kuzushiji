@@ -156,7 +156,14 @@ venv.bak/
 
 # checkpoint files and demo data
 .checkpoints/
+# demo data
 data/demo/
+
+# Local dataset folders (do not commit large data)
+assets/data/
+assets/data_preprocessed/
+data/
+data_preprocessed/
 # mypy
 .mypy_cache/
 .dmypy.json
@@ -208,3 +215,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+checkpoints/

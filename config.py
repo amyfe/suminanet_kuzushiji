@@ -4,7 +4,8 @@ from pathlib import Path
 
 # paths
 ROOT = Path(__file__).parent
-DATA_DIR = ROOT / "assets.data"
+DATA_DIR = ROOT / "assets/data"
+DATA_PREPROCESSED_DIR = ROOT / "assets/data_preprocessed"
 CHECKPOINT_DIR = ROOT / "checkpoints"
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 

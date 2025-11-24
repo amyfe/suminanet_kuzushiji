@@ -5,13 +5,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+from .utils import make_gn
+
+
 class DetectorHead(nn.Module):
     def __init__(self, in_ch, num_classes, extra_channels=64):
         super().__init__()
         # shared conv
         self.shared = nn.Sequential(
             nn.Conv2d(in_ch, extra_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(extra_channels),
+            make_gn(extra_channels),
             nn.ReLU(inplace=True),
         )
         # heatmap: per-class center heatmap (or single foreground map + classifier per-box)

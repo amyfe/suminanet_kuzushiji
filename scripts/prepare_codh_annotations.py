@@ -1,0 +1,162 @@
+"""
+prepare_codh_annotations.py
+---------------------------
+Konvertiert CODH Kuzushiji Datenstruktur in ein einheitliches JSON-Format:
+
+data_preprocessed/
+  ├── 100241706/
+  │   ├── images/
+  │   ├── characters/
+  │   └── 100241706_coordinate.csv
+  ├── 100241707/
+  └── ...
+
+Erzeugt:
+  data/annotations/<image>.json
+  data/label2id.json
+"""
+
+import pandas as pd
+import json
+import random
+import shutil
+from pathlib import Path
+from PIL import Image
+from config import DATA_DIR, DATA_PREPROCESSED_DIR
+from tqdm import tqdm
+
+OUTPUT_ANNOT_DIR = DATA_DIR / "annotations"
+OUTPUT_ANNOT_DIR.mkdir(exist_ok=True, parents=True)
+OUTPUT_IMAGES_DIR = DATA_DIR  # images will be copied into DATA_DIR/<book_id>/images
+OUTPUT_LABELS = DATA_DIR / "label2id.json"
+OUTPUT_ID2LABEL = DATA_DIR / "id2label.json"
+SPLITS_DIR = DATA_DIR / "splits"
+SPLITS_DIR.mkdir(exist_ok=True, parents=True)
+
+
+def process_book(book_dir: Path):
+    """Liest eine einzelne *_coordinate.csv und erzeugt JSON-Dateien für jedes Bild."""
+    csv_files = list(book_dir.glob("*_coordinate.csv"))
+    if not csv_files:
+        print(f"⚠️ No coordinate CSV found in {book_dir}, skipping.")
+        return set()
+
+    csv_path = csv_files[0]
+    df = pd.read_csv(csv_path)
+    print(f"📄 Processing {csv_path.name} with {len(df)} entries.")
+
+    required_cols = {"Unicode", "Image", "X", "Y", "Width", "Height"}
+    if not required_cols.issubset(df.columns):
+        raise ValueError(f"Missing important columns in {csv_path.name}")
+
+    all_labels = set()
+
+    for _, row in df.iterrows():
+        img_name_base = str(row["Image"]).strip()
+        img_dir = book_dir / "images"
+        # flexible Extension suchen
+        matches = list(img_dir.glob(f"{img_name_base}.*"))
+        if not matches:
+            print(f"⚠️ Image not found: {img_dir / img_name_base}, skipping.")
+            continue
+        img_path = matches[0]
+
+        # Copy image into DATA_DIR/<book_id>/images/
+        book_id = img_path.name.split("_")[0]
+        dest_img_dir = OUTPUT_IMAGES_DIR / book_id / "images"
+        dest_img_dir.mkdir(parents=True, exist_ok=True)
+        dest_img_path = dest_img_dir / img_path.name
+        if not dest_img_path.exists():
+            shutil.copy2(img_path, dest_img_path)
+
+        # load image to get size and clamp boxes
+        try:
+            with Image.open(dest_img_path) as im:
+                img_w, img_h = im.size
+        except Exception:
+            print(f"⚠️ Could not open image {dest_img_path}, skipping.")
+            continue
+
+        x_min = int(row["X"])
+        y_min = int(row["Y"])
+        width = int(row["Width"])
+        height = int(row["Height"])
+        x_max = x_min + width
+        y_max = y_min + height
+
+        # clamp to image bounds
+        x_min = max(0, x_min)
+        y_min = max(0, y_min)
+        x_max = min(img_w - 1, x_max)
+        y_max = min(img_h - 1, y_max)
+        if x_max <= x_min or y_max <= y_min:
+            # skip degenerate boxes
+            continue
+
+        label = str(row["Unicode"]).strip()
+        all_labels.add(label)
+
+        # JSON-Datei pro Bild (flat annotations dir)
+        annot_file = OUTPUT_ANNOT_DIR / (img_path.name.replace(img_path.suffix, ".json"))
+        if annot_file.exists():
+            with open(annot_file, "r", encoding="utf-8") as f:
+                annot = json.load(f)
+        else:
+            annot = {"boxes": [], "labels": [], "image_path": None}
+
+        annot["boxes"].append([x_min, y_min, x_max, y_max])
+        annot["labels"].append(label)
+        # store relative image path from DATA_DIR root: <book_id>/images/<image>
+        annot["image_path"] = str((book_id + "/images/" + img_path.name))
+
+        with open(annot_file, "w", encoding="utf-8") as f:
+            json.dump(annot, f, ensure_ascii=False, indent=2)
+
+    return all_labels
+
+
+def main():
+    all_labels = set()
+
+    # Alle Buch-Ordner durchsuchen
+    book_dirs = [d for d in DATA_PREPROCESSED_DIR.iterdir() if d.is_dir()]
+    print(f"📚 Found {len(book_dirs)} book directories.")
+
+    for book_dir in tqdm(book_dirs, desc="Processing books"):
+        book_labels = process_book(book_dir)
+        all_labels.update(book_labels)
+
+    # Label-Mapping speichern
+    label2id = {label: idx for idx, label in enumerate(sorted(all_labels))}
+    with open(OUTPUT_LABELS, "w", encoding="utf-8") as f:
+        json.dump(label2id, f, ensure_ascii=False, indent=2)
+
+    # also save id2label for convenience
+    id2label = {str(v): k for k, v in label2id.items()}
+    with open(OUTPUT_ID2LABEL, "w", encoding="utf-8") as f:
+        json.dump(id2label, f, ensure_ascii=False, indent=2)
+
+    # create a simple train/val split
+    ann_files = sorted([p.name for p in OUTPUT_ANNOT_DIR.glob("*.json")])
+    random.seed(42)
+    random.shuffle(ann_files)
+    train_frac = 0.9
+    split_idx = int(len(ann_files) * train_frac)
+    train_list = ann_files[:split_idx]
+    val_list = ann_files[split_idx:]
+
+    with open(SPLITS_DIR / "train.txt", "w", encoding="utf-8") as f:
+        for n in train_list:
+            f.write(n + "\n")
+    with open(SPLITS_DIR / "val.txt", "w", encoding="utf-8") as f:
+        for n in val_list:
+            f.write(n + "\n")
+
+    print(f"✅ Wrote splits: {len(train_list)} train, {len(val_list)} val to {SPLITS_DIR}")
+
+    print(f"\n✅ Saved {len(all_labels)} unique labels to: {OUTPUT_LABELS}")
+    print(f"✅ Annotations saved to: {OUTPUT_ANNOT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
