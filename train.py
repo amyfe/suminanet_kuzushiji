@@ -1,201 +1,246 @@
-"""
-Training script (lightweight CPU version).
-Reduziert Speicherverbrauch und stabilisiert Laufzeit für kleine Demos.
-"""
-
+# train_seq.py
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import torch.nn.functional as F
-import gc
-import json
-# faulthandler and anomaly detection are useful for debugging but noisy for regular runs
-
-from utils.common import seed_everything
-from utils import KuzushijiDataset
-from utils.losses import heatmap_loss, bbox_loss, class_loss, seq_loss
-#from utils.metrics import cer, compute_accuracy
-from utils.logger import TrainLogger, SimpleLogger
-from model.kuronet import UNet, DetectorHead, GlyphClassifier, SeqDecoder
-from config import DEVICE, NUM_EPOCHS, LR, WEIGHT_DECAY, CHECKPOINT_DIR, DATA_DIR
 from pathlib import Path
+from datetime import datetime
+import math
+import os
 
+# ---- imports from your repo (adjust paths if needed) ----
+from model.kuronet.unet import UNet
+from model.kuronet.encoder_wrapper import EncoderWrapper
+from model.kuronet.decoder.attention import SeqDecoderAttention
+from utils import KuzushijiDataset   # the corrected dataset
+from utils.vocab import VocabManager
+from config import DEVICE, NUM_EPOCHS, LR, WEIGHT_DECAY, CHECKPOINT_DIR, DATA_DIR, BATCH_SIZE, NUM_WORKERS
 
+# ---- Hyperparams you can tweak ----
+CTC_WARMUP_EPOCHS = 5   # set 0 to disable
+MAX_DECODING_LEN = 200  # fallback for decoder if needed
+GRAD_CLIP = 1.0
 
-def train():
-    seed_everything()
-    logger = SimpleLogger()
-    tlogger = TrainLogger()
-    # dynamic mapping for label strings -> ids
-    label2id: dict = {}
+# -----------------------------------------------------------------------------
+# Collate function (pads sequence with vocab.pad_id)
+# -----------------------------------------------------------------------------
+def collate_fn(batch, pad_id):
+    """
+    batch: list of samples from KuzushijiDataset
+    Each sample contains: image (Tensor), text_ids (optional Tensor), text_length
+    Returns dict with images, text_ids_padded, text_lengths
+    """
+    images = torch.stack([b["image"] for b in batch], dim=0)
+    # some samples may have no text (defensive); filter them
+    seq_samples = [b for b in batch if ("text_ids" in b and b["text_ids"] is not None)]
+    if len(seq_samples) == 0:
+        # return images only
+        return {"image": images, "text_ids": None, "text_lengths": torch.tensor([])}
+    text_ids = [b["text_ids"] for b in seq_samples]
+    text_lengths = torch.tensor([len(t) for t in text_ids], dtype=torch.long)
+    text_padded = nn.utils.rnn.pad_sequence(text_ids, batch_first=True, padding_value=pad_id)
+    return {"image": images, "text_ids": text_padded, "text_lengths": text_lengths}
 
-    # Auto-detect dataset root. Prefer prepared `data/` if present, else fall back to `data/demo`.
-    def find_dataset_root() -> Path:
-        # prefer explicit prepared dataset in config.DATA_DIR, then project-local data/demo
-        candidates = [Path(DATA_DIR), Path("data"), Path("data/demo"), Path("data/demo_data")]
-        for c in candidates:
-            images_dir = c / "images"
-            anns_dir = c / "annotations"
-            # accept candidate if annotations exist (images may be organized by book subfolders)
-            if anns_dir.exists() and any(anns_dir.glob('*.json')):
-                return c
-            if images_dir.exists() and anns_dir.exists():
-                return c
-        # if none found, raise informative error
-        raise FileNotFoundError("No dataset found. Expected 'images' and 'annotations' under one of: data/, data/demo/")
-
-    data_root = find_dataset_root()
-    print(f"Using dataset at: {data_root}")
-    print(f"Torch {torch.__version__}, device={DEVICE}")
-    # quick sanity counts (search images recursively because images are organized by book)
-    imgs = list((data_root).glob("**/*.jpg"))
-    anns = list((data_root / "annotations").glob("*.json"))
-    print(f"Found {len(imgs)} images and {len(anns)} annotations in {data_root}")
-
-    dataset = KuzushijiDataset(root_dir=str(data_root))
-    if len(dataset) == 0:
-        raise RuntimeError(f"No images found in dataset root {data_root}. Check your data layout.")
-    loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
-
-    # load label mapping if available so model sizes match the dataset
-    label2id_path = Path(data_root) / "label2id.json"
-    if label2id_path.exists():
-        with open(label2id_path, "r", encoding="utf-8") as f:
-            label2id = json.load(f)
-        print(f"Loaded label2id with {len(label2id)} classes from {label2id_path}")
+# -----------------------------------------------------------------------------
+# Scheduled teacher forcing ratio
+# -----------------------------------------------------------------------------
+def scheduled_teacher_forcing(epoch, total_epochs, start=1.0, end=0.1, schedule="exp"):
+    if schedule == "linear":
+        return max(end, start - (start-end) * (epoch / max(1, (total_epochs - 1))))
     else:
-        print("No label2id.json found in dataset root; using dataset-built mapping.")
+        decay = 0.97 ** epoch
+        return max(end, start * decay)
 
-    # set model class sizes according to label2id mapping
-    n_classes = len(label2id) if isinstance(label2id, dict) else 128
-    unet = UNet(in_channels=3, base_features=16).to(DEVICE)
-    detector = DetectorHead(in_ch=16, num_classes=n_classes).to(DEVICE)
-    classifier = GlyphClassifier(in_ch=3, n_classes=n_classes, base=16).to(DEVICE)
-    decoder = SeqDecoder(embed_dim=64, hidden_dim=128, vocab_size=n_classes).to(DEVICE)
+# -----------------------------------------------------------------------------
+# Helper to prepare CTC targets (remove padding, SOS/EOS)
+# -----------------------------------------------------------------------------
+def prepare_ctc_targets(text_ids_batch, pad_id, sos_id, eos_id, device):
+    """
+    text_ids_batch: (B, T_padded)
+    Returns:
+      targets_concat: 1D tensor with concatenated target sequences
+      target_lengths: 1D tensor len B_targets
+    If no valid targets -> returns (None, None)
+    """
+    B, T = text_ids_batch.shape
+    targets = []
+    target_lengths = []
+    for i in range(B):
+        ids = text_ids_batch[i]
+        # remove padding
+        ids = ids[ids != pad_id]
+        if ids.numel() == 0:
+            continue
+        # strip sos/eos if present
+        if ids[0].item() == sos_id:
+            ids = ids[1:]
+        if ids.numel() > 0 and ids[-1].item() == eos_id:
+            ids = ids[:-1]
+        if ids.numel() == 0:
+            continue
+        targets.append(ids)
+        target_lengths.append(ids.numel())
+    if len(targets) == 0:
+        return None, None
+    targets_concat = torch.cat(targets).to(device)
+    target_lengths = torch.tensor(target_lengths, dtype=torch.long, device=device)
+    return targets_concat, target_lengths
 
-    # --- Optimizer ---
-    optimizer = optim.AdamW(
-        list(unet.parameters()) +
-        list(detector.parameters()) +
-        list(classifier.parameters()) +
-        list(decoder.parameters()),
-        lr=LR,
-        weight_decay=WEIGHT_DECAY
-    )
-    print("Starting training...\n")
-    for epoch in range(NUM_EPOCHS):
-        logger.start_epoch(epoch)
-        unet.train(); detector.train(); classifier.train(); decoder.train()
-        total_loss = 0.0
-        num_batches = 0
-        for batch in loader:
-            num_batches += 1
-            print(f"Processing batch {num_batches}/{len(loader)} with {len(batch['image'])} images")
-            images = batch['image'].to(DEVICE)
-            optimizer.zero_grad()
+# -----------------------------------------------------------------------------
+# Smoke test utility: quick forward pass to validate shapes
+# -----------------------------------------------------------------------------
+def smoke_test(models, dataset, vocab, device, n_samples=2):
+    print("Running smoke test (small forward pass) ...")
+    unet, encoder, decoder, ctc_head = models
+    # take n_samples
+    loader = DataLoader(dataset, batch_size=n_samples, shuffle=False, collate_fn=lambda b: collate_fn(b, vocab.pad_id))
+    batch = next(iter(loader))
+    images = batch["image"].to(device)
+    text_ids = batch["text_ids"].to(device) if batch["text_ids"] is not None else None
 
-            # boxes/labels collate: DataLoader will produce list per batch for variable-length
-            raw_boxes = batch.get('boxes')
-            raw_labels = batch.get('labels')
-            if isinstance(raw_boxes, list):
-                boxes = raw_boxes[0].to(DEVICE)
-                labels = raw_labels[0]
-            else:
-                boxes = raw_boxes.to(DEVICE)
-                labels = raw_labels
+    with torch.no_grad():
+        feats2d, _ = encoder.backbone(images), None
+        # test encoder wrapper
+        enc_seq, enc_mask = encoder(images, orientation="horizontal")
+        print("enc_seq:", enc_seq.shape, "enc_mask:", enc_mask.shape)
+        # test ctc head
+        ctc_logits = ctc_head(enc_seq)  # (B, T, V)
+        print("ctc_logits:", ctc_logits.shape)
+        if text_ids is not None:
+            input_seq = text_ids[:, :-1]
+            targets = text_ids[:, 1:]
+            logits, hidden, attn = decoder(input_seq=input_seq, enc_outputs=enc_seq, enc_mask=enc_mask,
+                                           teacher_forcing_ratio=1.0, targets=targets, eos_id=vocab.eos_id)
+            print("decoder logits:", logits.shape, "attn:", None if attn is None else attn.shape)
+    print("smoke test finished successfully.\n")
 
-            # map label strings to ids using loaded mapping
-            label_ids = [label2id.get(lab, 0) for lab in labels]
+# -----------------------------------------------------------------------------
+# Main training function
+# -----------------------------------------------------------------------------
+def train():
+    # Build or load vocab
+    ann_files = sorted(list((Path(DATA_DIR) / "annotations").glob("*.json")))
+    if len(ann_files) == 0:
+        raise FileNotFoundError(f"No annotation files found in {Path(DATA_DIR)/'annotations'}")
+    vocab = VocabManager.from_annotations(ann_files)
+    pad_id = vocab.pad_id
+    sos_id = vocab.sos_id
+    eos_id = vocab.eos_id
+    vocab_size = vocab.vocab_size
 
-            # --- Forward ---
-            feats = unet(images)
-            out = detector(feats)
+    # Dataset + loader
+    dataset = KuzushijiDataset(Path(DATA_DIR), vocab=vocab, use_sequences=True, resize=(512,512))
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
+                            collate_fn=lambda b: collate_fn(b, pad_id))
 
-            # build targets at detector output resolution
-            B = images.size(0)
-            _, _, H_out, W_out = out['heatmap'].shape
-            _, _, H_in, W_in = images.shape
-            stride_h = float(H_in) / float(H_out)
-            stride_w = float(W_in) / float(W_out)
+    # Instantiate models
+    unet = UNet(in_channels=3, base_features=32).to(DEVICE)
+    encoder = EncoderWrapper(backbone=unet, in_channels=32, enc_dim=256).to(DEVICE)
+    decoder = SeqDecoderAttention(embed_dim=64, hidden_dim=256, vocab_size=vocab_size,
+                                  enc_dim=256, num_layers=1, init_from_encoder=True,
+                                  sampling_method="multinomial").to(DEVICE)
+    ctc_head = nn.Linear(256, vocab_size).to(DEVICE)  # persistent CTC head
 
-            # initialize targets
-            gt_heat = torch.zeros((B, 1, H_out, W_out), device=DEVICE)
-            gt_bbox = torch.zeros((B, 4, H_out, W_out), device=DEVICE)
-            gt_cls = torch.full((B, H_out, W_out), -1, dtype=torch.long, device=DEVICE)
+    # Optimizer (include ctc_head params)
+    opt_params = list(encoder.parameters()) + list(decoder.parameters()) + list(ctc_head.parameters())
+    optimizer = optim.AdamW(opt_params, lr=LR, weight_decay=WEIGHT_DECAY)
 
-            # simple gaussian heatmap at box centers + bbox regression at centers
-            for i in range(B):
-                if boxes is None or boxes.numel() == 0:
+    # Losses
+    ce_loss = nn.CrossEntropyLoss(ignore_index=pad_id)
+    ctc_loss_fn = nn.CTCLoss(blank=pad_id, zero_infinity=True)
+
+    # Smoke test once
+    smoke_test((unet, encoder, decoder, ctc_head), dataset, vocab, DEVICE)
+
+    # Optional CTC warmup
+    if CTC_WARMUP_EPOCHS > 0:
+        print("=== Starting CTC warmup ===")
+        for epoch in range(CTC_WARMUP_EPOCHS):
+            encoder.train()
+            total_loss = 0.0
+            n_batches = 0
+            for batch in dataloader:
+                if n_batches % 10 == 0:
+                    print(f"  CTC warmup epoch {epoch+1}, batch {n_batches}...")    
+                images = batch["image"].to(DEVICE)
+                text_ids = batch["text_ids"].to(DEVICE) if batch["text_ids"] is not None else None
+                if text_ids is None:
                     continue
-                # boxes for this image
-                bboxes = boxes if boxes.dim() == 2 else boxes[i]
-                labs = label_ids
-                for (box, lab) in zip(bboxes, labs):
-                    x1, y1, x2, y2 = box.tolist()
-                    cx = (x1 + x2) / 2.0 / stride_w
-                    cy = (y1 + y2) / 2.0 / stride_h
-                    # clamp within grid
-                    if cx < 0 or cy < 0 or cx >= W_out or cy >= H_out:
-                        continue
-                    ix = int(cx)
-                    iy = int(cy)
-                    # gaussian sigma proportional to box size (in output grid units)
-                    bw = max((x2 - x1) / stride_w, 1.0)
-                    bh = max((y2 - y1) / stride_h, 1.0)
-                    sigma = max(1.0, 0.25 * (bw + bh) / 2.0)
-                    # draw gaussian
-                    yy = torch.arange(0, H_out, device=DEVICE).view(H_out, 1).float()
-                    xx = torch.arange(0, W_out, device=DEVICE).view(1, W_out).float()
-                    g = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma * sigma))
-                    gt_heat[i, 0] = torch.max(gt_heat[i, 0], g)
-                    # bbox targets in output-grid units
-                    dx = cx - ix
-                    dy = cy - iy
-                    gw = bw
-                    gh = bh
-                    gt_bbox[i, :, iy, ix] = torch.tensor([dx, dy, gw, gh], device=DEVICE)
-                    gt_cls[i, iy, ix] = lab
 
-            # compute losses
-            loss_h = F.mse_loss(out['heatmap'], gt_heat)
-            loss_b = F.l1_loss(out['bbox'], gt_bbox)
-            # per-pixel class loss: flatten valid positions
-            logits = out['cls'].permute(0, 2, 3, 1).reshape(-1, out['cls'].shape[1])
-            labels_flat = gt_cls.reshape(-1)
-            valid = labels_flat >= 0
-            if valid.sum() > 0:
-                loss_c = F.cross_entropy(logits[valid], labels_flat[valid])
+                optimizer.zero_grad()
+                enc_seq, enc_mask = encoder(images, orientation="horizontal")
+                logits = ctc_head(enc_seq)  # (B, T, V)
+                log_probs = logits.log_softmax(dim=-1).permute(1,0,2).contiguous()  # (T,B,V)
+
+                targets_concat, target_lengths = prepare_ctc_targets(text_ids, pad_id, sos_id, eos_id, DEVICE)
+                if targets_concat is None:
+                    continue
+                input_lengths = torch.full((enc_seq.size(0),), fill_value=enc_seq.size(1), dtype=torch.long, device=DEVICE)
+
+                loss = ctc_loss_fn(log_probs, targets_concat, input_lengths, target_lengths)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), GRAD_CLIP)
+                torch.nn.utils.clip_grad_norm_(ctc_head.parameters(), GRAD_CLIP)
+                optimizer.step()
+
+                total_loss += loss.item()
+                n_batches += 1
+
+            if n_batches > 0:
+                print(f"CTC epoch {epoch+1}/{CTC_WARMUP_EPOCHS} avg_loss={total_loss/n_batches:.4f}")
             else:
-                loss_c = torch.tensor(0.0, device=DEVICE)
+                print(f"CTC epoch {epoch+1}: no valid targets found")
 
-            loss = loss_h + loss_b + loss_c
+    # Main attention training
+    print("=== Starting attention training ===")
+    for epoch in range(NUM_EPOCHS):
+        encoder.train(); decoder.train()
+        tf_ratio = scheduled_teacher_forcing(epoch, NUM_EPOCHS, start=1.0, end=0.1, schedule="exp")
+        total_loss = 0.0
+        n_batches = 0
+        for batch in dataloader:
+            images = batch["image"].to(DEVICE)
+            text_ids = batch["text_ids"].to(DEVICE) if batch["text_ids"] is not None else None
+            if text_ids is None:
+                continue
+
+            input_seq = text_ids[:, :-1]
+            targets = text_ids[:, 1:]
+
+            optimizer.zero_grad()
+            enc_outputs, enc_mask = encoder(images, orientation="horizontal")
+            logits, hidden, attn = decoder(input_seq=input_seq, enc_outputs=enc_outputs, enc_mask=enc_mask,
+                                           teacher_forcing_ratio=tf_ratio, targets=targets, eos_id=eos_id)
+            B, T_dec, V = logits.shape
+            # Flatten for CE: (B*T, V) vs (B*T)
+            loss = ce_loss(logits.reshape(-1, V), targets.reshape(-1))
             loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), GRAD_CLIP)
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), GRAD_CLIP)
             optimizer.step()
+
             total_loss += loss.item()
-            del loss, images, feats, out, gt_heat, gt_bbox, gt_cls
+            n_batches += 1
 
-        # Nur alle paar Epochen speichern (spart Speicher)
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == NUM_EPOCHS:
-            ckpt_path = CHECKPOINT_DIR / f"checkpoint_epoch{epoch+1}.pt"
-            torch.save({
-                'unet': unet.state_dict(),
-                'detector': detector.state_dict(),
-                'classifier': classifier.state_dict(),
-                'decoder': decoder.state_dict(),
-                'optimizer': optimizer.state_dict(),
-            }, ckpt_path)
-            print(f"✅ Checkpoint saved: {ckpt_path.name}\n")
-        out_path = CHECKPOINT_DIR / f"epoch{epoch+1}_pred.png"
-        # Ensure parent directory exists
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        tlogger.log(total_loss, 0.0)
-        tlogger.save_plot(out_path=str(out_path))
-        #Garbage Collection
-        gc.collect()
-        torch.cuda.empty_cache()
+        avg_loss = (total_loss / n_batches) if n_batches > 0 else 0.0
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS} TF={tf_ratio:.3f} AvgLoss={avg_loss:.4f}")
 
-    print("Training completed successfully.")
+        # Save checkpoint
+        ckpt_dir = Path(CHECKPOINT_DIR)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_dir / f"att_epoch{epoch+1}.pt"
+        torch.save({
+            'epoch': epoch+1,
+            'encoder': encoder.state_dict(),
+            'decoder': decoder.state_dict(),
+            'ctc_head': ctc_head.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'vocab': vocab.char2id,
+        }, ckpt_path)
+        print(f"Saved checkpoint: {ckpt_path}")
 
+    print("Training finished.")
 
 if __name__ == "__main__":
     train()

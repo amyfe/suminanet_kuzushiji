@@ -12,9 +12,9 @@ CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 # training
 DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-BATCH_SIZE = 4
-NUM_WORKERS = 4
-NUM_EPOCHS = 2 #TODO: erhöhen
+BATCH_SIZE = 2
+NUM_WORKERS = 0
+NUM_EPOCHS = 1 #TODO: erhöhen
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
 

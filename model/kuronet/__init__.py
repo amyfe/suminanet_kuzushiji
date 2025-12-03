@@ -1,13 +1,15 @@
-"""kuronet subpackage exports."""
-from .unet import UNet
-from .detector import DetectorHead
-from .classifier import GlyphClassifier
-from .decoder import SeqDecoder
+"""kuronet subpackage exports.
 
-__all__ = ["UNet", "DetectorHead", "GlyphClassifier", "SeqDecoder"]
-from .unet import UNet
-from .detector import DetectorHead
-from .classifier import GlyphClassifier
-from .decoder import SeqDecoder
+For attention-based transcription, you need:
+- UNet (backbone)
+- EncoderWrapper (wraps UNet for sequence tasks)
+- decoder.attention.SeqDecoderAttention
 
-__all__ = ["UNet", "DetectorHead", "GlyphClassifier", "SeqDecoder"]
+DetectorHead and GlyphClassifier are kept for detection tasks if needed.
+"""
+from .unet import UNet
+from .encoder_wrapper import EncoderWrapper
+from .detector import DetectorHead
+
+__all__ = ["UNet", "EncoderWrapper", "DetectorHead"]
+    

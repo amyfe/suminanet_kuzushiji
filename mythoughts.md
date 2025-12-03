@@ -12,6 +12,17 @@ source venv/Scripts/activate
 | **Evaluation (CER/WER)**      | 🔴 fehlt       | Metriken hinzufügen                     |
 | **End-to-End-Inference**      | 🔴 fehlt       | `translate.py`-Pipeline                 |
 
+1. UNet:
+liefert Feature Maps → benötigt für Detection UND Klassifikation
+2. DetectorHead:
+Heatmaps für Zentren
+BBox-Regression
+Per-Zelle Klassen-ID
+3. GlyphClassifier
+klassifiziert das ausgeschnittene Zeichen
+4. SeqDecoder
+bildet eine Sequenz (japanische Lesereihenfolge)
+→ finaler „Textausgabe-Generator“
 
 # Struktur von den Files
 Für Transkription braucht man drei Dinge:
@@ -158,3 +169,64 @@ Training wird modular ausgeführt – du kannst z. B. erst Detector pretrainen, 
 Warum:
 Zur Validierung und für quantitative Tests (mAP, CER, Top-k).
 Wird nach jedem Epoch-Checkpoint ausgeführt.
+
+### Architekturentscheidungen:
+① Feature-Extractor: ResNet, FusionNet oder etwas eigenes?
+Optionen:
+A. ResNet-18 / 34 (empfohlen für Thesis)
+
+stabil
+
+gut dokumentiert
+
+leicht modifizierbar
+
+Multi-scale möglich
+
+B. FusionNet (wie KuroNet)
+
+kombiniert 3 Scales → bessere Erkennung kleiner Kuzushiji
+
+aber deutlich komplexer
+
+schwieriger zu erklären in Thesis
+
+② Normalisierung: BatchNorm oder GroupNorm?
+
+Wie du schon richtig gesagt hast:
+
+Clanuwat et al. → GroupNorm
+weil:
+
+kleine Batchsizes (1–4)
+
+BatchNorm kollabiert da
+
+GroupNorm batchunabhängig → stabil
+
+③ Kontextmodellierung: LSTM oder ConvLSTM?
+
+KuroNet benutzt bi-directional ConvLSTM, weil:
+
+Textzellen hängen horizontal UND vertikal zusammen
+
+ConvLSTM behält räumliche Struktur
+
+besser für historisches/verschobenes Kursive-Kuzushiji
+
+Optionen:
+
+ConvLSTM (wie KuroNet)
+
+Transformer Encoder (moderner, aber schwerer zu begründen)
+
+reine CNNs (zu schwach)
+
+④ Decoder: CTC oder Attention-Decoder?
+Kuzushiji OCR: CTC klar besser, weil:
+
+keine sauber segmentierten Zeichen
+
+keine exakte bounding box Reihenfolge
+
+CTC ist de-facto Standard
