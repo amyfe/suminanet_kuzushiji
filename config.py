@@ -26,6 +26,19 @@ NUM_CLASSES = 3000 # adjust to Kuzushiji label count
 DETECTOR_HEATMAP_SIGMA = 2
 
 
+# training modes (choose one or both for comparison)
+USE_DETECTOR_HEAD = False  # Option 1: Traditional detection (heatmap + bbox regression)
+USE_ROI_ATTENTION = True   # Option 2: Predict boxes from attention patterns
+DETECTION_LOSS_WEIGHT = 1.0  # Weight for detection losses
+ROI_BOX_LOSS_WEIGHT = 0.5    # Weight for ROI box loss
+
+
+# validation (optional during training)
+RUN_VALIDATION = True       # Whether to run validation during training
+VALIDATION_FREQ = 1         # Validate every N epochs
+VALIDATION_BATCHES = 50     # Max batches per validation (set to None for full validation)
+
+
 # teacher forcing
 TEACHER_FORCING_PROB = 0.5
 

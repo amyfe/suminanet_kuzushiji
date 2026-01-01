@@ -9,31 +9,39 @@ from .utils import make_gn
 
 
 class DetectorHead(nn.Module):
-    def __init__(self, in_ch, num_classes, extra_channels=64):
+    def __init__(self, in_ch, num_classes, extra_channels=64, predict_boxes=True):
         super().__init__()
+        self.predict_boxes = predict_boxes
+        
         # shared conv
         self.shared = nn.Sequential(
             nn.Conv2d(in_ch, extra_channels, kernel_size=3, padding=1),
             make_gn(extra_channels),
             nn.ReLU(inplace=True),
         )
-        # heatmap: per-class center heatmap (or single foreground map + classifier per-box)
-        self.heatmap = nn.Conv2d(extra_channels, 1, kernel_size=1)
-        # bbox regression (dx,dy,w,h)
-        self.bbox = nn.Conv2d(extra_channels, 4, kernel_size=1)
+        
+        if predict_boxes:
+            # heatmap: per-class center heatmap (or single foreground map + classifier per-box)
+            self.heatmap = nn.Conv2d(extra_channels, 1, kernel_size=1)
+            # bbox regression (dx,dy,w,h)
+            self.bbox = nn.Conv2d(extra_channels, 4, kernel_size=1)
+        
         # classification logits (per-pixel class logits if desired), here we do a small per-box classifier instead
         self.cls_logits = nn.Conv2d(extra_channels, num_classes, kernel_size=1)
 
     def forward(self, feat):
         x = self.shared(feat)
-        heat = torch.sigmoid(self.heatmap(x))
-        bbox = self.bbox(x)  # raw regression
         cls = self.cls_logits(x)  # per-pixel class logits
-        return {
-            'heatmap': heat,
-            'bbox': bbox,
-            'cls': cls,
-        }
+        
+        result = {'cls': cls}
+        
+        if self.predict_boxes:
+            heat = torch.sigmoid(self.heatmap(x))
+            bbox = self.bbox(x)  # raw regression
+            result['heatmap'] = heat
+            result['bbox'] = bbox
+        
+        return result
 
 
 # helper losses (simple versions)

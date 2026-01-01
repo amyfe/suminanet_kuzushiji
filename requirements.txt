@@ -21,3 +21,6 @@ cv2-python>=4.8.0
 
 #Progress bar
 tqdm>=4.66.0
+
+#Translation
+anthropic>=3.3.0
