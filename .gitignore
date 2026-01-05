@@ -161,9 +161,7 @@ data/demo/
 
 # Local dataset folders (do not commit large data)
 assets/data/
-assets/data_preprocessed/
 data/
-data_preprocessed/
 # mypy
 .mypy_cache/
 .dmypy.json
