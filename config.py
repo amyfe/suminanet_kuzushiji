@@ -9,14 +9,26 @@ DATA_PREPROCESSED_DIR = ROOT / "assets/data_preprocessed"
 CHECKPOINT_DIR = ROOT / "checkpoints"
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 
+# For validation and testing, exclude some books
+EXCLUDE_BOOKS = {
+    "200021925",
+    "200022050",
+    "200025191",
+    "umgy00000",
+}
 
 # training
 DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-BATCH_SIZE = 2
-NUM_WORKERS = 0
-NUM_EPOCHS = 1 #TODO: erhöhen
-LR = 1e-4
+BATCH_SIZE = 4
+GRADIENT_ACCUMULATION_STEPS = 2
+NUM_WORKERS = 2  
+NUM_EPOCHS = 20 
+LR = 5e-4
 WEIGHT_DECAY = 1e-5
+GRAD_CLIP = 1.0  # Gradient clipping threshold
+
+# images
+IMAGE_SIZE = (512, 512)  # (H, W) centralized resize for training/validation
 
 
 # model
@@ -27,10 +39,13 @@ DETECTOR_HEATMAP_SIGMA = 2
 
 
 # training modes (choose one or both for comparison)
-USE_DETECTOR_HEAD = False  # Option 1: Traditional detection (heatmap + bbox regression)
-USE_ROI_ATTENTION = True   # Option 2: Predict boxes from attention patterns
-DETECTION_LOSS_WEIGHT = 1.0  # Weight for detection losses
-ROI_BOX_LOSS_WEIGHT = 0.5    # Weight for ROI box loss
+# Option 1
+USE_DETECTOR_HEAD = False
+DETECTION_LOSS_WEIGHT = 1.0
+# Option 2: Predict boxes from attention patterns
+USE_ROI_ATTENTION = True  
+USE_MIXED_PRECISION = True
+ROI_BOX_LOSS_WEIGHT = 0.1    
 
 
 # validation (optional during training)

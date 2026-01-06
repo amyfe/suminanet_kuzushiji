@@ -20,8 +20,12 @@ import pandas as pd
 import json
 import random
 import shutil
+import sys
 from pathlib import Path
 from PIL import Image
+
+# Add parent directory to path to import config
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import DATA_DIR, DATA_PREPROCESSED_DIR
 from tqdm import tqdm
 

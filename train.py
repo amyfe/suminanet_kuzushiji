@@ -3,30 +3,64 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import torch.amp as amp
 from pathlib import Path
-from datetime import datetime
-import math
-import os
 
-# ---- imports from your repo (adjust paths if needed) ----
 from model.kuronet.unet import UNet
 from model.kuronet.encoder_wrapper import EncoderWrapper
 from model.kuronet import DetectorHead
 from model.kuronet.decoder.attention import SeqDecoderAttention
-from utils import KuzushijiDataset   # the corrected dataset
+from utils import KuzushijiDataset
 from utils.vocab import VocabManager
-from utils.detection_utils import build_detection_targets, compute_detection_losses, compute_roi_box_loss
+from utils.detection_utils import build_detection_targets, compute_detection_losses, compute_roi_box_loss, compute_roi_align_loss
 from utils.validation import validate
 from config import (DEVICE, NUM_EPOCHS, LR, WEIGHT_DECAY, CHECKPOINT_DIR, DATA_DIR, BATCH_SIZE, NUM_WORKERS,
                     USE_DETECTOR_HEAD, USE_ROI_ATTENTION, DETECTION_LOSS_WEIGHT, ROI_BOX_LOSS_WEIGHT,
-                    NUM_CLASSES, DETECTOR_HEATMAP_SIGMA, RUN_VALIDATION, VALIDATION_FREQ, VALIDATION_BATCHES)
+                    NUM_CLASSES, DETECTOR_HEATMAP_SIGMA, RUN_VALIDATION, VALIDATION_FREQ, VALIDATION_BATCHES,
+                    GRADIENT_ACCUMULATION_STEPS, USE_MIXED_PRECISION, GRAD_CLIP, IMAGE_SIZE)
 
-# ---- Hyperparams you can tweak ----
-CTC_WARMUP_EPOCHS = 5   # set 0 to disable
+CTC_WARMUP_EPOCHS = 0  
 MAX_DECODING_LEN = 200  # fallback for decoder if needed
-GRAD_CLIP = 1.0
 
-# ---- Collate function (pads sequence with vocab.pad_id) ----
+def prune_existing_checkpoints(ckpt_dir: Path, old_name: str = "checkpoint_old.pt"):
+    """At start: keep only the newest checkpoint, rename it to old_name."""
+    ckpts = sorted(ckpt_dir.glob("*.pt"), key=lambda p: p.stat().st_mtime)
+    if not ckpts:
+        return
+    newest = ckpts[-1]
+    for p in ckpts[:-1]:
+        try:
+            p.unlink()
+        except Exception as exc:  # best-effort cleanup
+            print(f"Warning: could not delete {p}: {exc}")
+    target = ckpt_dir / old_name
+    if newest == target:
+        return
+    if target.exists():
+        try:
+            target.unlink()
+        except Exception:
+            pass
+    try:
+        newest.rename(target)
+        print(f"Preserved latest checkpoint as {target.name}")
+    except Exception as exc:
+        print(f"Warning: could not rename {newest} to {target}: {exc}")
+
+
+def prune_to_keep_last_n(ckpt_dir: Path, keep: int = 2, exclude: str = "checkpoint_old.pt"):
+    """Keep only the newest N checkpoints (excluding a preserved old file)."""
+    ckpts = [p for p in ckpt_dir.glob("*.pt") if p.name != exclude]
+    ckpts = sorted(ckpts, key=lambda p: p.stat().st_mtime)
+    if len(ckpts) <= keep:
+        return
+    to_delete = ckpts[:-keep]
+    for p in to_delete:
+        try:
+            p.unlink()
+        except Exception as exc:
+            print(f"Warning: could not delete old checkpoint {p}: {exc}")
+
 def collate_fn(batch, pad_id):
     """
     batch: list of samples from KuzushijiDataset
@@ -52,8 +86,7 @@ def collate_fn(batch, pad_id):
     return {"image": images, "text_ids": text_padded, "text_lengths": text_lengths,
             "boxes": boxes, "labels": labels}
 
-# ---- Scheduled teacher forcing ratio ----
-def scheduled_teacher_forcing(epoch, total_epochs, start=1.0, end=0.1, schedule="exp"):
+def scheduled_teacher_forcing(epoch, total_epochs, start=1.0, end=0.2, schedule="exp"):
     if schedule == "linear":
         return max(end, start - (start-end) * (epoch / max(1, (total_epochs - 1))))
     else:
@@ -114,8 +147,15 @@ def smoke_test(models, dataset, vocab, device, n_samples=2):
         if text_ids is not None:
             input_seq = text_ids[:, :-1]
             targets = text_ids[:, 1:]
-            decoder_out = decoder(input_seq=input_seq, enc_outputs=enc_seq, enc_mask=enc_mask,
-                                   teacher_forcing_ratio=1.0, targets=targets, eos_id=vocab.eos_id)
+            decoder_out = decoder(
+                input_seq=input_seq,
+                enc_outputs=enc_seq,
+                enc_mask=enc_mask,
+                teacher_forcing_ratio=1.0,
+                targets=targets,
+                eos_id=vocab.eos_id,
+                image_size=(images.shape[2], images.shape[3]),
+            )
             if len(decoder_out) == 4:
                 logits, hidden, attn, predicted_boxes = decoder_out
                 print("decoder logits:", logits.shape, "attn:", None if attn is None else attn.shape,
@@ -137,10 +177,15 @@ def train():
     eos_id = vocab.eos_id
     vocab_size = vocab.vocab_size
 
+    # Clean up existing checkpoints: keep only newest, rename to checkpoint_old.pt
+    ckpt_dir = Path(CHECKPOINT_DIR)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    prune_existing_checkpoints(ckpt_dir)
+
     # Dataset + loader
-    dataset = KuzushijiDataset(Path(DATA_DIR), vocab=vocab, use_sequences=True, resize=(512,512))
+    dataset = KuzushijiDataset(Path(DATA_DIR), vocab=vocab, use_sequences=True, resize=IMAGE_SIZE)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
-                            collate_fn=lambda b: collate_fn(b, pad_id))
+                            collate_fn=lambda b: collate_fn(b, pad_id), pin_memory=True)
 
     # Instantiate models
     unet = UNet(in_channels=3, base_features=32).to(DEVICE)
@@ -156,7 +201,7 @@ def train():
         detector = DetectorHead(in_ch=32, num_classes=NUM_CLASSES, predict_boxes=True).to(DEVICE)
         print(f"Using DetectorHead for box prediction (Option 1)")
     
-    # Report training mode
+    # Report training mode (Option 2)
     if USE_ROI_ATTENTION:
         print(f"Using ROI attention for box prediction (Option 2)")
     if not USE_DETECTOR_HEAD and not USE_ROI_ATTENTION:
@@ -167,6 +212,12 @@ def train():
     if detector is not None:
         opt_params += list(detector.parameters())
     optimizer = optim.AdamW(opt_params, lr=LR, weight_decay=WEIGHT_DECAY)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+    
+    # Mixed precision training
+    scaler = amp.GradScaler() if USE_MIXED_PRECISION else None
 
     # Losses
     ce_loss = nn.CrossEntropyLoss(ignore_index=pad_id)
@@ -182,31 +233,49 @@ def train():
             encoder.train()
             total_loss = 0.0
             n_batches = 0
-            for batch in dataloader:
-                if n_batches % 10 == 0:
-                    print(f"  CTC warmup epoch {epoch+1}, batch {n_batches}...")    
+            for batch_idx, batch in enumerate(dataloader):
+                if batch_idx % 10 == 0:
+                    print(f"  CTC warmup epoch {epoch+1}, batch {batch_idx}...")    
                 images = batch["image"].to(DEVICE)
                 text_ids = batch["text_ids"].to(DEVICE) if batch["text_ids"] is not None else None
                 if text_ids is None:
                     continue
 
-                optimizer.zero_grad()
-                enc_seq, enc_mask = encoder(images, orientation="horizontal")
-                logits = ctc_head(enc_seq)  # (B, T, V)
-                log_probs = logits.log_softmax(dim=-1).permute(1,0,2).contiguous()  # (T,B,V)
+                # Forward pass with mixed precision
+                with amp.autocast(device_type="cuda", enabled=USE_MIXED_PRECISION):
+                    enc_seq, enc_mask = encoder(images, orientation="horizontal")
+                    logits = ctc_head(enc_seq)  # (B, T, V)
+                    log_probs = logits.log_softmax(dim=-1).permute(1,0,2).contiguous()  # (T,B,V)
 
-                targets_concat, target_lengths = prepare_ctc_targets(text_ids, pad_id, sos_id, eos_id, DEVICE)
-                if targets_concat is None:
-                    continue
-                input_lengths = torch.full((enc_seq.size(0),), fill_value=enc_seq.size(1), dtype=torch.long, device=DEVICE)
+                    targets_concat, target_lengths = prepare_ctc_targets(text_ids, pad_id, sos_id, eos_id, DEVICE)
+                    if targets_concat is None:
+                        continue
+                    input_lengths = torch.full((enc_seq.size(0),), fill_value=enc_seq.size(1), dtype=torch.long, device=DEVICE)
 
-                loss = ctc_loss_fn(log_probs, targets_concat, input_lengths, target_lengths)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(encoder.parameters(), GRAD_CLIP)
-                torch.nn.utils.clip_grad_norm_(ctc_head.parameters(), GRAD_CLIP)
-                optimizer.step()
+                    loss = ctc_loss_fn(log_probs, targets_concat, input_lengths, target_lengths)
+                    loss = loss / GRADIENT_ACCUMULATION_STEPS  # Scale loss
+                
+                # Backward pass
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                
+                # Optimizer step with gradient accumulation
+                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(encoder.parameters(), GRAD_CLIP)
+                    torch.nn.utils.clip_grad_norm_(ctc_head.parameters(), GRAD_CLIP)
+                    
+                    if scaler is not None:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad()
 
-                total_loss += loss.item()
+                total_loss += loss.item() * GRADIENT_ACCUMULATION_STEPS
                 n_batches += 1
 
             if n_batches > 0:
@@ -228,7 +297,7 @@ def train():
         total_roi_loss = 0.0
         n_batches = 0
         
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             images = batch["image"].to(DEVICE)
             text_ids = batch["text_ids"].to(DEVICE) if batch["text_ids"] is not None else None
             boxes = batch["boxes"]
@@ -240,85 +309,133 @@ def train():
             input_seq = text_ids[:, :-1]
             targets = text_ids[:, 1:]
 
-            optimizer.zero_grad()
-            
-            # Get UNet features for detection if needed
-            feats2d = None
-            if detector is not None:
-                feats2d = unet(images)
-            
-            enc_outputs, enc_mask = encoder(images, orientation="horizontal")
-            
-            # Decoder forward (now returns 4-tuple with predicted_boxes)
-            decoder_output = decoder(input_seq=input_seq, enc_outputs=enc_outputs, enc_mask=enc_mask,
-                                    teacher_forcing_ratio=tf_ratio, targets=targets, eos_id=eos_id)
-            
-            # Handle both 3-tuple (old) and 4-tuple (new with predicted_boxes)
-            if len(decoder_output) == 4:
-                logits, hidden, attn, predicted_boxes = decoder_output
-            else:
-                logits, hidden, attn = decoder_output
-                predicted_boxes = None
-            
-            B, T_dec, V = logits.shape
-            
-            # Sequence loss
-            loss_seq = ce_loss(logits.reshape(-1, V), targets.reshape(-1))
-            loss = loss_seq
-            total_seq_loss += loss_seq.item()
-            
-            # Detection loss (Option 1: DetectorHead)
-            if detector is not None and feats2d is not None:
-                det_pred = detector(feats2d)
-                H_out, W_out = det_pred['cls'].shape[2:]
-                gt_heatmap, gt_bbox, gt_cls = build_detection_targets(
-                    boxes, labels, (H_out, W_out), (512, 512), DEVICE, sigma=DETECTOR_HEATMAP_SIGMA
-                )
-                loss_det, (l_heat, l_bbox, l_cls) = compute_detection_losses(
-                    det_pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.0, 1.0)
-                )
-                loss = loss + DETECTION_LOSS_WEIGHT * loss_det
-                total_det_loss += loss_det.item()
-            
-            # ROI box loss (Option 2: attention-based boxes)
-            if USE_ROI_ATTENTION and predicted_boxes is not None:
-                # Convert boxes list to padded tensor
-                gt_boxes_padded = []
-                max_boxes = max(b.shape[0] for b in boxes)
-                for box_tensor in boxes:
-                    if box_tensor.numel() == 0:
-                        box_tensor = torch.zeros((1, 4), device=DEVICE)
-                    pad_size = max_boxes - box_tensor.shape[0]
-                    if pad_size > 0:
-                        box_tensor = torch.cat([
-                            box_tensor.to(DEVICE),
-                            torch.zeros((pad_size, 4), device=DEVICE)
-                        ], dim=0)
-                    gt_boxes_padded.append(box_tensor)
-                gt_boxes_batch = torch.stack(gt_boxes_padded, dim=0)  # (B, N, 4)
+            # Forward pass with mixed precision
+            with amp.autocast(device_type="cuda", enabled=USE_MIXED_PRECISION):
+                # Get UNet features for detection if needed
+                feats2d = None
+                if detector is not None:
+                    feats2d = unet(images)
                 
-                loss_roi = compute_roi_box_loss(predicted_boxes, gt_boxes_batch)
-                loss = loss + ROI_BOX_LOSS_WEIGHT * loss_roi
-                total_roi_loss += loss_roi.item()
+                enc_outputs, enc_mask = encoder(images, orientation="horizontal")
+                
+                # Decoder forward (now returns 4-tuple with predicted_boxes)
+                decoder_output = decoder(
+                    input_seq=input_seq,
+                    enc_outputs=enc_outputs,
+                    enc_mask=enc_mask,
+                    teacher_forcing_ratio=tf_ratio,
+                    targets=targets,
+                    eos_id=eos_id,
+                    image_size=(images.shape[2], images.shape[3]),
+                )
+                
+                # Handle both 3-tuple (old) and 4-tuple (new with predicted_boxes)
+                if len(decoder_output) == 4:
+                    logits, hidden, attn, predicted_boxes = decoder_output
+                else:
+                    logits, hidden, attn = decoder_output
+                    predicted_boxes = None
+                
+                B, T_dec, V = logits.shape
+                
+                # Sequence loss
+                loss_seq = ce_loss(logits.reshape(-1, V), targets.reshape(-1))
+                loss = loss_seq
+                
+                # Detection loss (Option 1: DetectorHead)
+                if detector is not None and feats2d is not None:
+                    det_pred = detector(feats2d)
+                    H_out, W_out = det_pred['cls'].shape[2:]
+                    gt_heatmap, gt_bbox, gt_cls = build_detection_targets(
+                        boxes, labels, (H_out, W_out), IMAGE_SIZE, DEVICE, sigma=DETECTOR_HEATMAP_SIGMA
+                    )
+                    loss_det, (l_heat, l_bbox, l_cls) = compute_detection_losses(
+                        det_pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.0, 1.0)
+                    )
+                    loss = loss + DETECTION_LOSS_WEIGHT * loss_det
+                
+                # ROI Align loss (Option 2: attention-based boxes with feature alignment)
+                if USE_ROI_ATTENTION and predicted_boxes is not None:
+                    # Convert boxes list to padded tensor
+                    gt_boxes_padded = []
+                    gt_lengths = []
+                    max_boxes = max(b.shape[0] for b in boxes) if any(b.numel() > 0 for b in boxes) else 1
+                    for box_tensor in boxes:
+                        orig_len = box_tensor.shape[0]
+                        if box_tensor.numel() == 0:
+                            box_tensor = torch.zeros((1, 4), device=DEVICE)
+                        else:
+                            box_tensor = box_tensor.to(DEVICE)
+                        pad_size = max_boxes - box_tensor.shape[0]
+                        if pad_size > 0:
+                            box_tensor = torch.cat([
+                                box_tensor,
+                                torch.zeros((pad_size, 4), device=DEVICE)
+                            ], dim=0)
+                        gt_lengths.append(orig_len)
+                        gt_boxes_padded.append(box_tensor)
+                    gt_boxes_batch = torch.stack(gt_boxes_padded, dim=0)  # (B, N, 4)
+                    gt_lengths_tensor = torch.tensor(gt_lengths, device=DEVICE)
+                    
+                    # Use ROI Align loss: combines box regression + feature alignment
+                    loss_roi = compute_roi_align_loss(
+                        predicted_boxes,
+                        gt_boxes_batch,
+                        enc_outputs=enc_outputs,
+                        enc_mask=enc_mask,
+                        gt_lengths=gt_lengths_tensor,
+                        spatial_scale=1.0,
+                        pooled_size=7,
+                        alignment_weight=0.5
+                    )
+                    loss = loss + ROI_BOX_LOSS_WEIGHT * loss_roi
+                
+                # Scale loss for gradient accumulation
+                loss = loss / GRADIENT_ACCUMULATION_STEPS
             
-            loss.backward()
+            # Backward pass
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Optimizer step with gradient accumulation
+            if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), GRAD_CLIP)
+                torch.nn.utils.clip_grad_norm_(decoder.parameters(), GRAD_CLIP)
+                if detector is not None:
+                    torch.nn.utils.clip_grad_norm_(detector.parameters(), GRAD_CLIP)
+                
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+            
+            # Track losses (unscale for logging)
+            total_seq_loss += loss_seq.item()
+            if detector is not None and feats2d is not None:
+                total_det_loss += loss_det.item()
+            if USE_ROI_ATTENTION and predicted_boxes is not None:
+                total_roi_loss += loss_roi.item()
 
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), GRAD_CLIP)
-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), GRAD_CLIP)
-            if detector is not None:
-                torch.nn.utils.clip_grad_norm_(detector.parameters(), GRAD_CLIP)
-            optimizer.step()
-
-            total_loss += loss.item()
+            total_loss += loss.item() * GRADIENT_ACCUMULATION_STEPS
             n_batches += 1
 
         avg_loss = (total_loss / n_batches) if n_batches > 0 else 0.0
         avg_seq = (total_seq_loss / n_batches) if n_batches > 0 else 0.0
         avg_det = (total_det_loss / n_batches) if n_batches > 0 else 0.0
         avg_roi = (total_roi_loss / n_batches) if n_batches > 0 else 0.0
+        current_lr = optimizer.param_groups[0]['lr']
         
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS} TF={tf_ratio:.3f} Total={avg_loss:.4f} "
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS} LR={current_lr:.2e} TF={tf_ratio:.3f} Total={avg_loss:.4f} "
               f"Seq={avg_seq:.4f} Det={avg_det:.4f} ROI={avg_roi:.4f}")
+        
+        # Step learning rate scheduler
+        scheduler.step()
         
         # Run validation every VALIDATION_FREQ epochs (if enabled)
         if RUN_VALIDATION and (epoch + 1) % VALIDATION_FREQ == 0:
@@ -336,8 +453,6 @@ def train():
                   f"DetLoss={val_metrics['det_loss']:.4f} ROILoss={val_metrics['roi_loss']:.4f}")
 
         # Save checkpoint
-        ckpt_dir = Path(CHECKPOINT_DIR)
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = ckpt_dir / f"att_epoch{epoch+1}.pt"
         ckpt_dict = {
             'epoch': epoch+1,
@@ -354,6 +469,9 @@ def train():
         
         torch.save(ckpt_dict, ckpt_path)
         print(f"Saved checkpoint: {ckpt_path}")
+
+        # Prune to keep only the last two checkpoints (excluding checkpoint_old.pt)
+        prune_to_keep_last_n(ckpt_dir, keep=2, exclude="checkpoint_old.pt")
 
     print("Training finished.")
 

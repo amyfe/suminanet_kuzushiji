@@ -1,6 +1,7 @@
 """Helper functions for detection training."""
 import torch
 import torch.nn.functional as F
+from torchvision.ops import roi_align
 
 
 def build_detection_targets(boxes, labels, output_size, image_size, device, sigma=2.0):
@@ -114,47 +115,192 @@ def compute_detection_losses(pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.
     return total_loss, (loss_heat, loss_bbox, loss_cls)
 
 
-def compute_roi_box_loss(predicted_boxes, gt_boxes, reduction='mean'):
+def _bbox_iou(boxes1, boxes2):
+    """Compute IoU between matched boxes (B, 4)."""
+    x1 = torch.max(boxes1[:, 0], boxes2[:, 0])
+    y1 = torch.max(boxes1[:, 1], boxes2[:, 1])
+    x2 = torch.min(boxes1[:, 2], boxes2[:, 2])
+    y2 = torch.min(boxes1[:, 3], boxes2[:, 3])
+
+    inter_w = (x2 - x1).clamp(min=0)
+    inter_h = (y2 - y1).clamp(min=0)
+    inter = inter_w * inter_h
+
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    union = (area1 + area2 - inter).clamp(min=1e-6)
+    return inter / union
+
+
+def compute_roi_box_loss(predicted_boxes, gt_boxes, gt_lengths=None, reduction='mean', iou_weight=0.0, use_x_only=False):
     """
-    Compute box regression loss for ROI-based attention.
+    SmoothL1 + optional IoU loss for ROI-based attention.
+    - Supervise only up to the number of available GT boxes per sample
+    - Ignore padded / empty boxes (zero-area)
+    - If use_x_only is True, compare only x1/x2 (width-wise) since encoder flattens height
+    """
+    B, T_dec, _ = predicted_boxes.shape
+
+    total_l1 = torch.tensor(0.0, device=predicted_boxes.device)
+    total_iou = torch.tensor(0.0, device=predicted_boxes.device)
+    count = 0
+
+    for i in range(B):
+        pred_i = predicted_boxes[i]  # (T_dec, 4)
+        gt_i = gt_boxes[i].to(predicted_boxes.device)  # (N, 4)
+
+        # Filter out padded/zero boxes
+        valid_mask = (gt_i[:, 2] - gt_i[:, 0] > 1e-3) & (gt_i[:, 3] - gt_i[:, 1] > 1e-3)
+        gt_i = gt_i[valid_mask]
+
+        if gt_i.numel() == 0:
+            continue
+
+        max_t = min(T_dec, gt_i.shape[0]) if gt_lengths is None else min(T_dec, int(gt_lengths[i].item()))
+        pred_slice = pred_i[:max_t]
+        gt_slice = gt_i[:max_t]
+
+        if use_x_only:
+            pred_slice = pred_slice[:, [0, 2]]
+            gt_slice = gt_slice[:, [0, 2]]
+
+        l1 = F.smooth_l1_loss(pred_slice, gt_slice, reduction='sum')
+        total_l1 = total_l1 + l1
+
+        if (not use_x_only) and iou_weight > 0.0:
+            ious = _bbox_iou(pred_slice, gt_slice)
+            # IoU loss: 1 - IoU
+            total_iou = total_iou + (1.0 - ious).sum()
+
+        count += max_t
+
+    if count == 0:
+        return torch.tensor(0.0, device=predicted_boxes.device)
+
+    if reduction == 'mean':
+        total = total_l1 / count
+        if iou_weight > 0.0:
+            total = total + iou_weight * (total_iou / count)
+        return total
+
+    total = total_l1
+    if iou_weight > 0.0:
+        total = total + iou_weight * total_iou
+    return total
+
+
+def compute_roi_align_loss(predicted_boxes, gt_boxes, enc_outputs, enc_mask=None, 
+                           gt_lengths=None, spatial_scale=1.0, pooled_size=7, 
+                           alignment_weight=0.5):
+    """
+    Compute ROI Align loss: SmoothL1 on box coords + alignment consistency of extracted features.
     
     Args:
-        predicted_boxes: (B, T_dec, 4) predicted from attention
-        gt_boxes: (B, N, 4) ground truth boxes
-        reduction: 'mean' or 'sum'
+        predicted_boxes: (B, T_dec, 4) predicted box coords in image space
+        gt_boxes: (B, N, 4) ground truth box coords
+        enc_outputs: (B, T_enc, C) encoder feature map (flattened 1D; will reshape to 2D for ROI Align)
+        enc_mask: (B, T_enc) optional mask
+        gt_lengths: (B,) number of valid boxes per sample
+        spatial_scale: scale factor from original image to feature map (default 1.0 for image-space boxes)
+        pooled_size: size of pooled ROI features (e.g., 7 for 7x7 patches)
+        alignment_weight: weight for alignment loss vs. box regression loss
         
     Returns:
-        box_loss: L1 loss between predicted and GT boxes
+        total_loss: combined SmoothL1 + alignment loss
     """
-    # Match predicted boxes to GT boxes (simple nearest matching)
-    # For each predicted box, find closest GT box
     B, T_dec, _ = predicted_boxes.shape
+    B, T_enc, C = enc_outputs.shape
     
-    total_loss = torch.tensor(0.0, device=predicted_boxes.device)
+    # Reshape encoder outputs from (B, T_enc, C) to (B, C, H_feat, W_feat)
+    # For 1D encoder, treat as H_feat=1, W_feat=T_enc
+    enc_feat_2d = enc_outputs.permute(0, 2, 1).unsqueeze(2)  # (B, C, 1, T_enc)
+    
+    total_box_loss = torch.tensor(0.0, device=predicted_boxes.device)
+    total_align_loss = torch.tensor(0.0, device=predicted_boxes.device)
     count = 0
     
     for i in range(B):
         pred_i = predicted_boxes[i]  # (T_dec, 4)
-        gt_i = gt_boxes[i]  # (N, 4)
+        gt_i = gt_boxes[i].to(predicted_boxes.device)  # (N, 4)
+        
+        # Filter out padded/zero boxes
+        valid_mask = (gt_i[:, 2] - gt_i[:, 0] > 1e-3) & (gt_i[:, 3] - gt_i[:, 1] > 1e-3)
+        gt_i = gt_i[valid_mask]
         
         if gt_i.numel() == 0:
             continue
         
-        # For each prediction, find closest GT
-        for j in range(T_dec):
-            if j >= len(gt_i):
-                # No more GT boxes, use last one
-                target = gt_i[-1]
-            else:
-                target = gt_i[j]
+        # Determine number of boxes to supervise
+        max_t = min(T_dec, gt_i.shape[0]) if gt_lengths is None else min(T_dec, int(gt_lengths[i].item()))
+        pred_slice = pred_i[:max_t]
+        gt_slice = gt_i[:max_t]
+        
+        # SmoothL1 loss on x-coordinates only (since encoder is 1D horizontal)
+        pred_x = pred_slice[:, [0, 2]]  # x1, x2
+        gt_x = gt_slice[:, [0, 2]]
+        box_l1 = F.smooth_l1_loss(pred_x, gt_x, reduction='mean')
+        total_box_loss = total_box_loss + box_l1
+        
+        # Alignment loss: extract features via ROI Align from predicted vs GT boxes
+        # ROI Align expects boxes as Tensor (N, 5) with [batch_idx, x1, y1, x2, y2]
+        try:
+            # Build ROI format: add batch index as single tensor, not list
+            pred_boxes_roi = torch.cat([
+                torch.full((max_t, 1), i, dtype=torch.float32, device=predicted_boxes.device),
+                pred_slice
+            ], dim=1)  # (max_t, 5)
             
-            loss_j = F.l1_loss(pred_i[j], target)
-            total_loss = total_loss + loss_j
-            count += 1
+            gt_boxes_roi = torch.cat([
+                torch.full((max_t, 1), i, dtype=torch.float32, device=predicted_boxes.device),
+                gt_slice
+            ], dim=1)  # (max_t, 5)
+            
+            # Extract features: ROI Align from full batch encoder output
+            # roi_align expects boxes as (N, 5) tensor
+            pred_feats = roi_align(
+                enc_feat_2d,
+                pred_boxes_roi,
+                output_size=pooled_size,
+                spatial_scale=spatial_scale,
+                aligned=True
+            )  # (max_t, C, pooled_size, pooled_size)
+            
+            gt_feats = roi_align(
+                enc_feat_2d,
+                gt_boxes_roi,
+                output_size=pooled_size,
+                spatial_scale=spatial_scale,
+                aligned=True
+            )  # (max_t, C, pooled_size, pooled_size)
+            
+            # Alignment: similarity between predicted and GT features (cosine or L2)
+            # Flatten and compute cosine similarity
+            pred_feats_flat = pred_feats.reshape(max_t, -1)  # (max_t, C*pooled*pooled)
+            gt_feats_flat = gt_feats.reshape(max_t, -1)
+            
+            # Normalize for cosine similarity
+            pred_norm = F.normalize(pred_feats_flat, dim=1, p=2)
+            gt_norm = F.normalize(gt_feats_flat, dim=1, p=2)
+            
+            # Cosine similarity: higher is better alignment; loss = 1 - cosine_sim
+            cosine_sim = (pred_norm * gt_norm).sum(dim=1)  # (max_t,)
+            align_loss = (1.0 - cosine_sim).mean()
+            total_align_loss = total_align_loss + align_loss
+            
+        except Exception as e:
+            # If ROI Align fails (e.g., invalid boxes), skip alignment loss
+            print(f"Warning: ROI Align failed for sample {i}: {e}")
+            align_loss = torch.tensor(0.0, device=predicted_boxes.device)
+            total_align_loss = total_align_loss + align_loss
+        
+        count += max_t
     
     if count == 0:
         return torch.tensor(0.0, device=predicted_boxes.device)
     
-    if reduction == 'mean':
-        return total_loss / count
-    return total_loss
+    # Combine: box loss + alignment loss
+    avg_box_loss = total_box_loss / max(1, count)
+    avg_align_loss = total_align_loss / max(1, count)
+    
+    combined_loss = avg_box_loss + alignment_weight * avg_align_loss
+    return combined_loss

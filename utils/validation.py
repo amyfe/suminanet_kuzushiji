@@ -1,7 +1,9 @@
 """Validation utilities for training."""
 import torch
 import torch.nn as nn
-from utils.detection_utils import build_detection_targets, compute_detection_losses, compute_roi_box_loss
+import torch.amp as amp
+from utils.detection_utils import build_detection_targets, compute_detection_losses, compute_roi_align_loss
+from config import IMAGE_SIZE
 
 
 def compute_cer(predicted_ids, target_ids, vocab, pad_id, sos_id, eos_id):
@@ -109,9 +111,18 @@ def validate(encoder, decoder, detector, dataloader, vocab, device,
             
             enc_outputs, enc_mask = encoder(images, orientation="horizontal")
             
-            # Decoder forward (no teacher forcing during validation)
-            decoder_output = decoder(input_seq=input_seq, enc_outputs=enc_outputs, enc_mask=enc_mask,
-                                    teacher_forcing_ratio=0.0, targets=targets, eos_id=vocab.eos_id)
+            # Decoder forward (use teacher forcing=1.0 to match target length)
+            # With TF=0.0, decoder stops early when predicting EOS, causing shape mismatch
+            with amp.autocast(device_type="cuda", enabled=torch.cuda.is_available()):
+                decoder_output = decoder(
+                    input_seq=input_seq,
+                    enc_outputs=enc_outputs,
+                    enc_mask=enc_mask,
+                    teacher_forcing_ratio=1.0,
+                    targets=targets,
+                    eos_id=vocab.eos_id,
+                    image_size=(images.shape[2], images.shape[3]),
+                )
             
             if len(decoder_output) == 4:
                 logits, hidden, attn, predicted_boxes = decoder_output
@@ -138,30 +149,44 @@ def validate(encoder, decoder, detector, dataloader, vocab, device,
                 det_pred = detector(feats2d)
                 H_out, W_out = det_pred['cls'].shape[2:]
                 gt_heatmap, gt_bbox, gt_cls = build_detection_targets(
-                    boxes, labels, (H_out, W_out), (512, 512), device, sigma=detector_heatmap_sigma
+                    boxes, labels, (H_out, W_out), IMAGE_SIZE, device, sigma=detector_heatmap_sigma
                 )
                 loss_det, _ = compute_detection_losses(
                     det_pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.0, 1.0)
                 )
                 total_det_loss += loss_det.item()
             
-            # ROI box loss (Option 2: attention-based boxes)
+            # ROI Align loss (Option 2: attention-based boxes with feature alignment)
             if use_roi_attention and predicted_boxes is not None:
                 gt_boxes_padded = []
+                gt_lengths = []
                 max_boxes = max(b.shape[0] for b in boxes) if any(b.numel() > 0 for b in boxes) else 1
                 for box_tensor in boxes:
+                    orig_len = box_tensor.shape[0]
+                    box_tensor = box_tensor.to(device)
                     if box_tensor.numel() == 0:
                         box_tensor = torch.zeros((1, 4), device=device)
                     pad_size = max_boxes - box_tensor.shape[0]
                     if pad_size > 0:
                         box_tensor = torch.cat([
-                            box_tensor.to(device),
+                            box_tensor,
                             torch.zeros((pad_size, 4), device=device)
                         ], dim=0)
+                    gt_lengths.append(orig_len)
                     gt_boxes_padded.append(box_tensor)
                 gt_boxes_batch = torch.stack(gt_boxes_padded, dim=0)
+                gt_lengths_tensor = torch.tensor(gt_lengths, device=device)
                 
-                loss_roi = compute_roi_box_loss(predicted_boxes, gt_boxes_batch)
+                loss_roi = compute_roi_align_loss(
+                    predicted_boxes,
+                    gt_boxes_batch,
+                    enc_outputs=enc_outputs,
+                    enc_mask=enc_mask,
+                    gt_lengths=gt_lengths_tensor,
+                    spatial_scale=1.0,
+                    pooled_size=7,
+                    alignment_weight=0.5
+                )
                 total_roi_loss += loss_roi.item()
             
             n_batches += 1

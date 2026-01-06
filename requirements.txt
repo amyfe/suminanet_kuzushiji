@@ -17,10 +17,9 @@ opencv-python>=4.8.0
 seaborn>=0.13.0
 torchmetrics>=1.5.0
 transformers>=4.45.0
-cv2-python>=4.8.0
 
 #Progress bar
 tqdm>=4.66.0
 
 #Translation
-anthropic>=3.3.0
+anthropic>=0.75.0

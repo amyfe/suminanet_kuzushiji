@@ -5,6 +5,8 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 
+from config import IMAGE_SIZE
+
 
 class KuzushijiDataset(Dataset):
     """
@@ -17,22 +19,51 @@ class KuzushijiDataset(Dataset):
             images/*.jpg
         annotations/*.json
         splits/train.txt  (optional)
+            splits/val.txt    (optional)
     """
-    def __init__(self, root_dir, vocab=None, use_sequences=True, transform=None, resize=(512,512)):
+    def __init__(self, root_dir, vocab=None, use_sequences=True, transform=None, resize=None, split=None):
+        """
+        Args:
+            root_dir: Path to data directory
+            vocab: VocabManager instance
+            use_sequences: Whether to return text sequences
+            transform: Image transforms (None for default augmentation)
+            resize: Target image size (height, width). Defaults to config.IMAGE_SIZE when None.
+            split: 'train', 'val', or None (use all data)
+        """
         self.root_dir = Path(root_dir)
         self.annotations_dir = self.root_dir / "annotations"
-        self.resize_to = resize
+        self.resize_to = resize if resize is not None else IMAGE_SIZE
         self.use_sequences = use_sequences
         self.vocab = vocab
+        self.split = split
 
-        self.transform = transform or T.Compose([
-            T.ToTensor()
-        ])
+        if transform is None:
+            # Training augmentation: color jitter, small geometric transforms
+            self.transform = T.Compose([
+                T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+                T.RandomAffine(degrees=2, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+        else:
+            self.transform = transform
 
         # ---------------------------
         # Sammle alle Annotationen
         # ---------------------------
         self.ann_files = sorted(list(self.annotations_dir.glob("*.json")))
+        
+        # Filter by split if specified
+        if split is not None:
+            split_file = self.root_dir / "splits" / f"{split}.txt"
+            if split_file.exists():
+                with open(split_file, 'r') as f:
+                    valid_ids = set(f.read().strip().splitlines())
+                self.ann_files = [f for f in self.ann_files if f.stem in valid_ids]
+                print(f"Loaded {split} split: {len(self.ann_files)} files")
+            else:
+                print(f"Warning: Split file {split_file} not found, using all data")
         
         # Precompute image paths: safer than reconstructing later
         self.items = []
@@ -88,12 +119,21 @@ class KuzushijiDataset(Dataset):
         # ---------------------------
         # OCR CRITICAL: Sort boxes in reading order
         # ---------------------------
-        # Sort by y1 first, then x1
         if len(boxes) > 0:
-            sorted_indices = sorted(
-                range(len(boxes)),
-                key=lambda i: (boxes[i][1], boxes[i][0])
-            )
+            if orientation == "vertical":
+                # Traditional Japanese: right-to-left columns, top-to-bottom within columns
+                # Sort by -x (right to left), then by y (top to bottom)
+                sorted_indices = sorted(
+                    range(len(boxes)),
+                    key=lambda i: (-boxes[i][0], boxes[i][1])
+                )
+            else:  # horizontal
+                # Left-to-right, top-to-bottom
+                # Sort by y first (top to bottom), then x (left to right)
+                sorted_indices = sorted(
+                    range(len(boxes)),
+                    key=lambda i: (boxes[i][1], boxes[i][0])
+                )
 
             boxes = [boxes[i] for i in sorted_indices]
             labels = [labels[i] for i in sorted_indices]

@@ -162,6 +162,13 @@ data/demo/
 # Local dataset folders (do not commit large data)
 assets/data/
 data/
+logs/
+assets/logs/
+assets/data_preprocessed/
+data_preprocessed/
+submit_training.sh
+CLUSTER_QUICK_REFERENCE.md
+
 # mypy
 .mypy_cache/
 .dmypy.json
@@ -214,3 +221,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 checkpoints/
+
+#ignore my notes
+.vscode/linenote/
