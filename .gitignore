@@ -168,7 +168,7 @@ assets/data_preprocessed/
 data_preprocessed/
 submit_training.sh
 CLUSTER_QUICK_REFERENCE.md
-
+assets/data_cached/
 # mypy
 .mypy_cache/
 .dmypy.json
