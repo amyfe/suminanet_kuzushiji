@@ -12,14 +12,14 @@ from model.kuronet import DetectorHead
 from model.kuronet.decoder.attention import SeqDecoderAttention
 from utils import KuzushijiDataset
 from utils.vocab import VocabManager
-from utils.detection_utils import build_detection_targets, compute_detection_losses, compute_roi_box_loss, compute_roi_align_loss
+from utils.detection_utils import build_detection_targets, compute_detection_losses
 from utils.validation import validate
 from config import (DEVICE, NUM_EPOCHS, LR, WEIGHT_DECAY, CHECKPOINT_DIR, DATA_DIR, BATCH_SIZE, NUM_WORKERS,
-                    USE_DETECTOR_HEAD, USE_ROI_ATTENTION, DETECTION_LOSS_WEIGHT, ROI_BOX_LOSS_WEIGHT,
+                    USE_DETECTOR_HEAD, USE_ROI_ATTENTION, DETECTION_LOSS_WEIGHT,
                     NUM_CLASSES, DETECTOR_HEATMAP_SIGMA, RUN_VALIDATION, VALIDATION_FREQ, VALIDATION_BATCHES,
-                    GRADIENT_ACCUMULATION_STEPS, USE_MIXED_PRECISION, GRAD_CLIP, IMAGE_SIZE)
+                    GRADIENT_ACCUMULATION_STEPS, USE_MIXED_PRECISION, GRAD_CLIP, IMAGE_SIZE, CTC_WARMUP_EPOCHS)
 
-CTC_WARMUP_EPOCHS = 0  
+
 MAX_DECODING_LEN = 200  # fallback for decoder if needed
 
 def prune_existing_checkpoints(ckpt_dir: Path, old_name: str = "checkpoint_old.pt"):
@@ -165,7 +165,6 @@ def smoke_test(models, dataset, vocab, device, n_samples=2):
                 print("decoder logits:", logits.shape, "attn:", None if attn is None else attn.shape)
     print("smoke test finished successfully.\n")
 
-# ---- Main training function ----
 def train():
     # Build or load vocab
     ann_files = sorted(list((Path(DATA_DIR) / "annotations").glob("*.json")))
@@ -217,7 +216,7 @@ def train():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
     
     # Mixed precision training
-    scaler = amp.GradScaler() if USE_MIXED_PRECISION else None
+    scaler = amp.GradScaler(device="cuda", enabled=USE_MIXED_PRECISION)
 
     # Losses
     ce_loss = nn.CrossEntropyLoss(ignore_index=pad_id)
@@ -294,7 +293,6 @@ def train():
         total_loss = 0.0
         total_seq_loss = 0.0
         total_det_loss = 0.0
-        total_roi_loss = 0.0
         n_batches = 0
         
         for batch_idx, batch in enumerate(dataloader):
@@ -350,45 +348,10 @@ def train():
                         boxes, labels, (H_out, W_out), IMAGE_SIZE, DEVICE, sigma=DETECTOR_HEATMAP_SIGMA
                     )
                     loss_det, (l_heat, l_bbox, l_cls) = compute_detection_losses(
-                        det_pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.0, 1.0)
+                        det_pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.0, 1.0), use_focal_loss=True
                     )
                     loss = loss + DETECTION_LOSS_WEIGHT * loss_det
-                
-                # ROI Align loss (Option 2: attention-based boxes with feature alignment)
-                if USE_ROI_ATTENTION and predicted_boxes is not None:
-                    # Convert boxes list to padded tensor
-                    gt_boxes_padded = []
-                    gt_lengths = []
-                    max_boxes = max(b.shape[0] for b in boxes) if any(b.numel() > 0 for b in boxes) else 1
-                    for box_tensor in boxes:
-                        orig_len = box_tensor.shape[0]
-                        if box_tensor.numel() == 0:
-                            box_tensor = torch.zeros((1, 4), device=DEVICE)
-                        else:
-                            box_tensor = box_tensor.to(DEVICE)
-                        pad_size = max_boxes - box_tensor.shape[0]
-                        if pad_size > 0:
-                            box_tensor = torch.cat([
-                                box_tensor,
-                                torch.zeros((pad_size, 4), device=DEVICE)
-                            ], dim=0)
-                        gt_lengths.append(orig_len)
-                        gt_boxes_padded.append(box_tensor)
-                    gt_boxes_batch = torch.stack(gt_boxes_padded, dim=0)  # (B, N, 4)
-                    gt_lengths_tensor = torch.tensor(gt_lengths, device=DEVICE)
-                    
-                    # Use ROI Align loss: combines box regression + feature alignment
-                    loss_roi = compute_roi_align_loss(
-                        predicted_boxes,
-                        gt_boxes_batch,
-                        enc_outputs=enc_outputs,
-                        enc_mask=enc_mask,
-                        gt_lengths=gt_lengths_tensor,
-                        spatial_scale=1.0,
-                        pooled_size=7,
-                        alignment_weight=0.5
-                    )
-                    loss = loss + ROI_BOX_LOSS_WEIGHT * loss_roi
+
                 
                 # Scale loss for gradient accumulation
                 loss = loss / GRADIENT_ACCUMULATION_STEPS
@@ -419,8 +382,6 @@ def train():
             total_seq_loss += loss_seq.item()
             if detector is not None and feats2d is not None:
                 total_det_loss += loss_det.item()
-            if USE_ROI_ATTENTION and predicted_boxes is not None:
-                total_roi_loss += loss_roi.item()
 
             total_loss += loss.item() * GRADIENT_ACCUMULATION_STEPS
             n_batches += 1
@@ -428,11 +389,10 @@ def train():
         avg_loss = (total_loss / n_batches) if n_batches > 0 else 0.0
         avg_seq = (total_seq_loss / n_batches) if n_batches > 0 else 0.0
         avg_det = (total_det_loss / n_batches) if n_batches > 0 else 0.0
-        avg_roi = (total_roi_loss / n_batches) if n_batches > 0 else 0.0
         current_lr = optimizer.param_groups[0]['lr']
         
         print(f"Epoch {epoch+1}/{NUM_EPOCHS} LR={current_lr:.2e} TF={tf_ratio:.3f} Total={avg_loss:.4f} "
-              f"Seq={avg_seq:.4f} Det={avg_det:.4f} ROI={avg_roi:.4f}")
+              f"Seq={avg_seq:.4f} Det={avg_det:.4f}")
         
         # Step learning rate scheduler
         scheduler.step()
@@ -443,14 +403,14 @@ def train():
             val_metrics = validate(
                 encoder, decoder, detector, dataloader, vocab, DEVICE,
                 use_detector_head=USE_DETECTOR_HEAD,
-                use_roi_attention=USE_ROI_ATTENTION,
+                use_roi_attention=False,  # Disabled (was broken)
                 detection_loss_weight=DETECTION_LOSS_WEIGHT,
-                roi_box_loss_weight=ROI_BOX_LOSS_WEIGHT,
+                roi_box_loss_weight=0.0,
                 detector_heatmap_sigma=DETECTOR_HEATMAP_SIGMA,
                 max_batches=VALIDATION_BATCHES
             )
             print(f"  VAL Loss={val_metrics['loss']:.4f} CER={val_metrics['cer']:.4f} "
-                  f"DetLoss={val_metrics['det_loss']:.4f} ROILoss={val_metrics['roi_loss']:.4f}")
+                  f"DetLoss={val_metrics['det_loss']:.4f}")
 
         # Save checkpoint
         ckpt_path = ckpt_dir / f"att_epoch{epoch+1}.pt"

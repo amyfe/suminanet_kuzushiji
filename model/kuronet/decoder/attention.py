@@ -74,8 +74,8 @@ class SeqDecoderAttention(nn.Module):
         enc_dim,
         num_layers=1,
         init_from_encoder=True,
-        sampling_method="multinomial",  # "argmax"|"multinomial"|"gumbel"
-        use_roi_attention=False,  # NEW: enable ROI-based box prediction
+        sampling_method="multinomial",
+        use_roi_attention=False,
         roi_blend_alpha=0.7,
     ):
         super().__init__()
@@ -190,7 +190,6 @@ class SeqDecoderAttention(nn.Module):
 
             use_teacher = (targets is not None) and (random.random() < teacher_forcing_ratio)
             if use_teacher:
-                # mypy/linters: targets guaranteed non-None in this branch
                 assert targets is not None
                 next_tok = targets[:, t]
             else:

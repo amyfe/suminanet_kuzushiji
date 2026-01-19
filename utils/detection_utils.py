@@ -2,6 +2,7 @@
 import torch
 import torch.nn.functional as F
 from torchvision.ops import roi_align
+from .focal_loss import focal_loss_heatmap
 
 
 def build_detection_targets(boxes, labels, output_size, image_size, device, sigma=2.0):
@@ -75,7 +76,7 @@ def build_detection_targets(boxes, labels, output_size, image_size, device, sigm
     return gt_heatmap, gt_bbox, gt_cls
 
 
-def compute_detection_losses(pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.0, 1.0)):
+def compute_detection_losses(pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.0, 1.0), use_focal_loss=True):
     """
     Compute detection losses.
     
@@ -85,14 +86,21 @@ def compute_detection_losses(pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.
         gt_bbox: (B, 4, H, W)
         gt_cls: (B, H, W)
         weights: (w_heat, w_bbox, w_cls) loss weights
+        use_focal_loss: whether to use Focal Loss for heatmap (better for small objects)
         
     Returns:
         total_loss, (loss_heat, loss_bbox, loss_cls)
     """
     w_heat, w_bbox, w_cls = weights
     
-    # Heatmap loss (MSE)
-    loss_heat = F.mse_loss(pred['heatmap'], gt_heatmap) if 'heatmap' in pred else torch.tensor(0.0, device=gt_heatmap.device)
+    # Heatmap loss - use Focal Loss for better small object detection (furigana)
+    if 'heatmap' in pred:
+        if use_focal_loss:
+            loss_heat = focal_loss_heatmap(pred['heatmap'], gt_heatmap, alpha=0.25, gamma=2.0)
+        else:
+            loss_heat = F.mse_loss(pred['heatmap'], gt_heatmap)
+    else:
+        loss_heat = torch.tensor(0.0, device=gt_heatmap.device)
     
     # Bbox loss (L1, only at valid positions)
     if 'bbox' in pred:
@@ -282,8 +290,8 @@ def compute_roi_align_loss(predicted_boxes, gt_boxes, enc_outputs, enc_mask=None
             pred_norm = F.normalize(pred_feats_flat, dim=1, p=2)
             gt_norm = F.normalize(gt_feats_flat, dim=1, p=2)
             
-            # Cosine similarity: higher is better alignment; loss = 1 - cosine_sim
-            cosine_sim = (pred_norm * gt_norm).sum(dim=1)  # (max_t,)
+            # Cosine similarity
+            cosine_sim = (pred_norm * gt_norm).sum(dim=1)
             align_loss = (1.0 - cosine_sim).mean()
             total_align_loss = total_align_loss + align_loss
             

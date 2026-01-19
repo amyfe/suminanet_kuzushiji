@@ -26,7 +26,7 @@ from PIL import Image
 
 # Add parent directory to path to import config
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import DATA_DIR, DATA_PREPROCESSED_DIR
+from config import DATA_DIR, DATA_PREPROCESSED_DIR, DATA_ZIP_DIR
 from tqdm import tqdm
 
 OUTPUT_ANNOT_DIR = DATA_DIR / "annotations"
@@ -37,6 +37,12 @@ OUTPUT_ID2LABEL = DATA_DIR / "id2label.json"
 SPLITS_DIR = DATA_DIR / "splits"
 SPLITS_DIR.mkdir(exist_ok=True, parents=True)
 
+def unzip_file(zip_path: Path, extract_to: Path):
+    """Entpackt eine ZIP-Datei in das angegebene Verzeichnis."""
+    import zipfile
+
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_to)
 
 def process_book(book_dir: Path):
     """Liest eine einzelne *_coordinate.csv und erzeugt JSON-Dateien für jedes Bild."""
@@ -120,8 +126,12 @@ def process_book(book_dir: Path):
 
 
 def main():
+    #Get all data from zip files if any
+    zip_files = list(DATA_ZIP_DIR.glob("*.zip"))
+    for zip_file in zip_files:
+        print(f"Unzipping {zip_file} to {DATA_PREPROCESSED_DIR}...")
+        unzip_file(zip_file, DATA_PREPROCESSED_DIR)
     all_labels = set()
-
     # Alle Buch-Ordner durchsuchen
     book_dirs = [d for d in DATA_PREPROCESSED_DIR.iterdir() if d.is_dir()]
     print(f"📚 Found {len(book_dirs)} book directories.")
