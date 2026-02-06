@@ -1,4 +1,4 @@
-"""Two-stage training pipeline: Stage 1 (detection) + Stage 2 (classification)."""
+"""Two-stage training pipeline: Stage 1 (detection) + Stage 2 (classification).7981"""
 import sys
 import torch
 import torch.nn as nn
@@ -6,9 +6,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.cuda.amp as amp
 from pathlib import Path
-import json
 from tqdm import tqdm
-import argparse
 
 from config import (
     DATA_DIR, DEVICE, BATCH_SIZE, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, WEIGHT_DECAY,
@@ -95,63 +93,66 @@ def scheduled_teacher_forcing(epoch, total_epochs, start=1.0, end=0.2, schedule=
         return max(end, start * decay)
 
 
+def masked_bbox_smoothl1_loss(
+    pred_bbox: torch.Tensor,   # (B,4,H,W)
+    gt_bbox: torch.Tensor,     # (B,4,H,W)
+    gt_heatmap: torch.Tensor,  # (B,1,H,W) gaussian peaks
+    pos_thresh: float = 0.3,
+) -> torch.Tensor:
+    """
+    Compute bbox loss only where objects exist.
+    We use gt_heatmap to decide positives (peaks / gaussian area).
+    """
+    # positive mask: (B,1,H,W) -> (B,4,H,W)
+    pos = (gt_heatmap > pos_thresh).to(pred_bbox.dtype)
+    mask = pos.expand_as(pred_bbox)
+
+    # sum over positives, divide by #pos locations (not by H*W)
+    diff = nn.functional.smooth_l1_loss(pred_bbox * mask, gt_bbox * mask, reduction="sum")
+    denom = mask.sum().clamp(min=1.0)
+    return diff / denom
+
 def validate_detector(unet, detector, dataloader, DEVICE, USE_MIXED_PRECISION):
-    """Validate detector on full validation set. Returns average loss."""
     unet.eval()
     detector.eval()
     
     total_loss = 0.0
     num_batches = 0
     
-    with torch.no_grad():
-        pbar = tqdm(dataloader, desc="Validating", leave=False)
-        for batch in pbar:
-            images = batch['image'].to(DEVICE)
-            boxes = [b.to(DEVICE) if b.numel() > 0 else torch.empty((0, 4), device=DEVICE) for b in batch.get('boxes', [])]
-            labels = [l.to(DEVICE) if l.numel() > 0 else torch.empty((0,), dtype=torch.long, device=DEVICE) for l in batch.get('labels', [])]
+    for batch in tqdm(dataloader, desc="Validating", leave=False):
+        images = batch['image'].to(DEVICE)
+        boxes = [b.to(DEVICE) if b.numel() > 0 else torch.empty((0, 4), device=DEVICE) for b in batch.get('boxes', [])]
+        labels = [l.to(DEVICE) if (l is not None and l.numel() > 0) else torch.empty((0,), dtype=torch.long, device=DEVICE) for l in batch.get('labels', [])]
+        
+        with torch.amp.autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
+            features = unet(images)
+            outputs = detector(features)
             
-            with torch.amp.autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
-                features = unet(images)
-                outputs = detector(features)
-                
-                heatmap = outputs.get('heatmap')
-                bbox_reg = outputs.get('bbox')
-                cls_logits = outputs.get('cls')  # May be None
-                
-                B, _, H_feat, W_feat = features.shape
-                output_size = (H_feat, W_feat)
-                image_size = tuple(images.shape[-2:])
-                
-                gt_heatmap, gt_bbox, gt_cls = build_detection_targets(
-                    boxes, labels, output_size, image_size, DEVICE
-                )
-                
-                with torch.no_grad():
-                    features_shared = detector.shared(features)
-                heatmap_logits = detector.heatmap(features_shared)
-                
-                loss_heatmap = focal_loss_heatmap(
-                    heatmap_logits, gt_heatmap, alpha=0.25, gamma=2.0, pos_weight=10.0
-                )
-                loss_bbox = torch.nn.SmoothL1Loss()(bbox_reg, gt_bbox)
-                # Skip class loss (not computed)
-                
-                loss = loss_heatmap + 0.1 * loss_bbox
+            # heatmap = outputs.get('heatmap')
+            # bbox_reg = outputs.get('bbox')
+            # cls_logits = outputs.get('cls') 
             
-            total_loss += loss.item()
-            num_batches += 1
-            pbar.set_postfix({"val_loss": total_loss / num_batches})
+            B, _, Hf, Wf = features.shape
+            gt_heat, gt_bbox, gt_cls = build_detection_targets(
+                boxes, labels, output_size=(Hf, Wf), image_size=tuple(images.shape[-2:]), device=DEVICE
+            )
+            
+            # IMPORTANT: focal wants raw logits -> compute them from shared features
+            features_shared = detector.shared(features)
+            heat_logits = detector.heatmap(features_shared)  # (B,1,H,W) raw
+            
+            loss_heatmap = focal_loss_heatmap(heat_logits, gt_heat, alpha=0.25, gamma=2.0, pos_weight=10.0)
+            if "bbox" in outputs:
+                loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_heat, pos_thresh=0.3)
+            else:
+                loss_bbox = torch.tensor(0.0, device=DEVICE)
+
+            loss = loss_heatmap + 0.1 * loss_bbox
+        
+        total_loss += float(loss.item())
+        num_batches += 1
     
-    avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
-    return avg_loss
-
-
-
-
-
-
-
-
+    return total_loss / max(1, num_batches)
 
 def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3, val_split=None):
     """Stage 1: Train DetectorHead to localize characters.
@@ -175,18 +176,31 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         raise FileNotFoundError(f"No annotation files found in {Path(DATA_DIR)/'annotations'}")
     vocab = VocabManager.from_annotations(ann_files)
     pad_id = vocab.pad_id
-    sos_id = vocab.sos_id
-    eos_id = vocab.eos_id
-    vocab_size = vocab.vocab_size
 
     # Clean up existing checkpoints: keep only newest, rename to checkpoint_old.pt
-    ckpt_dir = Path(CHECKPOINT_DIR)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    prune_existing_checkpoints(ckpt_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    prune_existing_checkpoints(checkpoint_dir)
 
-    # Dataset + loader - use pre-existing splits (splits/train.txt, splits/val.txt)
-    train_dataset = KuzushijiDataset(Path(DATA_DIR), vocab=vocab, use_sequences=True, resize=IMAGE_SIZE, split='train')
-    val_dataset = KuzushijiDataset(Path(DATA_DIR), vocab=vocab, use_sequences=True, resize=IMAGE_SIZE, split='val')
+    # Dataset + loader - use pre-existing splits or random split if val_split provided
+    if val_split is None:
+        train_dataset = KuzushijiDataset(Path(DATA_DIR), vocab=vocab, use_sequences=True, resize=IMAGE_SIZE, split='train')
+        val_dataset = KuzushijiDataset(Path(DATA_DIR), vocab=vocab, use_sequences=True, resize=IMAGE_SIZE, split='val')
+    else:
+        full_dataset = KuzushijiDataset(Path(DATA_DIR), vocab=vocab, use_sequences=True, resize=IMAGE_SIZE, split=None)
+        if isinstance(val_split, float):
+            if not (0.0 < val_split < 1.0):
+                raise ValueError("val_split as float must be in (0, 1)")
+            val_size = max(1, int(len(full_dataset) * val_split))
+        elif isinstance(val_split, int):
+            if val_split <= 0 or val_split >= len(full_dataset):
+                raise ValueError("val_split as int must be in [1, len(dataset)-1]")
+            val_size = val_split
+        else:
+            raise TypeError("val_split must be None, float, or int")
+        train_size = len(full_dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size]
+        )
     
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
                             collate_fn=lambda b: collate_fn(b, pad_id), pin_memory=True,
@@ -223,24 +237,23 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     ##DISCUSS CTC warmup 
     print(f"Stage 1: Training DetectorHead for {num_epochs} epochs (early stopping patience={patience})...")
     print(f"Training set: {len(train_dataset)} images | Validation set: {len(val_dataset)} images")
-    best_val_loss = None
+    best_val = None
+    patience_ctr = 0
     for epoch in range(num_epochs):
         # Training
         unet.train()
         detector.train()
         
-        total_loss = 0
-        loss_heatmap_total = 0
-        loss_bbox_total = 0
-        loss_cls_total = 0
-        num_batches = 0
-        num_labeled_pixels = 0
-        num_total_pixels = 0
+        total_loss = 0.0
+        total_heat = 0.0
+        total_bbox = 0.0
+        n_batches = 0
+
         
         # Show progress bar with limited update frequency to reduce log spam
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", 
-                   mininterval=60.0)  # Update at most every 10 seconds
-        for batch_idx, batch in enumerate(pbar):
+                   mininterval=30.0)  
+        for step, batch in enumerate(pbar):
             images = batch['image'].to(DEVICE)
             boxes = [b.to(DEVICE) if b.numel() > 0 else torch.empty((0, 4), device=DEVICE) for b in batch.get('boxes', [])]
             labels = [l.to(DEVICE) if l.numel() > 0 else torch.empty((0,), dtype=torch.long, device=DEVICE) for l in batch.get('labels', [])]
@@ -250,58 +263,22 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                 features = unet(images)  # (B, 32, H/8, W/8)
                 outputs = detector(features)  # Returns dict with 'heatmap', 'bbox', 'cls'
                 
-                heatmap = outputs.get('heatmap')  # (B, 1, H, W) - sigmoid'd
-                bbox_reg = outputs.get('bbox')    # (B, 4, H, W)
-                cls_logits = outputs.get('cls')   # May be None if predict_classes=False
-                
-                # Build targets
-                B, _, H_feat, W_feat = features.shape
-                output_size = (H_feat, W_feat)
-                image_size = tuple(images.shape[-2:])
-                
-                gt_heatmap, gt_bbox, gt_cls = build_detection_targets(
-                    boxes, labels, output_size, image_size, DEVICE
+                B, _, Hf, Wf = features.shape
+                gt_heat, gt_bbox, gt_cls = build_detection_targets(
+                    boxes, labels, output_size=(Hf, Wf), image_size=tuple(images.shape[-2:]), device=DEVICE
                 )
                 
-                # Get raw heatmap logits (recompute shared features for loss)
-                with torch.no_grad():
-                    features_shared = detector.shared(features)
+                features_shared = detector.shared(features)
                 heatmap_logits = detector.heatmap(features_shared)  # Raw logits for focal loss
                 
                 # Compute losses with detailed tracking
                 loss_heatmap = focal_loss_heatmap(
-                    heatmap_logits, gt_heatmap, alpha=0.25, gamma=2.0, pos_weight=10.0
+                    heatmap_logits, gt_heat, alpha=0.25, gamma=2.0, pos_weight=10.0
                 )
-                loss_bbox = torch.nn.SmoothL1Loss()(bbox_reg, gt_bbox)
-                
-                # Track labeled vs total pixels for statistics only
-                if cls_logits is not None:
-                    B_curr, _, H, W = cls_logits.shape
-                    gt_cls_flat = gt_cls.reshape(-1)
-                    valid_mask = gt_cls_flat >= 0
-                    num_labeled = valid_mask.sum().item()
-                    num_total = gt_cls_flat.numel()
-                else:
-                    # When class head is off, approximate labeled pixels from heatmap positives
-                    hm_pos = (gt_heatmap > 0).sum().item()
-                    num_labeled = hm_pos
-                    num_total = gt_heatmap.numel()
-                
-                # Skip class loss: causes OOM with 4246 classes on flattened tensors
-                # (99% of pixels are unlabeled anyway, class prediction is auxiliary)
-                loss_cls = torch.tensor(0.0, device=DEVICE)
-                
+                loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_heat, pos_thresh=0.3)
+                                
                 # Heatmap-focused loss: spatial localization is the main goal for Stage 1
                 loss = loss_heatmap + 0.1 * loss_bbox
-                
-                # Track for statistics BEFORE gradient accumulation scaling
-                loss_heatmap_total += loss_heatmap.item()
-                loss_bbox_total += loss_bbox.item() if isinstance(loss_bbox, torch.Tensor) and loss_bbox.numel() > 0 else 0
-                loss_cls_total += loss_cls.item() if isinstance(loss_cls, torch.Tensor) and loss_cls.numel() > 0 else 0
-                num_labeled_pixels += num_labeled
-                num_total_pixels += num_total
-                
-                # Scale for gradient accumulation (after tracking)
                 loss = loss / GRADIENT_ACCUMULATION_STEPS
             
             if scaler is not None:
@@ -310,34 +287,34 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                 loss.backward()
             
             # Optimizer step with gradient accumulation
-            if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+            if (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                 if scaler is not None:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(list(unet.parameters()) + list(detector.parameters()), 1.0)
+                torch.nn.utils.clip_grad_norm_(list(unet.parameters()) + list(detector.parameters()), 1.0)
+
+                if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(list(unet.parameters()) + list(detector.parameters()), 1.0)
                     optimizer.step()
-                optimizer.zero_grad()
+
+                optimizer.zero_grad(set_to_none=True)
             
-            # Accumulate unscaled loss for reporting
-            total_loss += loss.item() * GRADIENT_ACCUMULATION_STEPS
-            num_batches += 1
-            pbar.set_postfix({"loss": total_loss / num_batches})
+            # logging (unscaled)
+            total_loss += float(loss.item() * GRADIENT_ACCUMULATION_STEPS)
+            total_heat += float(loss_heatmap.item())
+            total_bbox += float(loss_bbox.item())
+            n_batches += 1
+
+            pbar.set_postfix({
+                "loss": total_loss / n_batches,
+                "heat": total_heat / n_batches,
+                "bbox": total_bbox / n_batches
+            })
             
-            # Print progress every 1000 batches when tqdm is disabled
-            if not sys.stdout.isatty() and (batch_idx + 1) % 1000 == 0:
-                avg_heat = loss_heatmap_total / num_batches
-                avg_bbox = loss_bbox_total / num_batches
-                avg_cls = loss_cls_total / num_batches if num_labeled_pixels > 0 else 0
-                labeled_pct = 100.0 * num_labeled_pixels / max(1, num_total_pixels)
-                print(f"Epoch {epoch+1}/{num_epochs} - Batch {batch_idx+1}/{len(train_dataloader)}")
-                print(f"  Total Loss: {total_loss/num_batches:.4f} = Heatmap: {avg_heat:.4f} + Bbox: {avg_bbox*0.5:.4f} + Cls: {avg_cls*0.5:.4f}")
-                print(f"  Labeled pixels: {num_labeled_pixels}/{num_total_pixels} ({labeled_pct:.1f}%)")
             
             # Clear cache periodically to prevent memory fragmentation
-            if batch_idx % 50 == 0:
+            if step % 50 == 0:
                 torch.cuda.empty_cache()
         
         scheduler.step()
@@ -345,72 +322,42 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         
         # Validation
         val_loss = validate_detector(unet, detector, val_dataloader, DEVICE, USE_MIXED_PRECISION)
-        train_loss = total_loss / num_batches
-        
-        # Compute average component losses
-        avg_loss_heatmap = loss_heatmap_total / num_batches
-        avg_loss_bbox = loss_bbox_total / num_batches
-        avg_loss_cls = loss_cls_total / num_batches if num_labeled_pixels > 0 else 0
-        labeled_pct = 100.0 * num_labeled_pixels / max(1, num_total_pixels)
-        
-        print(f"\nEpoch {epoch+1}/{num_epochs} - Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        print(f"  Components - Heatmap: {avg_loss_heatmap:.4f} | Bbox: {avg_loss_bbox:.4f} | Cls: {avg_loss_cls:.4f}")
-        print(f"  Labeled pixels: {num_labeled_pixels}/{num_total_pixels} ({labeled_pct:.1f}%)")
-        
+        train_loss = total_loss / max(1, n_batches)
+        print(f"\nEpoch {epoch+1}/{num_epochs}  Train: {train_loss:.4f}  Val: {val_loss:.4f}")
+
         # Early stopping check
-        if best_val_loss is None or val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            is_best = True
+        
+        is_best = (best_val is None) or (val_loss < best_val)
+        if is_best:
+            best_val = val_loss
+            patience_ctr = 0
         else:
-            patience_counter += 1
-            is_best = False
+            patience_ctr += 1
         
-        # Save checkpoint
-        checkpoint_path = checkpoint_dir / f"detector_epoch{epoch+1}.pt"
-        try:
-            torch.save({
-                'epoch': epoch + 1,
-                'unet_state_dict': unet.state_dict(),
-                'detector_state_dict': detector.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': train_loss,
-                'val_loss': val_loss,
-                'vocab_size': vocab.vocab_size,
-                'is_best': is_best,
-            }, checkpoint_path)
-            
-            if is_best:
-                # Also save as best checkpoint
-                best_path = checkpoint_dir / "detector_best.pt"
-                torch.save({
-                    'epoch': epoch + 1,
-                    'unet_state_dict': unet.state_dict(),
-                    'detector_state_dict': detector.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': train_loss,
-                    'val_loss': val_loss,
-                    'vocab_size': vocab.vocab_size,
-                    'is_best': True,
-                }, best_path)
-                print(f"✅ Saved best checkpoint: {best_path} (Val Loss: {val_loss:.4f})")
-            else:
-                print(f"✅ Saved checkpoint: {checkpoint_path}")
-            
-            # Only prune after successful save
-            prune_to_keep_last_n(checkpoint_dir, keep=2, exclude="detector_best.pt")
-        except Exception as e:
-            print(f"⚠️ Failed to save checkpoint: {e}")
-        
-        # Early stopping
-        if patience_counter >= patience:
-            print(f"\n⏹️  Early stopping triggered! (Val loss did not improve for {patience} epochs)")
-            print(f"Best val loss: {best_val_loss:.4f} at epoch {epoch+1-patience_counter}")
-            break
+        ckpt = {
+            "epoch": epoch + 1,
+            "unet_state_dict": unet.state_dict(),
+            "detector_state_dict": detector.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "vocab_size": vocab.vocab_size,
+            "is_best": is_best,
+        }
+
+        epoch_path = checkpoint_dir / f"detector_epoch{epoch+1}.pt"
+        torch.save(ckpt, epoch_path)
+
+        if is_best:
+            torch.save(ckpt, checkpoint_dir / "detector_best.pt")
+            print(f"✅ saved best: detector_best.pt (val={val_loss:.4f})")
+
+        if patience > 0 and patience_ctr >= patience:
+            print(f"⏹️ early stop (no val improvement for {patience} epochs). best={best_val:.4f}")
+            break    
     
     print(f"\n{'='*60}")
     print(f"Stage 1 training complete!")
-    print(f"Final checkpoint: {checkpoint_path}")
     print(f"Best checkpoint: {checkpoint_dir / 'detector_best.pt'}")
     print(f"{'='*60}\n")
     
@@ -675,4 +622,4 @@ def train(stage2=False, args=None):
         )
         
 if __name__ == "__main__":
-    train(stage2=False)  # Run both stages
+    train(stage2=False)  # Run stage 1 only
