@@ -57,13 +57,22 @@ class KuzushijiDataset(Dataset):
         # Filter by split if specified
         if split is not None:
             split_file = self.root_dir / "splits" / f"{split}.txt"
-            if split_file.exists():
-                with open(split_file, 'r') as f:
-                    valid_ids = set(f.read().strip().splitlines())
-                self.ann_files = [f for f in self.ann_files if f.stem in valid_ids]
-                print(f"Loaded {split} split: {len(self.ann_files)} files")
-            else:
-                print(f"Warning: Split file {split_file} not found, using all data")
+            if not split_file.exists():
+                raise FileNotFoundError(f"Expected split file at {split_file} but it does not exist. Refusing to fall back to full dataset.")
+
+            with open(split_file, 'r') as f:
+                lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+            # Strip optional .json suffix from ids to match annotation stems
+            valid_ids = set([ln[:-5] if ln.endswith('.json') else ln for ln in lines])
+
+            self.ann_files = [f for f in self.ann_files if f.stem in valid_ids]
+            print(f"Loaded {split} split: {len(self.ann_files)} files")
+
+            if len(self.ann_files) == 0:
+                raise ValueError(
+                    f"Split file {split_file} produced zero matches against annotations."
+                    " Ensure IDs match annotation filenames (with or without .json suffix)."
+                )
         
         # Precompute image paths: safer than reconstructing later
         self.items = []

@@ -50,8 +50,8 @@ def build_detection_targets(boxes, labels, output_size, image_size, device, sigm
             if cx < 0 or cy < 0 or cx >= W_out or cy >= H_out:
                 continue
                 
-            ix = int(cx)
-            iy = int(cy)
+            ix = int(torch.clamp(torch.tensor(cx), 0, W_out - 1))
+            iy = int(torch.clamp(torch.tensor(cy), 0, H_out - 1))
             
             # Box size in output grid units
             bw = max((x2 - x1) / stride_w, 1.0)
@@ -102,19 +102,29 @@ def compute_detection_losses(pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.
     else:
         loss_heat = torch.tensor(0.0, device=gt_heatmap.device)
     
-    # Bbox loss (L1, only at valid positions)
     if 'bbox' in pred:
-        loss_bbox = F.l1_loss(pred['bbox'], gt_bbox)
+        pos_mask = (gt_heatmap[:, 0] > 0.1)  # (B, H, W)
+
+        if pos_mask.sum() > 0:
+            pred_bbox = pred['bbox'].permute(0, 2, 3, 1)[pos_mask]  # (N_pos, 4)
+            gt_bbox_pos = gt_bbox.permute(0, 2, 3, 1)[pos_mask]
+            loss_bbox = F.smooth_l1_loss(pred_bbox, gt_bbox_pos)
+        else:
+            loss_bbox = torch.tensor(0.0, device=device)
     else:
-        loss_bbox = torch.tensor(0.0, device=gt_bbox.device)
+        loss_bbox = torch.tensor(0.0, device=device)
+
     
     # Classification loss (CE at valid positions)
-    logits = pred['cls'].permute(0, 2, 3, 1).reshape(-1, pred['cls'].shape[1])
-    labels_flat = gt_cls.reshape(-1)
-    valid = labels_flat >= 0
+    if 'cls' in pred:
+        logits = pred['cls'].permute(0, 2, 3, 1).reshape(-1, pred['cls'].shape[1])
+        labels_flat = gt_cls.reshape(-1)
+        valid = labels_flat >= 0
     
-    if valid.sum() > 0:
-        loss_cls = F.cross_entropy(logits[valid], labels_flat[valid])
+        if valid.sum() > 0:
+            loss_cls = F.cross_entropy(logits[valid], labels_flat[valid])
+        else:
+            loss_cls = torch.tensor(0.0, device=gt_cls.device)
     else:
         loss_cls = torch.tensor(0.0, device=gt_cls.device)
     

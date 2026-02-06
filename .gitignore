@@ -164,7 +164,7 @@ assets/data/
 data/
 logs/
 assets/logs/
-assets/data_preprocessed/
+assets/
 data_preprocessed/
 submit_training.sh
 CLUSTER_QUICK_REFERENCE.md

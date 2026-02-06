@@ -26,7 +26,7 @@ from PIL import Image
 
 # Add parent directory to path to import config
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import DATA_DIR, DATA_PREPROCESSED_DIR, DATA_ZIP_DIR
+from config import DATA_DIR, DATA_PREPROCESSED_DIR, DATA_ZIP_DIR, EXCLUDE_BOOKS
 from tqdm import tqdm
 
 OUTPUT_ANNOT_DIR = DATA_DIR / "annotations"
@@ -72,7 +72,20 @@ def process_book(book_dir: Path):
         img_path = matches[0]
 
         # Copy image into DATA_DIR/<book_id>/images/
-        book_id = img_path.name.split("_")[0]
+        # Extract base book_id (e.g., "hnsd00000" from "hnsd00000_0001_1.jpg")
+        # Split by underscore and take first parts that are alphabetic/numeric prefix
+        parts = img_path.name.split("_")
+        # Find the base book_id by removing numeric suffixes like _0001, _0002, etc.
+        book_id = parts[0]
+        
+        # If filename has pattern like "hnsd00000_0001_1.jpg", keep just "hnsd00000"
+        # by checking if subsequent parts are 4-digit numbers (like 0001, 0002)
+        if len(parts) > 1 and parts[1].isdigit() and len(parts[1]) == 4:
+            book_id = parts[0]  # Already correct
+        elif len(parts) > 1:
+            # Otherwise, might need to combine: e.g., if it's numeric_id_variant
+            # For numeric-only book IDs, just take first part
+            book_id = parts[0]
         dest_img_dir = OUTPUT_IMAGES_DIR / book_id / "images"
         dest_img_dir.mkdir(parents=True, exist_ok=True)
         dest_img_path = dest_img_dir / img_path.name
@@ -127,16 +140,31 @@ def process_book(book_dir: Path):
 
 def main():
     #Get all data from zip files if any
-    zip_files = list(DATA_ZIP_DIR.glob("*.zip"))
-    for zip_file in zip_files:
-        print(f"Unzipping {zip_file} to {DATA_PREPROCESSED_DIR}...")
-        unzip_file(zip_file, DATA_PREPROCESSED_DIR)
+    # zip_files = list(DATA_ZIP_DIR.glob("*.zip"))
+    # for zip_file in zip_files:
+    #     print(f"Unzipping {zip_file} to {DATA_PREPROCESSED_DIR}...")
+    #     unzip_file(zip_file, DATA_PREPROCESSED_DIR)
+    
     all_labels = set()
+    
+    # Check which books are already processed by looking at existing folders in DATA_DIR
+    processed_books = set()
+    if OUTPUT_IMAGES_DIR.exists():
+        # Look for existing book folders (those with /images subdirectory)
+        for item in OUTPUT_IMAGES_DIR.iterdir():
+            if item.is_dir() and (item / "images").exists():
+                processed_books.add(item.name)
+    
     # Alle Buch-Ordner durchsuchen
     book_dirs = [d for d in DATA_PREPROCESSED_DIR.iterdir() if d.is_dir()]
     print(f"📚 Found {len(book_dirs)} book directories.")
+    print(f"📋 Already processed: {len(processed_books)} books")
+    
+    # Filter to only unprocessed books
+    unprocessed_dirs = [d for d in book_dirs if d.name not in processed_books and d.name not in EXCLUDE_BOOKS]
+    print(f"⏳ To process: {len(unprocessed_dirs)} books")
 
-    for book_dir in tqdm(book_dirs, desc="Processing books"):
+    for book_dir in tqdm(unprocessed_dirs, desc="Processing books"):
         book_labels = process_book(book_dir)
         all_labels.update(book_labels)
 

@@ -9,15 +9,17 @@ from .utils import make_gn
 
 
 class DetectorHead(nn.Module):
-    def __init__(self, in_ch, num_classes, extra_channels=64, predict_boxes=True):
+    def __init__(self, in_ch, num_classes, extra_channels=64, predict_boxes=True, dropout_rate=0.3, predict_classes=False):
         super().__init__()
         self.predict_boxes = predict_boxes
+        self.predict_classes = predict_classes
         
-        # shared conv
+        # shared conv with dropout to reduce overfitting
         self.shared = nn.Sequential(
             nn.Conv2d(in_ch, extra_channels, kernel_size=3, padding=1),
             make_gn(extra_channels),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_rate),
         )
         
         if predict_boxes:
@@ -26,14 +28,20 @@ class DetectorHead(nn.Module):
             # bbox regression (dx,dy,w,h)
             self.bbox = nn.Conv2d(extra_channels, 4, kernel_size=1)
         
-        # classification logits (per-pixel class logits if desired), here we do a small per-box classifier instead
-        self.cls_logits = nn.Conv2d(extra_channels, num_classes, kernel_size=1)
+        # classification logits (per-pixel class logits) - optional to save memory
+        if predict_classes:
+            self.cls_logits = nn.Conv2d(extra_channels, num_classes, kernel_size=1)
+        else:
+            self.cls_logits = None
 
     def forward(self, feat):
         x = self.shared(feat)
-        cls = self.cls_logits(x)  # per-pixel class logits
         
-        result = {'cls': cls}
+        result = {}
+        
+        if self.cls_logits is not None:
+            cls = self.cls_logits(x)
+            result['cls'] = cls
         
         if self.predict_boxes:
             heat = torch.sigmoid(self.heatmap(x))

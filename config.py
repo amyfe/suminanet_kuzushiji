@@ -20,22 +20,24 @@ EXCLUDE_BOOKS = {
 
 # training
 DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-BATCH_SIZE = 4
-GRADIENT_ACCUMULATION_STEPS = 2
+BATCH_SIZE = 2  # Reduced from 4 to fit in 16GB GPU
+GRADIENT_ACCUMULATION_STEPS = 4  # Increased to maintain effective batch size of 8
 NUM_WORKERS = 2  
-NUM_EPOCHS = 20 
+NUM_EPOCHS = 15 
 LR = 5e-4
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP = 1.0  # Gradient clipping threshold
 CTC_WARMUP_EPOCHS = 0  
 # images
-IMAGE_SIZE = (512, 512)  # (H, W) centralized resize for training/validation
+IMAGE_SIZE = (256, 256)
 
 
 # model
 IN_CHANNELS = 3
 BASE_FEATURES = 32
-NUM_CLASSES = 3000 # adjust to Kuzushiji label count
+# NUM_CLASSES will be set dynamically from vocab (vocab_size includes special tokens)
+# Actual data has ~2906 characters + 4 special tokens (PAD, UNK, SOS, EOS) = ~2910 total
+NUM_CLASSES = 3000  # Keep as upper bound, actual value set in training from vocab.vocab_size
 DETECTOR_HEATMAP_SIGMA = 2
 
 
