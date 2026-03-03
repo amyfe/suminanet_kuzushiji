@@ -5,7 +5,14 @@ from torchvision.ops import roi_align
 from .focal_loss import focal_loss_heatmap
 
 
-def build_detection_targets(boxes, labels, output_size, image_size, device, sigma=2.0):
+def build_detection_targets(boxes,
+    labels,
+    output_size,
+    image_size,
+    device,
+    sigma=0.5,          # REDUCED: 0.5 instead of 2.0 for tighter peaks
+    bbox_radius=0,          # 0 = only center cell (most stable)
+    heatmap_min=1e-6):
     """
     Build detection targets (heatmap, bbox regression, class) from ground truth boxes.
     
@@ -44,35 +51,45 @@ def build_detection_targets(boxes, labels, output_size, image_size, device, sigm
             x1, y1, x2, y2 = box.tolist()
             
             # Box center in output grid coordinates
-            cx = (x1 + x2) / 2.0 / stride_w
-            cy = (y1 + y2) / 2.0 / stride_h
+            cx = (x1 + x2) *0.5 / stride_w
+            cy = (y1 + y2) *0.5 / stride_h
             
             if cx < 0 or cy < 0 or cx >= W_out or cy >= H_out:
                 continue
                 
-            ix = int(torch.clamp(torch.tensor(cx), 0, W_out - 1))
-            iy = int(torch.clamp(torch.tensor(cy), 0, H_out - 1))
+            ix = int(cx)
+            iy = int(cy)
+            ix = max(0, min(ix, W_out - 1))
+            iy = max(0, min(iy, H_out - 1))
             
             # Box size in output grid units
             bw = max((x2 - x1) / stride_w, 1.0)
             bh = max((y2 - y1) / stride_h, 1.0)
             
             # Gaussian heatmap
-            gaussian_sigma = max(1.0, sigma * (bw + bh) / 2.0)
+            dx = cx - float(ix)
+            dy = cy - float(iy)
+
+            gaussian_sigma = max(1.0, sigma * (bw + bh) *0.5)
             yy = torch.arange(0, H_out, device=device).view(H_out, 1).float()
             xx = torch.arange(0, W_out, device=device).view(1, W_out).float()
             g = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * gaussian_sigma ** 2))
-            
-            gt_heatmap[i, 0] = torch.max(gt_heatmap[i, 0], g)
+            gt_heatmap[i, 0] = torch.maximum(gt_heatmap[i, 0], g)
             
             # Bbox targets (offset from grid cell + size)
-            dx = cx - ix
-            dy = cy - iy
-            gt_bbox[i, :, iy, ix] = torch.tensor([dx, dy, bw, bh], device=device)
-            
-            # Class label
-            gt_cls[i, iy, ix] = label.item()
-    
+            x0 = max(0, ix - bbox_radius)
+            x1i = min(W_out - 1, ix + bbox_radius)
+            y0 = max(0, iy - bbox_radius)
+            y1i = min(H_out - 1, iy + bbox_radius)
+
+            gt_bbox[i, 0, y0:y1i+1, x0:x1i+1] = dx
+            gt_bbox[i, 1, y0:y1i+1, x0:x1i+1] = dy
+            gt_bbox[i, 2, y0:y1i+1, x0:x1i+1] = bw
+            gt_bbox[i, 3, y0:y1i+1, x0:x1i+1] = bh
+
+            # class label only at center cell (keeps it sparse; even if class head disabled)
+            gt_cls[i, iy, ix] = int(label.item())
+    gt_heatmap = gt_heatmap.clamp(min=heatmap_min, max=1.0)
     return gt_heatmap, gt_bbox, gt_cls
 
 
@@ -110,9 +127,9 @@ def compute_detection_losses(pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.
             gt_bbox_pos = gt_bbox.permute(0, 2, 3, 1)[pos_mask]
             loss_bbox = F.smooth_l1_loss(pred_bbox, gt_bbox_pos)
         else:
-            loss_bbox = torch.tensor(0.0, device=device)
+            loss_bbox = torch.tensor(0.0, device=gt_heatmap.device)
     else:
-        loss_bbox = torch.tensor(0.0, device=device)
+        loss_bbox = torch.tensor(0.0, device=gt_heatmap.device)
 
     
     # Classification loss (CE at valid positions)

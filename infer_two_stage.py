@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-from config import DEVICE
+from config import DEVICE, IMAGE_SIZE
 from model.kuronet import UNet, DetectorHead
 from model.kuronet.classifier import build_glyph_classifier
 from utils.box_extraction import extract_boxes_from_heatmap
@@ -138,7 +138,7 @@ class TwoStageInference:
             
             return transcription
     
-    def _preprocess_image(self, image_path, target_size=(512, 512)):
+    def _preprocess_image(self, image_path, target_size=IMAGE_SIZE):
         """Load and preprocess image.
         
         Args:

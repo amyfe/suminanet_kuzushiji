@@ -27,7 +27,7 @@ class KuzushijiDataset(Dataset):
             root_dir: Path to data directory
             vocab: VocabManager instance
             use_sequences: Whether to return text sequences
-            transform: Image transforms (None for default augmentation)
+            transform: Image transforms (None for default based on split)
             resize: Target image size (height, width). Defaults to config.IMAGE_SIZE when None.
             split: 'train', 'val', or None (use all data)
         """
@@ -39,13 +39,21 @@ class KuzushijiDataset(Dataset):
         self.split = split
 
         if transform is None:
-            # Training augmentation: color jitter, small geometric transforms
-            self.transform = T.Compose([
-                T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-                T.RandomAffine(degrees=2, translate=(0.05, 0.05), scale=(0.95, 1.05)),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
+            # Separate transforms for train vs val: validation should NOT have augmentation
+            if split == 'train':
+                # Training: use augmentation
+                self.transform = T.Compose([
+                    T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+                    T.RandomAffine(degrees=2, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ])
+            else:
+                # Validation/test: no augmentation, only normalize
+                self.transform = T.Compose([
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ])
         else:
             self.transform = transform
 

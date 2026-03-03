@@ -45,7 +45,6 @@ echo ""
 python validate_stage1.py \
     --checkpoint checkpoints/stage1_detection/detector_best.pt \
     --num_samples 20 \
-    --confidence 0.3 \
     --split val
 
 # python diagnose_stage1.py

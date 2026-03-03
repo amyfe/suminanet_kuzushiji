@@ -1,4 +1,5 @@
 # model/kuronet/decoder/attention.py
+from config import IMAGE_SIZE
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -137,7 +138,7 @@ class SeqDecoderAttention(nn.Module):
         sos_id=None,
         eos_id=None,
         max_len=None,
-        image_size=(512, 512),
+        image_size=IMAGE_SIZE,
     ):
         device = enc_outputs.device
         # Batch size: derive from input_seq if provided, else from encoder outputs

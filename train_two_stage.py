@@ -1,4 +1,4 @@
-"""Two-stage training pipeline: Stage 1 (detection) + Stage 2 (classification).7981"""
+"""Two-stage training pipeline: Stage 1 (detection) + Stage 2 (classification).8040"""
 import sys
 import torch
 import torch.nn as nn
@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from config import (
     DATA_DIR, DEVICE, BATCH_SIZE, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, WEIGHT_DECAY,
-    GRADIENT_ACCUMULATION_STEPS, CHECKPOINT_DIR, USE_MIXED_PRECISION
+    GRADIENT_ACCUMULATION_STEPS, CHECKPOINT_DIR, USE_MIXED_PRECISION, DETECTOR_HEATMAP_SIGMA
 )
 from model.kuronet import UNet, DetectorHead
 from model.kuronet.encoder_wrapper import EncoderWrapper
@@ -19,6 +19,8 @@ from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
 from utils.vocab import VocabManager
+import torch.nn.functional as F
+
 
 def prune_existing_checkpoints(ckpt_dir: Path, old_name: str = "checkpoint_old.pt"):
     """At start: keep only the newest checkpoint, rename it to old_name."""
@@ -103,20 +105,23 @@ def masked_bbox_smoothl1_loss(
     Compute bbox loss only where objects exist.
     We use gt_heatmap to decide positives (peaks / gaussian area).
     """
-    # positive mask: (B,1,H,W) -> (B,4,H,W)
-    pos = (gt_heatmap > pos_thresh).to(pred_bbox.dtype)
-    mask = pos.expand_as(pred_bbox)
+    pos = (gt_heatmap[:, 0] > pos_thresh)  # (B,H,W) bool
+    if pos.sum() == 0:
+        return pred_bbox.new_tensor(0.0)
 
-    # sum over positives, divide by #pos locations (not by H*W)
-    diff = nn.functional.smooth_l1_loss(pred_bbox * mask, gt_bbox * mask, reduction="sum")
-    denom = mask.sum().clamp(min=1.0)
-    return diff / denom
+    # select positives -> (Npos,4)
+    pred_pos = pred_bbox.permute(0, 2, 3, 1)[pos]
+    gt_pos = gt_bbox.permute(0, 2, 3, 1)[pos]
+
+    return F.smooth_l1_loss(pred_pos, gt_pos, reduction="mean")
 
 def validate_detector(unet, detector, dataloader, DEVICE, USE_MIXED_PRECISION):
     unet.eval()
     detector.eval()
     
     total_loss = 0.0
+    total_heat = 0.0
+    total_bbox = 0.0
     num_batches = 0
     
     for batch in tqdm(dataloader, desc="Validating", leave=False):
@@ -126,33 +131,30 @@ def validate_detector(unet, detector, dataloader, DEVICE, USE_MIXED_PRECISION):
         
         with torch.amp.autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
             features = unet(images)
-            outputs = detector(features)
-            
-            # heatmap = outputs.get('heatmap')
-            # bbox_reg = outputs.get('bbox')
-            # cls_logits = outputs.get('cls') 
-            
             B, _, Hf, Wf = features.shape
             gt_heat, gt_bbox, gt_cls = build_detection_targets(
-                boxes, labels, output_size=(Hf, Wf), image_size=tuple(images.shape[-2:]), device=DEVICE
+                boxes, labels, output_size=(Hf, Wf), image_size=tuple(images.shape[-2:]), device=DEVICE, sigma=DETECTOR_HEATMAP_SIGMA
             )
             
-            # IMPORTANT: focal wants raw logits -> compute them from shared features
             features_shared = detector.shared(features)
-            heat_logits = detector.heatmap(features_shared)  # (B,1,H,W) raw
+            heat_logits = detector.heatmap(features_shared)
+            bbox_reg = detector.bbox(features_shared)
             
             loss_heatmap = focal_loss_heatmap(heat_logits, gt_heat, alpha=0.25, gamma=2.0, pos_weight=10.0)
-            if "bbox" in outputs:
-                loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_heat, pos_thresh=0.3)
-            else:
-                loss_bbox = torch.tensor(0.0, device=DEVICE)
-
-            loss = loss_heatmap + 0.1 * loss_bbox
+            loss_bbox = masked_bbox_smoothl1_loss(bbox_reg, gt_bbox, gt_heat, pos_thresh=0.1)
+            loss = loss_heatmap + 0.5 * loss_bbox
         
         total_loss += float(loss.item())
+        total_heat += float(loss_heatmap.item())
+        total_bbox += float(loss_bbox.item())
         num_batches += 1
     
-    return total_loss / max(1, num_batches)
+    denom = max(1, num_batches)
+    return (
+        total_loss / denom,
+        total_heat / denom,
+        total_bbox / denom,
+    )
 
 def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3, val_split=None):
     """Stage 1: Train DetectorHead to localize characters.
@@ -265,7 +267,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                 
                 B, _, Hf, Wf = features.shape
                 gt_heat, gt_bbox, gt_cls = build_detection_targets(
-                    boxes, labels, output_size=(Hf, Wf), image_size=tuple(images.shape[-2:]), device=DEVICE
+                    boxes, labels, output_size=(Hf, Wf), image_size=tuple(images.shape[-2:]), device=DEVICE, sigma=DETECTOR_HEATMAP_SIGMA
                 )
                 
                 features_shared = detector.shared(features)
@@ -275,10 +277,11 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                 loss_heatmap = focal_loss_heatmap(
                     heatmap_logits, gt_heat, alpha=0.25, gamma=2.0, pos_weight=10.0
                 )
-                loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_heat, pos_thresh=0.3)
+                # Lower pos_thresh for bbox (include broader region around peak) and increase bbox weight
+                loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_heat, pos_thresh=0.1)
                                 
-                # Heatmap-focused loss: spatial localization is the main goal for Stage 1
-                loss = loss_heatmap + 0.1 * loss_bbox
+                # Balanced loss: heatmap for localization, bbox for accurate box dimensions
+                loss = loss_heatmap + 0.5 * loss_bbox  # Increased from 0.1 to 0.5
                 loss = loss / GRADIENT_ACCUMULATION_STEPS
             
             if scaler is not None:
@@ -321,12 +324,17 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         torch.cuda.empty_cache()
         
         # Validation
-        val_loss = validate_detector(unet, detector, val_dataloader, DEVICE, USE_MIXED_PRECISION)
+        val_loss, val_heat, val_bbox = validate_detector(
+            unet, detector, val_dataloader, DEVICE, USE_MIXED_PRECISION
+        )
         train_loss = total_loss / max(1, n_batches)
-        print(f"\nEpoch {epoch+1}/{num_epochs}  Train: {train_loss:.4f}  Val: {val_loss:.4f}")
+        print(
+            f"\nEpoch {epoch+1}/{num_epochs}  "
+            f"Train: {train_loss:.4f} (heat={total_heat/max(1,n_batches):.4f}, bbox={total_bbox/max(1,n_batches):.4f})  "
+            f"Val: {val_loss:.4f} (heat={val_heat:.4f}, bbox={val_bbox:.4f})"
+        )
 
         # Early stopping check
-        
         is_best = (best_val is None) or (val_loss < best_val)
         if is_best:
             best_val = val_loss
@@ -352,9 +360,10 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
             torch.save(ckpt, checkpoint_dir / "detector_best.pt")
             print(f"✅ saved best: detector_best.pt (val={val_loss:.4f})")
 
-        if patience > 0 and patience_ctr >= patience:
-            print(f"⏹️ early stop (no val improvement for {patience} epochs). best={best_val:.4f}")
-            break    
+        # DISABLED: Early stopping to collect full training curves
+        # if patience > 0 and patience_ctr >= patience:
+        #     print(f"⏹️ early stop (no val improvement for {patience} epochs). best={best_val:.4f}")
+        #     break    
     
     print(f"\n{'='*60}")
     print(f"Stage 1 training complete!")

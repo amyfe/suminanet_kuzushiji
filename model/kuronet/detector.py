@@ -23,9 +23,7 @@ class DetectorHead(nn.Module):
         )
         
         if predict_boxes:
-            # heatmap: per-class center heatmap (or single foreground map + classifier per-box)
             self.heatmap = nn.Conv2d(extra_channels, 1, kernel_size=1)
-            # bbox regression (dx,dy,w,h)
             self.bbox = nn.Conv2d(extra_channels, 4, kernel_size=1)
         
         # classification logits (per-pixel class logits) - optional to save memory
