@@ -160,7 +160,7 @@ def validate_detector(unet, detector, dataloader, DEVICE, USE_MIXED_PRECISION):
             
             loss_heatmap = focal_loss_heatmap(heat_logits, gt_heat, alpha=0.25, gamma=2.0, pos_weight=10.0)
             loss_bbox = masked_bbox_smoothl1_loss(bbox_reg, gt_bbox, gt_bbox_mask)
-            loss = loss_heatmap + 0.3 * loss_bbox
+            loss = loss_heatmap + 0.5 * loss_bbox
 
             if batch_idx == 0:
                 print("\n[VAL DEBUG]")

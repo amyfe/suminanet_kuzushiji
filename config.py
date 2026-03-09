@@ -38,7 +38,7 @@ BASE_FEATURES = 32
 # NUM_CLASSES will be set dynamically from vocab (vocab_size includes special tokens)
 # Actual data has ~2906 characters + 4 special tokens (PAD, UNK, SOS, EOS) = ~2910 total
 NUM_CLASSES = 3000  # Keep as upper bound, actual value set in training from vocab.vocab_size
-DETECTOR_HEATMAP_SIGMA = 0.5  # Reduced from 2.0 for tighter, more localized peaks
+DETECTOR_HEATMAP_SIGMA = 1.0  # Controls Gaussian spread; capped in build_detection_targets
 
 
 # training modes

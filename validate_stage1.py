@@ -112,7 +112,6 @@ def extract_boxes_from_heatmap(
     for y, x, sc in zip(ys, xs, scores_np):
         dx, dy, bw, bh = bbox_np[:, y, x]
 
-        # Ensure width/height are positive (use softplus-like behavior)
         bw = max(bw, 0.1)  # Minimum 0.1 grid units
         bh = max(bh, 0.1)
 

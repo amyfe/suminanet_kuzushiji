@@ -44,7 +44,7 @@ class KuzushijiDataset(Dataset):
                 # Training: use augmentation
                 self.transform = T.Compose([
                     T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-                    T.RandomAffine(degrees=2, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+                    # T.RandomAffine(degrees=2, translate=(0.05, 0.05), scale=(0.95, 1.05)), boxes not tranformed yet
                     T.ToTensor(),
                     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
                 ])

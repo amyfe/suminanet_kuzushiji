@@ -44,10 +44,13 @@ python validate_stage1.py \
     --checkpoint "$CHECKPOINT" \
     --split "$SPLIT" \
     --num_samples "$NUM_SAMPLES" \
-    --confidence 0.5 \
-    --top_k 200 \
-    --nms_iou 0.5 \
-    --iou_thr 0.5
+    --job_id "$SLURM_JOB_ID" \
+    --confidence 0.3 \
+    --top_k 400 \
+    --nms_iou 0.3 \
+    --iou_thr 0.5 \
+    --min_box_size 4
+
 
 echo ""
 echo "=========================================="

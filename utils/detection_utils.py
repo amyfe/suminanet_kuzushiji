@@ -11,7 +11,7 @@ def build_detection_targets(
     output_size,
     image_size,
     device,
-    sigma=0.5,          # REDUCED: 0.5 instead of 2.0 for tighter peaks
+    sigma=1.0,          
     bbox_radius=0,          # 0 = only center cell (most stable)
     heatmap_min=1e-6):
     """
@@ -72,7 +72,7 @@ def build_detection_targets(
             dx = cx - float(ix)
             dy = cy - float(iy)
 
-            gaussian_sigma = max(0.5, sigma * (bw + bh) *0.5)
+            gaussian_sigma = min(2.0, max(0.5, sigma * min(bw, bh) * 0.25))
             yy = torch.arange(0, H_out, device=device).view(H_out, 1).float()
             xx = torch.arange(0, W_out, device=device).view(1, W_out).float()
             g = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * gaussian_sigma ** 2))
@@ -84,14 +84,15 @@ def build_detection_targets(
             y0 = max(0, iy - bbox_radius)
             y1i = min(H_out - 1, iy + bbox_radius)
 
-            gt_bbox[i, 0, y0:y1i+1, x0:x1i+1] = dx
-            gt_bbox[i, 1, y0:y1i+1, x0:x1i+1] = dy
-            gt_bbox[i, 2, y0:y1i+1, x0:x1i+1] = bw
-            gt_bbox[i, 3, y0:y1i+1, x0:x1i+1] = bh
+            # bbox targets ONLY at center
+            gt_bbox[i,0,iy,ix] = dx
+            gt_bbox[i,1,iy,ix] = dy
+            gt_bbox[i,2,iy,ix] = bw
+            gt_bbox[i,3,iy,ix] = bh
 
             # class label only at center cell (keeps it sparse; even if class head disabled)
             gt_cls[i, iy, ix] = int(label.item())
-            gt_bbox_mask[i, y0:y1i+1, x0:x1i+1] = True
+            gt_bbox_mask[i,iy,ix] = True
     gt_heatmap = gt_heatmap.clamp(min=heatmap_min, max=1.0)
     return gt_heatmap, gt_bbox, gt_bbox_mask, gt_cls
 
