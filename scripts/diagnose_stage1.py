@@ -90,7 +90,7 @@ def analyze_detection_targets():
         B, _, H_in, W_in = images.shape
         H_feat, W_feat = H_in // 8, W_in // 8
         
-        gt_heatmap, gt_bbox, gt_cls = build_detection_targets(
+        gt_heatmap, gt_bbox, gt_bbox_mask, gt_cls = build_detection_targets(
             boxes, labels, (H_feat, W_feat), (H_in, W_in), DEVICE
         )
         

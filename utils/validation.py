@@ -100,6 +100,16 @@ def validate(encoder, decoder, detector, dataloader, vocab, device,
             
             if text_ids is None:
                 continue
+
+            text_ids_present = batch.get("text_ids_present", None)
+            if text_ids_present is not None:
+                valid_idx = text_ids_present.to(device).nonzero(as_tuple=False).squeeze(1)
+                if valid_idx.numel() == 0:
+                    continue
+                images = images.index_select(0, valid_idx)
+                valid_idx_list = valid_idx.detach().cpu().tolist()
+                boxes = [boxes[i] for i in valid_idx_list]
+                labels = [labels[i] for i in valid_idx_list]
             
             input_seq = text_ids[:, :-1]
             targets = text_ids[:, 1:]
@@ -147,14 +157,15 @@ def validate(encoder, decoder, detector, dataloader, vocab, device,
             # Detection loss (Option 1: DetectorHead)
             if detector is not None and feats2d is not None and use_detector_head:
                 det_pred = detector(feats2d)
-                H_out, W_out = det_pred['cls'].shape[2:]
-                gt_heatmap, gt_bbox, gt_cls = build_detection_targets(
-                    boxes, labels, (H_out, W_out), IMAGE_SIZE, device, sigma=detector_heatmap_sigma
-                )
-                loss_det, _ = compute_detection_losses(
-                    det_pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.0, 1.0)
-                )
-                total_det_loss += loss_det.item()
+                if 'heatmap' in det_pred:
+                    H_out, W_out = det_pred['heatmap'].shape[2:]
+                    gt_heatmap, gt_bbox, gt_bbox_mask, gt_cls = build_detection_targets(
+                        boxes, labels, (H_out, W_out), IMAGE_SIZE, device, sigma=detector_heatmap_sigma
+                    )
+                    loss_det, _ = compute_detection_losses(
+                        det_pred, gt_heatmap, gt_bbox, gt_bbox_mask, gt_cls, weights=(1.0, 1.0, 1.0)
+                    )
+                    total_det_loss += loss_det.item()
             
             # ROI Align loss (Option 2: attention-based boxes with feature alignment)
             if use_roi_attention and predicted_boxes is not None:

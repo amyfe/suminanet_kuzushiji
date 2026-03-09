@@ -5,7 +5,8 @@ from torchvision.ops import roi_align
 from .focal_loss import focal_loss_heatmap
 
 
-def build_detection_targets(boxes,
+def build_detection_targets(
+    boxes,
     labels,
     output_size,
     image_size,
@@ -38,6 +39,7 @@ def build_detection_targets(boxes,
     
     gt_heatmap = torch.zeros((B, 1, H_out, W_out), device=device)
     gt_bbox = torch.zeros((B, 4, H_out, W_out), device=device)
+    gt_bbox_mask = torch.zeros((B, H_out, W_out), dtype=torch.bool, device=device)
     gt_cls = torch.full((B, H_out, W_out), -1, dtype=torch.long, device=device)
     
     for i in range(B):
@@ -70,7 +72,7 @@ def build_detection_targets(boxes,
             dx = cx - float(ix)
             dy = cy - float(iy)
 
-            gaussian_sigma = max(1.0, sigma * (bw + bh) *0.5)
+            gaussian_sigma = max(0.5, sigma * (bw + bh) *0.5)
             yy = torch.arange(0, H_out, device=device).view(H_out, 1).float()
             xx = torch.arange(0, W_out, device=device).view(1, W_out).float()
             g = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * gaussian_sigma ** 2))
@@ -89,11 +91,12 @@ def build_detection_targets(boxes,
 
             # class label only at center cell (keeps it sparse; even if class head disabled)
             gt_cls[i, iy, ix] = int(label.item())
+            gt_bbox_mask[i, y0:y1i+1, x0:x1i+1] = True
     gt_heatmap = gt_heatmap.clamp(min=heatmap_min, max=1.0)
-    return gt_heatmap, gt_bbox, gt_cls
+    return gt_heatmap, gt_bbox, gt_bbox_mask, gt_cls
 
 
-def compute_detection_losses(pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.0, 1.0), use_focal_loss=True):
+def compute_detection_losses(pred, gt_heatmap, gt_bbox, gt_bbox_mask,gt_cls, weights=(1.0, 1.0, 1.0), use_focal_loss=True):
     """
     Compute detection losses.
     
@@ -120,11 +123,9 @@ def compute_detection_losses(pred, gt_heatmap, gt_bbox, gt_cls, weights=(1.0, 1.
         loss_heat = torch.tensor(0.0, device=gt_heatmap.device)
     
     if 'bbox' in pred:
-        pos_mask = (gt_heatmap[:, 0] > 0.1)  # (B, H, W)
-
-        if pos_mask.sum() > 0:
-            pred_bbox = pred['bbox'].permute(0, 2, 3, 1)[pos_mask]  # (N_pos, 4)
-            gt_bbox_pos = gt_bbox.permute(0, 2, 3, 1)[pos_mask]
+        if gt_bbox_mask.sum() > 0:
+            pred_bbox = pred['bbox'].permute(0, 2, 3, 1)[gt_bbox_mask]  # (N_pos, 4)
+            gt_bbox_pos = gt_bbox.permute(0, 2, 3, 1)[gt_bbox_mask]
             loss_bbox = F.smooth_l1_loss(pred_bbox, gt_bbox_pos)
         else:
             loss_bbox = torch.tensor(0.0, device=gt_heatmap.device)

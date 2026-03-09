@@ -42,9 +42,9 @@ class DetectorHead(nn.Module):
             result['cls'] = cls
         
         if self.predict_boxes:
-            heat = torch.sigmoid(self.heatmap(x))
+            heat_logits = self.heatmap(x)  # raw logits (no sigmoid)
             bbox = self.bbox(x)  # raw regression
-            result['heatmap'] = heat
+            result['heatmap'] = heat_logits
             result['bbox'] = bbox
         
         return result

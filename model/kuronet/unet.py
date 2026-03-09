@@ -3,8 +3,6 @@ A reasonably compact implementation to serve as encoder/decoder.
 """
 import torch
 import torch.nn as nn
-
-
 from .utils import make_gn
 import torch.nn.functional as F
 
@@ -40,54 +38,59 @@ class Down(nn.Module):
         return self.block(x)
     
 class FusionBlock(nn.Module):
-    def __init__(self, ch):
+    """
+    Fuse two feature maps (high-res skip and lower-res aux skip) deterministically.
+    - high: (B, ch_high, H, W)
+    - low:  (B, ch_low,  h, w)  -> upsampled to (H,W)
+    Output: (B, out_ch, H, W)
+    """
+    def __init__(self, ch_high: int, ch_low: int, out_ch: int):
         super().__init__()
-        # We don't know the incoming channel sizes for `high` and `low`
-        # at init time (they may differ). Create the 1x1 conv lazily
-        # on first forward pass based on the concatenated channel size.
-        self.conv: nn.Module | None = None
-        self.out_ch = ch
-        self.gn: nn.Module | None = None
+        in_ch = ch_high + ch_low
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.gn = make_gn(out_ch)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, high, low):
-        # Upsample 'low' to same spatial size as 'high'
         low_up = F.interpolate(low, size=high.shape[2:], mode="bilinear", align_corners=False)
         fused = torch.cat([high, low_up], dim=1)
-        # create conv + gn lazily to handle differing input channel sizes
-        if self.conv is None:
-            in_ch = fused.size(1)
-            self.conv = nn.Conv2d(in_ch, self.out_ch, 1, bias=False)
-            self.gn = make_gn(self.out_ch)
-            # move created modules to the same device as fused
-            self.conv.to(fused.device)
-            self.gn.to(fused.device)
         out = self.conv(fused)
-        assert self.gn is not None
         out = self.gn(out)
         return self.relu(out)
 
 
 class Up(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch: int, out_ch: int, skip_main_ch: int, skip_aux_ch: int | None = None):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
-        self.block = ConvBlock(in_ch, out_ch)
-        self.fusion = FusionBlock(out_ch)
+
+        self.use_fusion = skip_aux_ch is not None
+        if self.use_fusion:
+            self.fusion = FusionBlock(ch_high=skip_main_ch, ch_low=skip_aux_ch, out_ch=out_ch)
+            fused_skip_ch = out_ch
+        else:
+            self.fusion = None
+            fused_skip_ch = skip_main_ch
+        self.block = ConvBlock(out_ch + fused_skip_ch, out_ch)
 
     def forward(self, x, skip_main, skip_aux=None):
         x = self.up(x)
-        if skip_aux is not None:
+
+        if self.use_fusion:
+            if skip_aux is None:
+                raise ValueError("Up block expects skip_aux but got None.")
             skip_main = self.fusion(skip_main, skip_aux)
+
         # Match shapes if needed
         diffY = skip_main.size(2) - x.size(2)
         diffX = skip_main.size(3) - x.size(3)
         if diffY != 0 or diffX != 0:
             x = F.pad(x, [diffX // 2, diffX - diffX // 2,
                           diffY // 2, diffY - diffY // 2])
+
         x = torch.cat([x, skip_main], dim=1)
         return self.block(x)
-    
+
 class UNet(nn.Module):
     def __init__(self, in_channels=3, base_features=32):
         super().__init__()
@@ -99,21 +102,22 @@ class UNet(nn.Module):
 
         self.mid = ConvBlock(f * 8, f * 16)
 
-        self.up3 = Up(f * 16, f * 8)
-        self.up2 = Up(f * 8, f * 4)
-        self.up1 = Up(f * 4, f * 2)
-        self.up0 = Up(f * 2, f)
+        # Up(in_ch, out_ch, skip_main_ch, skip_aux_ch?)
+        self.up3 = Up(f * 16, f * 8,  skip_main_ch=f * 8,  skip_aux_ch=None)
+        self.up2 = Up(f * 8,  f * 4,  skip_main_ch=f * 4,  skip_aux_ch=f * 2)
+        self.up1 = Up(f * 4,  f * 2,  skip_main_ch=f * 2,  skip_aux_ch=f)
+        self.up0 = Up(f * 2,  f,      skip_main_ch=f,      skip_aux_ch=None)
 
     def forward(self, x):
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
+        x1 = self.inc(x)      # f
+        x2 = self.down1(x1)   # 2f
+        x3 = self.down2(x2)   # 4f
+        x4 = self.down3(x3)   # 8f
 
-        xm = self.mid(x4)
+        xm = self.mid(x4)     # 16f
 
         u3 = self.up3(xm, x4)
-        u2 = self.up2(u3, x3, skip_aux=x2)   # fuse with shallower encoder feature
+        u2 = self.up2(u3, x3, skip_aux=x2)
         u1 = self.up1(u2, x2, skip_aux=x1)
         u0 = self.up0(u1, x1)
         return u0

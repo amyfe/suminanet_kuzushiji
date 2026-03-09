@@ -66,6 +66,9 @@ def collate_fn(batch, pad_id):
     batch: list of samples from KuzushijiDataset
     Each sample contains: image (Tensor), text_ids (optional Tensor), text_length, boxes, labels
     Returns dict with images, text_ids_padded, text_lengths, boxes, labels
+    
+    NOTE: If a sample lacks text_ids, we still include boxes/labels for that image,
+    but set its text_ids to None. This ensures 1-to-1 correspondence between batch indices.
     """
     images = torch.stack([b["image"] for b in batch], dim=0)
     
@@ -74,18 +77,35 @@ def collate_fn(batch, pad_id):
     labels = [b.get("labels", torch.empty((0,), dtype=torch.long)) for b in batch]
     orientations = [b.get("orientation", "horizontal") for b in batch]
     
-    # Text sequences
-    seq_samples = [b for b in batch if ("text_ids" in b and b["text_ids"] is not None)]
-    if len(seq_samples) == 0:
-        return {"image": images, "text_ids": None, "text_lengths": torch.tensor([]), 
-            "boxes": boxes, "labels": labels, "orientations": orientations}
+    # Text sequences - fill missing with None instead of filtering
+    text_ids_list = []
+    text_lengths_list = []
+    for b in batch:
+        if "text_ids" in b and b["text_ids"] is not None:
+            text_ids_list.append(b["text_ids"])
+            text_lengths_list.append(len(b["text_ids"]))
+        else:
+            text_ids_list.append(None)
+            text_lengths_list.append(0)
     
-    text_ids = [b["text_ids"] for b in seq_samples]
-    text_lengths = torch.tensor([len(t) for t in text_ids], dtype=torch.long)
-    text_padded = nn.utils.rnn.pad_sequence(text_ids, batch_first=True, padding_value=pad_id)
+    # Pad sequences (skip None entries)
+    valid_text_ids = [t for t in text_ids_list if t is not None]
+    if len(valid_text_ids) == 0:
+        text_padded = None
+        text_lengths = torch.tensor(text_lengths_list, dtype=torch.long)
+    else:
+        text_padded = nn.utils.rnn.pad_sequence(valid_text_ids, batch_first=True, padding_value=pad_id)
+        text_lengths = torch.tensor(text_lengths_list, dtype=torch.long)
     
-    return {"image": images, "text_ids": text_padded, "text_lengths": text_lengths,
-        "boxes": boxes, "labels": labels, "orientations": orientations}
+    return {
+        "image": images, 
+        "text_ids": text_padded, 
+        "text_lengths": text_lengths,
+        "boxes": boxes, 
+        "labels": labels, 
+        "orientations": orientations,
+        "text_ids_present": torch.tensor([t is not None for t in text_ids_list], dtype=torch.bool)
+    }
 
 def scheduled_teacher_forcing(epoch, total_epochs, start=1.0, end=0.2, schedule="exp"):
     if schedule == "linear":
@@ -98,20 +118,18 @@ def scheduled_teacher_forcing(epoch, total_epochs, start=1.0, end=0.2, schedule=
 def masked_bbox_smoothl1_loss(
     pred_bbox: torch.Tensor,   # (B,4,H,W)
     gt_bbox: torch.Tensor,     # (B,4,H,W)
-    gt_heatmap: torch.Tensor,  # (B,1,H,W) gaussian peaks
-    pos_thresh: float = 0.3,
+    gt_bbox_mask: torch.Tensor,  # (B,H,W) boolean mask
 ) -> torch.Tensor:
     """
     Compute bbox loss only where objects exist.
     We use gt_heatmap to decide positives (peaks / gaussian area).
     """
-    pos = (gt_heatmap[:, 0] > pos_thresh)  # (B,H,W) bool
-    if pos.sum() == 0:
+    if gt_bbox_mask.sum() == 0:
         return pred_bbox.new_tensor(0.0)
 
     # select positives -> (Npos,4)
-    pred_pos = pred_bbox.permute(0, 2, 3, 1)[pos]
-    gt_pos = gt_bbox.permute(0, 2, 3, 1)[pos]
+    pred_pos = pred_bbox.permute(0, 2, 3, 1)[gt_bbox_mask]
+    gt_pos = gt_bbox.permute(0, 2, 3, 1)[gt_bbox_mask]
 
     return F.smooth_l1_loss(pred_pos, gt_pos, reduction="mean")
 
@@ -124,7 +142,7 @@ def validate_detector(unet, detector, dataloader, DEVICE, USE_MIXED_PRECISION):
     total_bbox = 0.0
     num_batches = 0
     
-    for batch in tqdm(dataloader, desc="Validating", leave=False):
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validating", leave=False)):
         images = batch['image'].to(DEVICE)
         boxes = [b.to(DEVICE) if b.numel() > 0 else torch.empty((0, 4), device=DEVICE) for b in batch.get('boxes', [])]
         labels = [l.to(DEVICE) if (l is not None and l.numel() > 0) else torch.empty((0,), dtype=torch.long, device=DEVICE) for l in batch.get('labels', [])]
@@ -132,8 +150,8 @@ def validate_detector(unet, detector, dataloader, DEVICE, USE_MIXED_PRECISION):
         with torch.amp.autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
             features = unet(images)
             B, _, Hf, Wf = features.shape
-            gt_heat, gt_bbox, gt_cls = build_detection_targets(
-                boxes, labels, output_size=(Hf, Wf), image_size=tuple(images.shape[-2:]), device=DEVICE, sigma=DETECTOR_HEATMAP_SIGMA
+            gt_heat, gt_bbox, gt_bbox_mask, gt_cls = build_detection_targets(
+                boxes, labels, output_size=(Hf, Wf), image_size=tuple(images.shape[-2:]), device=DEVICE, sigma=DETECTOR_HEATMAP_SIGMA, bbox_radius=0
             )
             
             features_shared = detector.shared(features)
@@ -141,8 +159,24 @@ def validate_detector(unet, detector, dataloader, DEVICE, USE_MIXED_PRECISION):
             bbox_reg = detector.bbox(features_shared)
             
             loss_heatmap = focal_loss_heatmap(heat_logits, gt_heat, alpha=0.25, gamma=2.0, pos_weight=10.0)
-            loss_bbox = masked_bbox_smoothl1_loss(bbox_reg, gt_bbox, gt_heat, pos_thresh=0.1)
-            loss = loss_heatmap + 0.5 * loss_bbox
+            loss_bbox = masked_bbox_smoothl1_loss(bbox_reg, gt_bbox, gt_bbox_mask)
+            loss = loss_heatmap + 0.3 * loss_bbox
+
+            if batch_idx == 0:
+                print("\n[VAL DEBUG]")
+                print("images.shape:", tuple(images.shape))
+                print("features.shape:", tuple(features.shape))
+                print("gt_heat min/max/mean:",
+                    gt_heat.min().item(),
+                    gt_heat.max().item(),
+                    gt_heat.mean().item())
+                print("num bbox supervised cells:", int(gt_bbox_mask.sum().item()))
+                if gt_bbox_mask.sum() > 0:
+                    gt_bbox_pos = gt_bbox.permute(0, 2, 3, 1)[gt_bbox_mask]
+                    pred_bbox_pos = bbox_reg.permute(0, 2, 3, 1)[gt_bbox_mask]
+                    print("gt_bbox mean [dx,dy,bw,bh]:", gt_bbox_pos.mean(dim=0).detach().cpu().tolist())
+                    print("pred_bbox mean [dx,dy,bw,bh]:", pred_bbox_pos.mean(dim=0).detach().cpu().tolist())
+
         
         total_loss += float(loss.item())
         total_heat += float(loss_heatmap.item())
@@ -245,6 +279,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         # Training
         unet.train()
         detector.train()
+        optimizer.zero_grad(set_to_none=True)
         
         total_loss = 0.0
         total_heat = 0.0
@@ -261,24 +296,20 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
             labels = [l.to(DEVICE) if l.numel() > 0 else torch.empty((0,), dtype=torch.long, device=DEVICE) for l in batch.get('labels', [])]
             
             with torch.amp.autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
-                # Single forward pass - reuse detector outputs
+                # Single forward pass
                 features = unet(images)  # (B, 32, H/8, W/8)
-                outputs = detector(features)  # Returns dict with 'heatmap', 'bbox', 'cls'
+                outputs = detector(features)  # Returns dict with 'heatmap' (raw logits), 'bbox', etc.
                 
                 B, _, Hf, Wf = features.shape
-                gt_heat, gt_bbox, gt_cls = build_detection_targets(
+                gt_heat, gt_bbox, gt_bbox_mask, gt_cls = build_detection_targets(
                     boxes, labels, output_size=(Hf, Wf), image_size=tuple(images.shape[-2:]), device=DEVICE, sigma=DETECTOR_HEATMAP_SIGMA
                 )
-                
-                features_shared = detector.shared(features)
-                heatmap_logits = detector.heatmap(features_shared)  # Raw logits for focal loss
-                
                 # Compute losses with detailed tracking
                 loss_heatmap = focal_loss_heatmap(
-                    heatmap_logits, gt_heat, alpha=0.25, gamma=2.0, pos_weight=10.0
+                    outputs["heatmap"], gt_heat, alpha=0.25, gamma=2.0, pos_weight=10.0
                 )
                 # Lower pos_thresh for bbox (include broader region around peak) and increase bbox weight
-                loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_heat, pos_thresh=0.1)
+                loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_bbox_mask)
                                 
                 # Balanced loss: heatmap for localization, bbox for accurate box dimensions
                 loss = loss_heatmap + 0.5 * loss_bbox  # Increased from 0.1 to 0.5
@@ -315,11 +346,54 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                 "bbox": total_bbox / n_batches
             })
             
-            
+            if epoch == 0 and step == 0:
+                print("\n[TRAIN DEBUG]")
+                print("images.shape:", tuple(images.shape))
+                print("features.shape:", tuple(features.shape))
+                print("output_size:", (Hf, Wf))
+                print("image_size:", tuple(images.shape[-2:]))
+                print("gt_heat min/max/mean:",
+                    gt_heat.min().item(),
+                    gt_heat.max().item(),
+                    gt_heat.mean().item())
+                print("num bbox supervised cells:", int(gt_bbox_mask.sum().item()))
+
+                if gt_bbox_mask.sum() > 0:
+                    gt_bbox_pos = gt_bbox.permute(0, 2, 3, 1)[gt_bbox_mask]
+                    pred_bbox_pos = outputs["bbox"].permute(0, 2, 3, 1)[gt_bbox_mask]
+
+                    print("gt_bbox mean [dx,dy,bw,bh]:",
+                        gt_bbox_pos.mean(dim=0).detach().cpu().tolist())
+                    print("gt_bbox min  [dx,dy,bw,bh]:",
+                        gt_bbox_pos.min(dim=0).values.detach().cpu().tolist())
+                    print("gt_bbox max  [dx,dy,bw,bh]:",
+                        gt_bbox_pos.max(dim=0).values.detach().cpu().tolist())
+
+                    print("pred_bbox mean [dx,dy,bw,bh]:",
+                        pred_bbox_pos.mean(dim=0).detach().cpu().tolist())
+                    print("pred_bbox min  [dx,dy,bw,bh]:",
+                        pred_bbox_pos.min(dim=0).values.detach().cpu().tolist())
+                    print("pred_bbox max  [dx,dy,bw,bh]:",
+                        pred_bbox_pos.max(dim=0).values.detach().cpu().tolist())
             # Clear cache periodically to prevent memory fragmentation
             if step % 50 == 0:
                 torch.cuda.empty_cache()
         
+        if n_batches > 0 and (n_batches % GRADIENT_ACCUMULATION_STEPS) != 0:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+
+            torch.nn.utils.clip_grad_norm_(
+                list(unet.parameters()) + list(detector.parameters()), 1.0
+            )
+
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+
+            optimizer.zero_grad(set_to_none=True)
         scheduler.step()
         torch.cuda.empty_cache()
         
@@ -460,6 +534,14 @@ def train_sequence_stage(detector_ckpt_path, num_epochs=10, lr=None, checkpoint_
                 if text_ids is None:
                     continue
 
+                # collate_fn packs only valid text rows; keep images aligned to that subset
+                text_ids_present = batch.get("text_ids_present", None)
+                if text_ids_present is not None:
+                    valid_idx = text_ids_present.to(DEVICE).nonzero(as_tuple=False).squeeze(1)
+                    if valid_idx.numel() == 0:
+                        continue
+                    images = images.index_select(0, valid_idx)
+
                 optimizer.zero_grad()
                 
                 with amp.autocast(enabled=USE_MIXED_PRECISION):
@@ -531,6 +613,17 @@ def train_sequence_stage(detector_ckpt_path, num_epochs=10, lr=None, checkpoint_
             
             if text_ids is None:
                 continue
+
+            # collate_fn packs only valid text rows; keep image/orientation tensors aligned
+            text_ids_present = batch.get("text_ids_present", None)
+            if text_ids_present is not None:
+                valid_idx = text_ids_present.to(DEVICE).nonzero(as_tuple=False).squeeze(1)
+                if valid_idx.numel() == 0:
+                    continue
+                images = images.index_select(0, valid_idx)
+                if orientations is not None:
+                    valid_idx_cpu = valid_idx.detach().cpu().tolist()
+                    orientations = [orientations[i] for i in valid_idx_cpu]
 
             input_seq = text_ids[:, :-1]
             targets = text_ids[:, 1:]

@@ -76,7 +76,10 @@ class TwoStageInference:
         with torch.no_grad():
             # Stage 1: Detection
             features = self.unet(image_tensor)  # (1, 32, H/8, W/8)
-            heatmap, bbox_reg, cls_logits = self.detector(features)
+            det_out = self.detector(features)
+            heatmap = det_out["heatmap"]
+            bbox_reg = det_out["bbox"]
+            cls_logits = det_out.get("cls", None)
             
             # Extract boxes
             results = extract_boxes_from_heatmap(
@@ -112,7 +115,7 @@ class TwoStageInference:
             
             # Convert to character labels
             if self.vocab:
-                characters = [self.vocab.id2char(p) for p in char_preds]
+                characters = [self.vocab.id2char.get(p, self.vocab.UNK_TOKEN) for p in char_preds]
             else:
                 characters = [str(p) for p in char_preds]
             

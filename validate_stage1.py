@@ -13,7 +13,9 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 import json
+import os
 from datetime import datetime
+import torch.nn.functional as F
 
 from config import DATA_DIR, DEVICE, IMAGE_SIZE, CHECKPOINT_DIR
 from model.kuronet import UNet, DetectorHead
@@ -66,17 +68,17 @@ def non_max_suppression(boxes, scores, iou_threshold=0.5):
 # Decode: (dx,dy,bw,bh) -> (x1,y1,x2,y2)
 # -------------------------
 def extract_boxes_from_heatmap(
-    heatmap,            # (1,1,H,W) already sigmoid
+    heatmap_probs,      # (1,1,H,W) already sigmoid
     bbox_reg,           # (1,4,H,W) = (dx,dy,bw,bh)
     confidence_thresh=0.5,     
     output_size=(64, 64),
     image_size=IMAGE_SIZE,
     top_k=200,
     nms_iou=0.5,
+    min_box_size=4.0,
+    debug=False,
 ):
-    import torch.nn.functional as F
-
-    hm = heatmap[0, 0]      # (H,W)
+    hm = heatmap_probs[0, 0]
     bbox = bbox_reg[0]      # (4,H,W)
 
     # local maxima (3x3)
@@ -93,21 +95,20 @@ def extract_boxes_from_heatmap(
     if top_k is not None and len(order) > top_k:
         order = order[:top_k]
 
-    ys = peak_idx[order, 0].cpu().numpy()
-    xs = peak_idx[order, 1].cpu().numpy()
+    ys = peak_idx[order, 0].detach().cpu().numpy()
+    xs = peak_idx[order, 1].detach().cpu().numpy()
     scores_np = sorted_scores[:len(order)].detach().cpu().numpy().tolist()
 
-    H, W = hm.shape
     H_img, W_img = image_size
     H_out, W_out = output_size
-
     stride_h = H_img / float(H_out)
     stride_w = W_img / float(W_out)
 
     bbox_np = bbox.detach().cpu().numpy()
 
     boxes = []
-    skipped_count = 0
+    scores_out = []
+    skipped_invalid = 0
     for y, x, sc in zip(ys, xs, scores_np):
         dx, dy, bw, bh = bbox_np[:, y, x]
 
@@ -119,82 +120,110 @@ def extract_boxes_from_heatmap(
         cy = (y + dy) * stride_h
         w  = bw * stride_w
         h  = bh * stride_h
-        x1 = cx - 0.5*w
-        y1 = cy - 0.5*h
-        x2 = cx + 0.5*w
-        y2 = cy + 0.5*h
+        w = max(w, min_box_size)
+        h = max(h, min_box_size)
+
+        y1 = cy - 0.5 * h
+        x2 = cx + 0.5 * w
+        y2 = cy + 0.5 * h
+        x1 = cx - 0.5 * w
+
+        x1 = float(np.clip(x1, 0, W_img))
+        y1 = float(np.clip(y1, 0, H_img))
+        x2 = float(np.clip(x2, 0, W_img))
+        y2 = float(np.clip(y2, 0, H_img))
 
         # enforce ordering
         if x2 <= x1 or y2 <= y1:
-            skipped_count += 1
+            skipped_invalid += 1
             continue
 
         boxes.append([x1, y1, x2, y2])
+        scores_out.append(float(sc))
     
     # Debug: print stats on first batch
-    if len(ys) > 0:
-        print(f"  → Peak detection: {len(ys)} peaks found, {skipped_count} skipped (bad ordering)")
-        print(f"    Sample predictions: bw={bbox_np[2, ys[0], xs[0]]:.2f}, bh={bbox_np[3, ys[0], xs[0]]:.2f}")
-        print(f"    Stride: h={stride_h:.2f}, w={stride_w:.2f}")
+    if debug:
+        bw_vals = bbox_np[2]
+        bh_vals = bbox_np[3]
+        print(f"  → peaks found: {len(ys)} | kept after valid decode: {len(scores_out)} | skipped: {skipped_invalid}")
+        print(f"    heatmap stats min/max/mean: {hm.min().item():.4f} / {hm.max().item():.4f} / {hm.mean().item():.4f}")
+        print(f"    bbox bw stats min/max/mean: {bw_vals.min():.4f} / {bw_vals.max():.4f} / {bw_vals.mean():.4f}")
+        print(f"    bbox bh stats min/max/mean: {bh_vals.min():.4f} / {bh_vals.max():.4f} / {bh_vals.mean():.4f}")
+        print(f"    stride_h={stride_h:.2f}, stride_w={stride_w:.2f}")
 
     if len(boxes) == 0:
         return [], [], []
 
     # NMS
-    keep = non_max_suppression(boxes, scores_np[:len(boxes)], iou_threshold=nms_iou)
+    keep = non_max_suppression(boxes, scores_out, iou_threshold=nms_iou)
     boxes = [boxes[i] for i in keep]
-    scores_out = [scores_np[i] for i in keep]
+    scores_out = [scores_out[i] for i in keep]
 
     # you currently don’t predict classes in stage1 => dummy class=0
     classes = [0] * len(boxes)
     return boxes, scores_out, classes
 
 
-# -------------------------
-# Metrics: add mean IoU of matched TPs
-# -------------------------
+# --------------------------------------------------
+# Matching / metrics
+# --------------------------------------------------
+def match_predictions_to_gt(gt_boxes, pred_boxes, iou_threshold=0.5):
+    gt_boxes = np.asarray(gt_boxes, dtype=np.float32)
+    pred_boxes = np.asarray(pred_boxes, dtype=np.float32)
+
+    if gt_boxes.size == 0:
+        gt_boxes = gt_boxes.reshape(0, 4)
+    elif gt_boxes.ndim == 1:
+        gt_boxes = gt_boxes.reshape(1, 4)
+
+    if pred_boxes.size == 0:
+        pred_boxes = pred_boxes.reshape(0, 4)
+    elif pred_boxes.ndim == 1:
+        pred_boxes = pred_boxes.reshape(1, 4)
+
+    matched_gt = set()
+    tp = 0
+    fp = 0
+    matched_ious = []
+
+    if len(pred_boxes) == 0:
+        return 0, 0, len(gt_boxes), []
+
+    if len(gt_boxes) == 0:
+        return 0, len(pred_boxes), 0, []
+
+    ious = np.zeros((len(pred_boxes), len(gt_boxes)), dtype=np.float32)
+    for i, pred_box in enumerate(pred_boxes):
+        ious[i] = compute_iou_batch(pred_box, gt_boxes)
+
+    for i in range(len(pred_boxes)):
+        best_iou = 0.0
+        best_gt = -1
+        for j in range(len(gt_boxes)):
+            if j not in matched_gt and ious[i, j] > best_iou:
+                best_iou = float(ious[i, j])
+                best_gt = j
+
+        if best_iou >= iou_threshold:
+            tp += 1
+            matched_gt.add(best_gt)
+            matched_ious.append(best_iou)
+        else:
+            fp += 1
+
+    fn = len(gt_boxes) - len(matched_gt)
+    return tp, fp, fn, matched_ious
+
 def compute_detection_metrics(gt_boxes_list, pred_boxes_list, iou_threshold=0.5):
     total_tp = total_fp = total_fn = 0
     matched_ious = []
 
     for gt_boxes, pred_boxes in zip(gt_boxes_list, pred_boxes_list):
-        gt_boxes = np.asarray(gt_boxes, dtype=np.float32)
-        pred_boxes = np.asarray(pred_boxes, dtype=np.float32)
-
-        if gt_boxes.ndim == 1 and gt_boxes.size > 0:
-            gt_boxes = gt_boxes.reshape(1, 4)
-        if pred_boxes.ndim == 1 and pred_boxes.size > 0:
-            pred_boxes = pred_boxes.reshape(1, 4)
-
-        if len(gt_boxes) == 0 and len(pred_boxes) == 0:
-            continue
-        if len(pred_boxes) == 0:
-            total_fn += len(gt_boxes)
-            continue
-        if len(gt_boxes) == 0:
-            total_fp += len(pred_boxes)
-            continue
-
-        ious = np.zeros((len(pred_boxes), len(gt_boxes)), dtype=np.float32)
-        for i, pred_box in enumerate(pred_boxes):
-            ious[i] = compute_iou_batch(pred_box, gt_boxes)
-
-        matched_gt = set()
-        for i in range(len(pred_boxes)):
-            best_iou = 0.0
-            best_gt = -1
-            for j in range(len(gt_boxes)):
-                if j not in matched_gt and ious[i, j] > best_iou:
-                    best_iou = float(ious[i, j])
-                    best_gt = j
-            if best_iou >= iou_threshold:
-                total_tp += 1
-                matched_gt.add(best_gt)
-                matched_ious.append(best_iou)
-            else:
-                total_fp += 1
-
-        total_fn += len(gt_boxes) - len(matched_gt)
+        tp, fp, fn, ious = match_predictions_to_gt(gt_boxes, pred_boxes, iou_threshold=iou_threshold)
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+        matched_ious.extend(ious)
 
     precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) else 0.0
     recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) else 0.0
@@ -213,6 +242,10 @@ def denormalize_image(image_tensor):
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
+# -------------------------
+# Main visualtisation function
+# -------------------------
+
 def visualize_boxes_only(image_tensor, gt_boxes, pred_boxes, out_path):
     img = denormalize_image(image_tensor)
     for box in gt_boxes:
@@ -223,24 +256,46 @@ def visualize_boxes_only(image_tensor, gt_boxes, pred_boxes, out_path):
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
     cv2.imwrite(str(out_path), img)
 
+def visualize_centers_only(image_tensor, gt_boxes, pred_boxes, out_path):
+    img = denormalize_image(image_tensor)
+
+    for box in gt_boxes:
+        x1, y1, x2, y2 = box
+        cx = int(0.5 * (x1 + x2))
+        cy = int(0.5 * (y1 + y2))
+        cv2.circle(img, (cx, cy), 2, (0, 255, 0), -1)
+
+    for box in pred_boxes:
+        x1, y1, x2, y2 = box
+        cx = int(0.5 * (x1 + x2))
+        cy = int(0.5 * (y1 + y2))
+        cv2.circle(img, (cx, cy), 2, (0, 0, 255), -1)
+
+    cv2.imwrite(str(out_path), img)
 
 def validate_stage1(
     checkpoint_path,
     confidence_thresh=0.5,      
     split="val",
     num_samples=None,          # None => full split
-    top_k=200,
+    top_k=300,
     nms_iou=0.5,
     iou_threshold=0.5,
+    min_box_size = 4.0,
+    job_id=None,
 ):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(CHECKPOINT_DIR) / "stage1_validation" / timestamp
+    resolved_job_id = job_id or os.environ.get("SLURM_JOB_ID") or os.environ.get("JOB_ID")
+    run_tag = f"{timestamp}_job{resolved_job_id}" if resolved_job_id else timestamp
+    out_dir = Path(CHECKPOINT_DIR) / "stage1_validation" / run_tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n🔍 Stage1 validation")
     print(f"  ckpt: {checkpoint_path}")
     print(f"  split: {split}")
+    print(f"  job_id: {resolved_job_id if resolved_job_id else 'n/a'}")
     print(f"  conf: {confidence_thresh} | top_k: {top_k} | nms_iou: {nms_iou} | iou_thr: {iou_threshold}")
+    print(f"  min_box_size: {min_box_size}")
     print(f"  out: {out_dir}")
 
     ann_files = sorted(list((Path(DATA_DIR) / "annotations").glob("*.json")))
@@ -257,11 +312,6 @@ def validate_stage1(
 
     unet = UNet(in_channels=3, base_features=32).to(DEVICE)
     detector = DetectorHead(in_ch=32, num_classes=vocab.vocab_size, predict_classes=False).to(DEVICE)
-
-    unet.eval()
-    with torch.no_grad():
-        dummy = torch.zeros(1, 3, IMAGE_SIZE[0], IMAGE_SIZE[1], device=DEVICE)
-        _ = unet(dummy)  # triggers FusionBlock conv/gn creation
 
     ckpt = torch.load(checkpoint_path, map_location=DEVICE)
 
@@ -289,19 +339,22 @@ def validate_stage1(
             features = unet(images)
             outputs = detector(features)
 
-            heatmap = outputs["heatmap"]  
+            heatmap_probs = torch.sigmoid(outputs["heatmap"])  
             bbox_reg = outputs["bbox"]
 
             _, _, Hf, Wf = features.shape
+            debug_this = (idx == 0)
 
             pred_boxes, pred_scores, _ = extract_boxes_from_heatmap(
-                heatmap=heatmap,
+                heatmap_probs=heatmap_probs,
                 bbox_reg=bbox_reg,
                 confidence_thresh=confidence_thresh,
                 output_size=(Hf, Wf),
                 image_size=IMAGE_SIZE,
                 top_k=top_k,
                 nms_iou=nms_iou,
+                min_box_size=min_box_size,
+                debug=debug_this,
             )
 
             all_gt_boxes.append(gt_boxes)
@@ -311,16 +364,21 @@ def validate_stage1(
             total_pred += len(pred_boxes)
 
             # check sth for first batch
-            if idx == 0:
-                hm = heatmap[0,0].detach().cpu()
-                bb = bbox_reg[0].detach().cpu()
-                print("heatmap stats min/max/mean:", float(hm.min()), float(hm.max()), float(hm.mean()))
-                print("bbox dx/dy/bw/bh mean:", [float(bb[c].mean()) for c in range(4)])
-                print("bbox bw/bh min/max:", float(bb[2].min()), float(bb[2].max()), float(bb[3].min()), float(bb[3].max()))
-                print("num gt boxes", len(gt_boxes))
+            if debug_this:
+                print(f"    num gt boxes: {len(gt_boxes)}")
+                if len(pred_boxes) > 0:
+                    pred_arr = np.asarray(pred_boxes, dtype=np.float32)
+                    widths = pred_arr[:, 2] - pred_arr[:, 0]
+                    heights = pred_arr[:, 3] - pred_arr[:, 1]
+                    print(f"    pred box width stats min/max/mean: {widths.min():.2f} / {widths.max():.2f} / {widths.mean():.2f}")
+                    print(f"    pred box height stats min/max/mean: {heights.min():.2f} / {heights.max():.2f} / {heights.mean():.2f}")
+                else:
+                    print("    no predicted boxes after decode")
             if idx < 30:
                 vis_path = out_dir / f"sample_{idx:04d}.png"
+                vis_centers = out_dir / f"sample_{idx:04d}_centers.png"
                 visualize_boxes_only(images[0], gt_boxes, pred_boxes, vis_path)
+                visualize_centers_only(images[0], gt_boxes, pred_boxes, vis_centers)
 
     metrics = compute_detection_metrics(all_gt_boxes, all_pred_boxes, iou_threshold=iou_threshold)
 
@@ -341,21 +399,20 @@ def validate_stage1(
     print(f"Mean IoU(TP): {metrics['mean_iou_tp']:.4f} (matches={metrics['num_matches']})")
     print("=" * 70)
 
+    metrics_to_save = {
+        **metrics,
+        "confidence_thresh": confidence_thresh,
+        "top_k": top_k,
+        "nms_iou": nms_iou,
+        "iou_threshold": iou_threshold,
+        "min_box_size": min_box_size,
+        "images_evaluated": len(all_gt_boxes),
+        "avg_gt_per_img": avg_gt,
+        "avg_pred_per_img": avg_pred,
+    }
+
     with open(out_dir / "metrics.json", "w") as f:
-        json.dump(
-            {
-                **metrics,
-                "confidence_thresh": confidence_thresh,
-                "top_k": top_k,
-                "nms_iou": nms_iou,
-                "iou_threshold": iou_threshold,
-                "images_evaluated": len(all_gt_boxes),
-                "avg_gt_per_img": avg_gt,
-                "avg_pred_per_img": avg_pred,
-            },
-            f,
-            indent=2,
-        )
+        json.dump(metrics_to_save, f, indent=2)
     print(f"✅ saved: {out_dir/'metrics.json'}")
     print(f"✅ visuals: {out_dir} (first ~30 imgs)")
 
@@ -367,10 +424,12 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--split", type=str, default="val", choices=["train", "val"])
-    p.add_argument("--confidence", type=float, default=0.3)
-    p.add_argument("--top_k", type=int, default=200)
+    p.add_argument("--confidence", type=float, default=0.5)
+    p.add_argument("--top_k", type=int, default=300)
     p.add_argument("--nms_iou", type=float, default=0.5)
     p.add_argument("--iou_thr", type=float, default=0.5)
+    p.add_argument("--min_box_size", type=float, default=4.0)
+    p.add_argument("--job_id", type=str, default=None, help="Optional job id suffix for output folder (default: SLURM_JOB_ID env)")
     p.add_argument("--num_samples", type=int, default=0, help="0 => full split")
     args = p.parse_args()
 
@@ -382,4 +441,6 @@ if __name__ == "__main__":
         top_k=args.top_k,
         nms_iou=args.nms_iou,
         iou_threshold=args.iou_thr,
+        min_box_size=args.min_box_size,
+        job_id=args.job_id,
     )
