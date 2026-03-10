@@ -107,126 +107,328 @@ Dadurch stabilisiert sich das Training bei langen Sequenzen.
 
 Ziel: Stabilität + Genauigkeit bei langen Sätzen, selbst mit unvollständigen Bounding Boxes.
 
-### 🧩 3️⃣ Utils / Infrastruktur
-#### 📁 utils/dataset.py
-
-Warum:
-Trainingsdaten liegen meist als Bilder + JSON-Annotationen vor (z. B. Bounding Boxes, Label-IDs).
-
-Was passiert:
-
-Lädt Bild (PIL.Image oder cv2.imread)
-
-Liest zugehörige JSON-Datei ({"boxes": [...], "labels": [...]}).
-
-Wandelt alles in Tensoren um.
-
-Optional: erzeugt Heatmaps aus Box-Zentren für den Detector.
-
-Ziel: ein einheitlicher Batch aus (image, heatmap, boxes, labels).
-
-#### 🔧 utils/transforms.py
-
-Warum:
-Historische Manuskripte sind oft verblasst, schief, gefaltet → Augmentation ist entscheidend.
-
-Was passiert:
-
-CLAHE (Kontrastverbesserung)
-
-Random Rotation / Perspective Warp
-
-Random Crop / Resize
-
-Normalize
-
-Ziel: robustes Modell gegen Schriftarteinflüsse, Verfärbungen und Scanfehler.
-
-#### 📊 utils/visualization.py
-
-Warum:
-Zum Debuggen und für qualitative Tests.
-Zeigt Heatmaps, Bounding Boxes, Prediction-Overlays und Trainingsverläufe (Loss, CER).
-
-### 🏋️‍♂️ train.py
-
-Warum:
-Hier läuft der gesamte Trainingszyklus zusammen:
-
-Lädt Config
-
-Initialisiert Dataset, Models, Optimizer
-
-Führt Training mit Teacher Forcing durch
-
-Speichert Checkpoints und Logs
-
-Besonderheit:
-Training wird modular ausgeführt – du kannst z. B. erst Detector pretrainen, dann Classifier, dann Decoder.
-
-### 📈 evaluate.py
-
-Warum:
-Zur Validierung und für quantitative Tests (mAP, CER, Top-k).
-Wird nach jedem Epoch-Checkpoint ausgeführt.
-
 ### Architekturentscheidungen:
 ① Feature-Extractor: ResNet, FusionNet oder etwas eigenes?
 Optionen:
 A. ResNet-18 / 34 (empfohlen für Thesis)
 
-stabil
+    stabil
 
-gut dokumentiert
+    gut dokumentiert
 
-leicht modifizierbar
+    leicht modifizierbar
 
-Multi-scale möglich
+    Multi-scale möglich
 
 B. FusionNet (wie KuroNet)
 
-kombiniert 3 Scales → bessere Erkennung kleiner Kuzushiji
+    kombiniert 3 Scales → bessere Erkennung kleiner Kuzushiji
 
-aber deutlich komplexer
+    aber deutlich komplexer
 
-schwieriger zu erklären in Thesis
+    schwieriger zu erklären in Thesis
 
-② Normalisierung: BatchNorm oder GroupNorm?
+    ② Normalisierung: BatchNorm oder GroupNorm?
 
-Wie du schon richtig gesagt hast:
+        Clanuwat et al. → GroupNorm
+        weil:
 
-Clanuwat et al. → GroupNorm
-weil:
+        kleine Batchsizes (1–4)
 
-kleine Batchsizes (1–4)
+        BatchNorm kollabiert da
 
-BatchNorm kollabiert da
+        GroupNorm batchunabhängig → stabil
 
-GroupNorm batchunabhängig → stabil
 
-③ Kontextmodellierung: LSTM oder ConvLSTM?
+Kontextmodellierung: LSTM oder ConvLSTM?
 
 KuroNet benutzt bi-directional ConvLSTM, weil:
 
-Textzellen hängen horizontal UND vertikal zusammen
+    Textzellen hängen horizontal UND vertikal zusammen
 
-ConvLSTM behält räumliche Struktur
+    ConvLSTM behält räumliche Struktur
 
-besser für historisches/verschobenes Kursive-Kuzushiji
+    besser für historisches/verschobenes Kursive-Kuzushiji
 
 Optionen:
 
-ConvLSTM (wie KuroNet)
+    ConvLSTM (wie KuroNet)
 
-Transformer Encoder (moderner, aber schwerer zu begründen)
+    Transformer Encoder (moderner, aber schwerer zu begründen)
 
-reine CNNs (zu schwach)
+    reine CNNs (zu schwach)
 
-④ Decoder: CTC oder Attention-Decoder?
-Kuzushiji OCR: CTC klar besser, weil:
+    ④ Decoder: CTC oder Attention-Decoder?
+    Kuzushiji OCR: CTC klar besser, weil:
 
-keine sauber segmentierten Zeichen
+    keine sauber segmentierten Zeichen
 
-keine exakte bounding box Reihenfolge
+    keine exakte bounding box Reihenfolge
 
-CTC ist de-facto Standard
+    CTC ist de-facto Standard
+
+
+# Mögliche Probleme
+
+## **No Reading Direction Awareness**
+**Problem:** Kuzushiji manuscripts have:
+- Vertical text (top-to-bottom, right-to-left columns) - **MOST COMMON**
+- Horizontal text (left-to-right, top-to-bottom) - RARE
+- Mixed orientations in same document
+
+**Impact:** Detection may work spatially, but sequence order will be **completely wrong** in Stage 2.
+
+#### 2. **No Character Similarity Handling**
+With 4246 classes and many visually similar characters:
+- 生 (10+ readings: sei, nama, iki, u...)
+- 土 vs 士 (earth vs samurai - differ by one pixel)
+- 未 vs 末 (not yet vs end - very similar)
+
+**Current:** Stage 1 has NO classification head (disabled due to OOM).
+**Result:** ALL disambiguation happens in Stage 2 decoder, which may struggle without spatial class priors.
+
+#### 3. **Sparse Targets (0.7% labeled pixels)**
+```
+Labeled pixels: 937/131,072 (0.71%)
+```
+**Problem:** 99% of feature map is unlabeled → model learns mostly on sparse signals.
+**Better:** Dense annotation or contrastive learning on unlabeled regions.
+
+---
+
+## Stage 2: Sequence Prediction Analysis
+
+### Current Implementation
+```python
+EncoderWrapper:
+  - orientation: "horizontal" or "vertical"
+  - Mean pooling across height (horizontal) or width (vertical)
+  - Outputs: (B, T, enc_dim) sequence
+
+SeqDecoderAttention:
+  - LSTM decoder with Luong attention
+  - Teacher forcing: 1.0 → 0.1 (scheduled decay)
+  - Predicts character sequence token-by-token
+```
+
+### ✅ Strengths
+1. **Contextual understanding** - Critical for ambiguous characters
+2. **Attention mechanism** - Can focus on relevant spatial regions
+3. **Teacher forcing schedule** - Helps training stability
+4. **Support for vertical/horizontal** - Architecture CAN handle it!
+
+### ❌ Critical Gaps
+
+#### 1. **Orientation is Hardcoded in Training**
+```python
+# train_two_stage.py line ~595
+enc_outputs, enc_mask = encoder(images, orientation="horizontal")
+```
+
+**Problem:** Training ALWAYS uses horizontal orientation.
+**Result:** Model never learns vertical text patterns (the dominant format in Kuzushiji!).
+
+**Fix Needed:**
+```python
+# Should detect or annotate reading direction per image
+orientation = detect_orientation(boxes) or annotations['orientation']
+enc_outputs, enc_mask = encoder(images, orientation=orientation)
+```
+
+#### 2. **Reading Order Not Applied**
+```python
+# utils/reading_order.py EXISTS but is NEVER CALLED
+def sort_boxes_reading_order(boxes, classes, direction="auto"):
+    # Auto-detects vertical vs horizontal
+    # Sorts boxes in proper reading order
+    # But UNUSED in training pipeline!
+```
+
+**Problem:** Even if boxes are detected correctly, they're processed in arbitrary order.
+**Result:** Decoder learns wrong character sequence patterns.
+
+**Fix Needed:** Integrate reading order before passing to decoder:
+```python
+sorted_boxes, sorted_labels, indices = sort_boxes_reading_order(
+    detected_boxes, detected_classes, direction="auto"
+)
+```
+
+#### 3. **No Explicit Similar Character Modeling**
+The architecture relies purely on:
+- Spatial context (from UNet features)
+- Sequence context (from LSTM + attention)
+
+**Missing:** 
+- Character confusion matrix
+- Hard negative mining for similar pairs
+- Triplet loss or contrastive learning for similar glyphs
+
+---
+
+5. **Add column detection for vertical text**
+   - Detect text columns before character detection
+   - Process each column separately
+   - Essential for multi-column layouts
+
+6. **Character confusion matrix**
+   - Analyze common misclassifications
+   - Add hard negative mining
+   - Weight loss higher for confusable pairs
+
+### **Optional Enhancements**
+
+7. **Layout segmentation** - Separate text from non-text
+8. **Multi-scale detection** - Better for varying character sizes
+9. **Transformer decoder** - May handle long sequences better than LSTM
+
+
+### 6. **No Data Augmentation**
+**Status**: ⚠️ DEPENDS ON DATASET
+
+Both stages use raw KuzushijiDataset. Check if dataset already includes augmentation:
+- Random rotation?
+- Elastic deformation?
+- Noise?
+
+**If missing**: Could add `torchvision.transforms` to improve robustness.
+
+
+### 3. **Detection Loss Not Used in Stage 2**
+**Status**: ⚠️ PARTIAL
+
+```python
+if predicted_boxes is not None and any(len(b) > 0 for b in boxes):
+    # Can add detection loss here if needed
+    # For now, we use boxes for guidance only
+    pass
+```
+
+**Question**: Should we also train box prediction in Stage 2?
+
+**Options**:
+- **Option A**: Don't use detection loss in Stage 2 (current)
+  - Pro: Focuses purely on sequence understanding
+  - Con: Don't refine box predictions
+  
+- **Option B**: Add weak supervision from ground truth boxes
+  - Pro: Refines detection + sequence jointly
+  - Con: Adds complexity, similar to train.py
+
+---
+
+### 4. **Missing TensorBoard / Logging**
+**Status**: ❌ NOT IMPLEMENTED
+
+Only has `print()` statements. Missing:
+- TensorBoard logging
+- Loss plots
+- Training curves
+- Metrics tracking
+
+Weitere Infos
+
+### 5. **Encoder Learning Rate**
+**Status**: ⚠️ UNCLEAR
+
+```python
+encoder = EncoderWrapper(backbone=unet, in_channels=32, enc_dim=256).to(DEVICE)
+optimizer = optim.AdamW(
+    list(encoder.parameters()) + list(decoder.parameters()) + list(ctc_head.parameters()),
+    lr=lr, weight_decay=WEIGHT_DECAY
+)
+```
+
+**Question**: Should frozen UNet backbone have 0 learning rate?
+
+**Current behavior**: UNet is frozen (no grad), so it won't update anyway. But EncoderWrapper might have additional parameters?
+
+---
+
+## ✅ WHAT IS IMPLEMENTED
+
+### Stage 1: Detection Training
+```
+Input Image → UNet → DetectorHead → 3 Tasks:
+  1. Heatmap (FocalLoss) - WHERE are characters
+  2. BBox Regression (SmoothL1) - Precise box coordinates
+  3. Class Logits (CrossEntropy) - Class per pixel
+```
+
+**Components Implemented**:
+- ✅ FocalLoss for heatmap (alpha=0.25, gamma=2.0)
+- ✅ SmoothL1Loss for bbox regression (weight 0.5)
+- ✅ CrossEntropyLoss for class prediction (weight 0.5)
+- ✅ Mixed precision training (amp.GradScaler)
+- ✅ Gradient accumulation (GRADIENT_ACCUMULATION_STEPS)
+- ✅ Checkpoint saving and pruning
+- ✅ Learning rate scheduling (CosineAnnealingLR)
+
+---
+
+### Stage 2: Sequence Training (Context Understanding)
+
+```
+Input Image → UNet (frozen) → EncoderWrapper → SeqDecoderAttention
+                                                      ↓
+                                            Predicts sequence with context
+```
+
+**Components Implemented**:
+
+#### Phase 1: CTC Warmup (2 epochs)
+- ✅ Encoder + CTC Head
+- ✅ CTC Loss (for alignment)
+- ✅ Learns character-sequence alignment
+- ✅ Mixed precision + gradient accumulation
+- ✅ Frozen detector (spatial guidance)
+
+#### Phase 2: Attention Training (NUM_EPOCHS)
+- ✅ Encoder + Decoder with Attention
+- ✅ Sequence CrossEntropyLoss
+- ✅ Teacher forcing decay (1.0 → 0.1)
+- ✅ Mixed precision + gradient accumulation
+- ✅ Frozen detector (spatial guidance)
+
+---
+
+### Stage 1: Detection
+```
+✅ Load dataset with boxes/labels
+✅ Initialize UNet + DetectorHead
+✅ Create loss functions
+✅ Loop over epochs:
+   ✅ Loop over batches:
+      ✅ Forward pass
+      ✅ Compute 3 losses (heatmap, bbox, class)
+      ✅ Backward with gradient accumulation
+      ✅ Optimizer step
+   ✅ Save checkpoint
+   ✅ Prune old checkpoints
+✅ Return trained models
+```
+### Stage 2: Sequence Training
+
+```
+✅ Load Stage 1 checkpoint
+✅ Freeze detector
+✅ Initialize Encoder + Decoder + CTC Head
+✅ Create loss functions (CE, CTC)
+✅ CTC Warmup (2 epochs):
+   ✅ Train encoder with CTC loss
+   ✅ Gradient accumulation
+   ✅ Learning rate scheduling
+❌ Validation during warmup?
+✅ Main Attention Training:
+   ✅ Loop over epochs:
+      ✅ Compute teacher forcing ratio (decay)
+      ✅ Loop over batches:
+         ✅ Forward pass (encoder + decoder)
+         ✅ Sequence loss
+         ⚠️ Detection loss? (optional)
+         ✅ Backward with gradient accumulation
+         ✅ Optimizer step
+      ✅ Save checkpoint
+      ✅ Prune old checkpoints
+❌ Validation during training?
+✅ Return trained models
