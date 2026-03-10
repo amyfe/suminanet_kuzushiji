@@ -20,6 +20,7 @@ transformers>=4.45.0
 
 #Progress bar
 tqdm>=4.66.0
+optuna>=3.6.1
 
 #Translation
 anthropic>=0.75.0

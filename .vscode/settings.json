@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "/home/afelic/miniconda3/envs/kuzushiji/bin/python",
+  "python.terminal.activateEnvironment": true,
+"python.terminal.activateEnvInCurrentTerminal": true,
+"python-envs.defaultEnvManager": "ms-python.python:conda",
+"python-envs.defaultPackageManager": "ms-python.python:conda"
+}

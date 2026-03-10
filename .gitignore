@@ -168,6 +168,8 @@ assets/
 data_preprocessed/
 submit_training.sh
 submit_validation.sh
+submit_script.sh
+submit_optuna.sh
 CLUSTER_QUICK_REFERENCE.md
 assets/data_cached/
 # mypy
