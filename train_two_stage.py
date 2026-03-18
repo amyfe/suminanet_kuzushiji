@@ -1,4 +1,4 @@
-"""Two-stage training pipeline: Stage 1 (detection) + Stage 2 (classification).8040"""
+"""Two-stage training pipeline: Stage 1 (detection) + Stage 2 (classification)"""
 import sys
 import torch
 import torch.nn as nn
@@ -9,8 +9,9 @@ from pathlib import Path
 from tqdm import tqdm
 
 from config import (
-    DATA_DIR, DEVICE, BATCH_SIZE, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, WEIGHT_DECAY,
-    GRADIENT_ACCUMULATION_STEPS, CHECKPOINT_DIR, USE_MIXED_PRECISION, DETECTOR_HEATMAP_SIGMA
+    DATA_DIR, DEVICE, BATCH_SIZE, DROPOUT_RATE, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, WEIGHT_DECAY,
+    GRADIENT_ACCUMULATION_STEPS, CHECKPOINT_DIR, USE_MIXED_PRECISION, DETECTOR_HEATMAP_SIGMA,
+    FOCAL_ALPHA, FOCAL_GAMMA, POS_WEIGHT, BBOX_WEIGHT
 )
 from model.kuronet import UNet, DetectorHead
 from model.kuronet.encoder_wrapper import EncoderWrapper
@@ -158,9 +159,9 @@ def validate_detector(unet, detector, dataloader, DEVICE, USE_MIXED_PRECISION):
             heat_logits = detector.heatmap(features_shared)
             bbox_reg = detector.bbox(features_shared)
             
-            loss_heatmap = focal_loss_heatmap(heat_logits, gt_heat, alpha=0.25, gamma=2.0, pos_weight=10.0)
+            loss_heatmap = focal_loss_heatmap(heat_logits, gt_heat, alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA, pos_weight=POS_WEIGHT)
             loss_bbox = masked_bbox_smoothl1_loss(bbox_reg, gt_bbox, gt_bbox_mask)
-            loss = loss_heatmap + 0.5 * loss_bbox
+            loss = loss_heatmap + BBOX_WEIGHT * loss_bbox
 
             if batch_idx == 0:
                 print("\n[VAL DEBUG]")
@@ -247,7 +248,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     
     # Build model
     unet = UNet(in_channels=3, base_features=32).to(DEVICE)
-    detector = DetectorHead(in_ch=32, num_classes=vocab.vocab_size, dropout_rate=0.3, predict_classes=False).to(DEVICE)  # Disable class head to save memory
+    detector = DetectorHead(in_ch=32, num_classes=vocab.vocab_size, dropout_rate=DROPOUT_RATE, predict_classes=False).to(DEVICE)  # Disable class head to save memory
     print(f"✅ Model initialized with {vocab.vocab_size} classes (from vocab)")
     print(f"⚠️  Class prediction disabled to prevent OOM (Stage 1 focuses on spatial detection only)")
     ##DISCUSS: encoder = EncoderWrapper(backbone=unet, in_channels=32, enc_dim=256).to(DEVICE)
@@ -286,7 +287,6 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         total_bbox = 0.0
         n_batches = 0
 
-        
         # Show progress bar with limited update frequency to reduce log spam
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", 
                    mininterval=30.0)  
@@ -306,13 +306,13 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                 )
                 # Compute losses with detailed tracking
                 loss_heatmap = focal_loss_heatmap(
-                    outputs["heatmap"], gt_heat, alpha=0.25, gamma=2.0, pos_weight=10.0
+                    outputs["heatmap"], gt_heat, alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA, pos_weight=POS_WEIGHT
                 )
                 # Lower pos_thresh for bbox (include broader region around peak) and increase bbox weight
                 loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_bbox_mask)
                                 
                 # Balanced loss: heatmap for localization, bbox for accurate box dimensions
-                loss = loss_heatmap + 0.5 * loss_bbox  # Increased from 0.1 to 0.5
+                loss = loss_heatmap + BBOX_WEIGHT * loss_bbox  
                 loss = loss / GRADIENT_ACCUMULATION_STEPS
             
             if scaler is not None:
