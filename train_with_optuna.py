@@ -10,6 +10,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Tuple
 
@@ -19,6 +20,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from optuna.trial import TrialState
 
 from config import (
     CHECKPOINT_DIR,
@@ -192,7 +194,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
             desc=f"Trial {trial.number} Epoch {epoch + 1}/{args.epochs}",
             leave=False,
             mininterval=args.pbar_mininterval,
-            file=sys.stdout,
+            file=sys.stderr,
             disable=args.no_progress_bar,
         )
 
@@ -382,6 +384,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", type=str, default="train", choices=["train", "val"], help="train: tune stage1 training hparams, val: tune stage1 decode/validation params")
     parser.add_argument("--epochs", type=int, default=6, help="Epochs per trial")
     parser.add_argument("--n-trials", type=int, default=30, help="Number of Optuna trials")
+    parser.add_argument(
+        "--global-max-trials",
+        type=int,
+        default=0,
+        help="Global trial cap across parallel workers (0 disables)",
+    )
     parser.add_argument("--timeout", type=int, default=0, help="Timeout in seconds (0 = disabled)")
     parser.add_argument(
         "--pbar-mininterval",
@@ -460,22 +468,54 @@ def main() -> None:
 
     pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2, interval_steps=1)
 
-    study = optuna.create_study(
-        study_name=args.study_name,
-        storage=args.storage,
-        load_if_exists=True,
-        direction="maximize" if args.mode == "val" else "minimize",
-        sampler=sampler,
-        pruner=pruner,
-    )
+    for _attempt in range(10):
+        try:
+            study = optuna.create_study(
+                study_name=args.study_name,
+                storage=args.storage,
+                load_if_exists=True,
+                direction="maximize" if args.mode == "val" else "minimize",
+                sampler=sampler,
+                pruner=pruner,
+            )
+            break
+        except Exception as _e:
+            if "already exists" in str(_e):
+                time.sleep(random.uniform(1, 5))
+            else:
+                raise
+    else:
+        raise RuntimeError("Failed to create/load Optuna study after 10 retries")
 
     timeout = None if args.timeout <= 0 else args.timeout
+    optimize_callbacks = []
+    effective_n_trials = args.n_trials
+    if args.global_max_trials > 0:
+        optimize_callbacks.append(
+            optuna.study.MaxTrialsCallback(
+                n_trials=args.global_max_trials,
+                states=(TrialState.COMPLETE, TrialState.PRUNED),
+            )
+        )
+        # Let workers keep requesting new trials until the shared global cap is reached.
+        effective_n_trials = None
+
     if args.mode == "val":
         if not Path(args.checkpoint).exists():
             raise FileNotFoundError(f"Validation mode requires checkpoint, not found: {args.checkpoint}")
-        study.optimize(lambda trial: objective_validation(trial, args), n_trials=args.n_trials, timeout=timeout)
+        study.optimize(
+            lambda trial: objective_validation(trial, args),
+            n_trials=effective_n_trials,
+            timeout=timeout,
+            callbacks=optimize_callbacks,
+        )
     else:
-        study.optimize(lambda trial: objective(trial, args), n_trials=args.n_trials, timeout=timeout)
+        study.optimize(
+            lambda trial: objective(trial, args),
+            n_trials=effective_n_trials,
+            timeout=timeout,
+            callbacks=optimize_callbacks,
+        )
 
     summary = {
         "study_name": study.study_name,
