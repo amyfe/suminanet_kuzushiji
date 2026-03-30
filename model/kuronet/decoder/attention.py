@@ -78,6 +78,7 @@ class SeqDecoderAttention(nn.Module):
         sampling_method="multinomial",
         use_roi_attention=False,
         roi_blend_alpha=0.7,
+        use_attn_centroid_boxes=True,
     ):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
@@ -90,6 +91,7 @@ class SeqDecoderAttention(nn.Module):
         self.sampling_method = sampling_method
         self.use_roi_attention = use_roi_attention
         self.roi_blend_alpha = roi_blend_alpha
+        self.use_attn_centroid_boxes = use_attn_centroid_boxes
         
         if init_from_encoder:
             self.enc2hidden = nn.Sequential(
@@ -221,7 +223,8 @@ class SeqDecoderAttention(nn.Module):
 
             boxes_attn = None
             # attn_cat: (B, T_dec, T_enc)
-            boxes_attn = _attention_weighted_centroids(attn_cat, enc_mask, H_img, W_img)
+            if self.use_attn_centroid_boxes:
+                boxes_attn = _attention_weighted_centroids(attn_cat, enc_mask, H_img, W_img)
 
             # Blend boxes: alpha * attn + (1-alpha) * head (when both available)
             if boxes_head is not None and boxes_attn is not None:

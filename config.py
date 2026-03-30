@@ -23,7 +23,7 @@ DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
 BATCH_SIZE = 2  # Reduced from 4 to fit in 16GB GPU
 GRADIENT_ACCUMULATION_STEPS = 4  # Increased to maintain effective batch size of 8
 NUM_WORKERS = 2  
-NUM_EPOCHS = 15 
+NUM_EPOCHS = 5
 GRAD_CLIP = 1.0  # Gradient clipping threshold
 CTC_WARMUP_EPOCHS = 0  
 IMAGE_SIZE = (256, 256)
@@ -50,10 +50,25 @@ NUM_CLASSES = 3000  # Keep as upper bound, actual value set in training from voc
 # training modes
 
 # Stage 2: Recognition (Classifier/Decoder predicts WHAT characters are)
-# ROI Attention is DISABLED - it was architecturally broken (1D encoder used as fake 2D)
-USE_ROI_ATTENTION = False  
+# Enable ROI attention for detector-guided Stage 2 training (Option B).
+USE_ROI_ATTENTION = True
 USE_MIXED_PRECISION = True
-ROI_BOX_LOSS_WEIGHT = 0.1  # Not used when USE_ROI_ATTENTION=False    
+ROI_BOX_LOSS_WEIGHT = 0.01
+STAGE2_USE_CTC_WARMUP = False
+STAGE2_AUX_CTC_WEIGHT = 0.10
+STAGE2_USE_GT_BOXES = True
+STAGE2_CURRICULUM_ENABLE = True
+STAGE2_CURRICULUM_GT_EPOCHS = 2
+STAGE2_GRAD_ACCUMULATION_STEPS = 4
+STAGE2_READING_ORDER_POLICY = "annotation"  # annotation | inferred | auto
+STAGE2_USE_ATTN_CENTROID_BOXES = False
+STAGE2_ARCH_GUARDRAIL_STRICT = True
+ROI_POOL_SIZE = (6, 6)
+ROI_EMBED_DIM = 256
+CONTEXT_HIDDEN_DIM = 256
+STAGE2_DET_CONFIDENCE = 0.40
+STAGE2_DET_TOP_K = 256
+STAGE2_DET_NMS_IOU = 0.5
 
 
 # validation (optional during training)

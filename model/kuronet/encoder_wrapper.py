@@ -1,7 +1,6 @@
-# model/kuronet/encoder_wrapper.py
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
+
 
 class EncoderWrapper(nn.Module):
     def __init__(self, backbone: nn.Module, in_channels: int, enc_dim: int = 256):
@@ -12,8 +11,9 @@ class EncoderWrapper(nn.Module):
     def forward(self, images: torch.Tensor, orientation: str = "horizontal", return_2d: bool = False):
         feats = self.backbone(images)       # (B, in_ch, Hf, Wf)
         feats = self.proj(feats)            # (B, enc_dim, Hf, Wf)
+
         if return_2d:
-            return feats, None
+            return feats
 
         B, C, Hf, Wf = feats.shape
         if orientation == "horizontal":

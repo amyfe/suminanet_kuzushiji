@@ -10,6 +10,7 @@ DetectorHead and GlyphClassifier are kept for detection tasks if needed.
 from .unet import UNet
 from .encoder_wrapper import EncoderWrapper
 from .detector import DetectorHead
+from .roi_sequence import ROISequenceEncoder, ROIContextEncoder
 
-__all__ = ["UNet", "EncoderWrapper", "DetectorHead"]
+__all__ = ["UNet", "EncoderWrapper", "DetectorHead", "ROISequenceEncoder", "ROIContextEncoder"]
     

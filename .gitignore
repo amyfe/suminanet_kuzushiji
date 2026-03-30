@@ -166,6 +166,7 @@ logs/
 assets/logs/
 assets/
 data_preprocessed/
+submit_scripts/
 submit_training.sh
 submit_validation.sh
 submit_script.sh

@@ -169,7 +169,71 @@ def _bbox_iou(boxes1, boxes2):
     return inter / union
 
 
-def compute_roi_box_loss(predicted_boxes, gt_boxes, gt_lengths=None, reduction='mean', iou_weight=0.0, use_x_only=False):
+def _interval_iou_1d(pred_x, gt_x):
+    """Compute pairwise 1D IoU for x-intervals, pred_x:(N,2), gt_x:(M,2)."""
+    n = pred_x.size(0)
+    m = gt_x.size(0)
+    if n == 0 or m == 0:
+        return pred_x.new_zeros((n, m))
+
+    px1 = pred_x[:, 0].unsqueeze(1)
+    px2 = pred_x[:, 1].unsqueeze(1)
+    gx1 = gt_x[:, 0].unsqueeze(0)
+    gx2 = gt_x[:, 1].unsqueeze(0)
+
+    inter = (torch.minimum(px2, gx2) - torch.maximum(px1, gx1)).clamp(min=0)
+    plen = (px2 - px1).clamp(min=1e-6)
+    glen = (gx2 - gx1).clamp(min=1e-6)
+    union = (plen + glen - inter).clamp(min=1e-6)
+    return inter / union
+
+
+def _greedy_iou_match(pred_boxes, gt_boxes, use_x_only=False):
+    """Greedy one-to-one matching between predictions and GT by highest IoU."""
+    n = pred_boxes.size(0)
+    m = gt_boxes.size(0)
+    if n == 0 or m == 0:
+        return pred_boxes.new_zeros((0,), dtype=torch.long), gt_boxes.new_zeros((0,), dtype=torch.long)
+
+    if use_x_only:
+        pred_x = pred_boxes[:, [0, 2]]
+        gt_x = gt_boxes[:, [0, 2]]
+        iou_mat = _interval_iou_1d(pred_x, gt_x)
+    else:
+        iou_mat = _bbox_iou(
+            pred_boxes.unsqueeze(1).expand(-1, m, -1).reshape(-1, 4),
+            gt_boxes.unsqueeze(0).expand(n, -1, -1).reshape(-1, 4),
+        ).reshape(n, m)
+
+    used_pred = set()
+    used_gt = set()
+    pred_idx = []
+    gt_idx = []
+
+    flat_scores = iou_mat.reshape(-1)
+    order = torch.argsort(flat_scores, descending=True)
+    for flat_i in order.tolist():
+        pi = flat_i // m
+        gi = flat_i % m
+        if pi in used_pred or gi in used_gt:
+            continue
+        used_pred.add(pi)
+        used_gt.add(gi)
+        pred_idx.append(pi)
+        gt_idx.append(gi)
+        if len(pred_idx) >= min(n, m):
+            break
+
+    if len(pred_idx) == 0:
+        return pred_boxes.new_zeros((0,), dtype=torch.long), gt_boxes.new_zeros((0,), dtype=torch.long)
+
+    return (
+        torch.tensor(pred_idx, device=pred_boxes.device, dtype=torch.long),
+        torch.tensor(gt_idx, device=gt_boxes.device, dtype=torch.long),
+    )
+
+
+def compute_roi_box_loss(predicted_boxes, gt_boxes, gt_lengths=None, reduction='mean', iou_weight=0.0, use_x_only=False, coord_scale=None):
     """
     SmoothL1 + optional IoU loss for ROI-based attention.
     - Supervise only up to the number of available GT boxes per sample
@@ -197,19 +261,35 @@ def compute_roi_box_loss(predicted_boxes, gt_boxes, gt_lengths=None, reduction='
         pred_slice = pred_i[:max_t]
         gt_slice = gt_i[:max_t]
 
+        match_pred_idx, match_gt_idx = _greedy_iou_match(pred_slice, gt_slice, use_x_only=use_x_only)
+        if match_pred_idx.numel() == 0:
+            continue
+        pred_slice = pred_slice.index_select(0, match_pred_idx)
+        gt_slice = gt_slice.index_select(0, match_gt_idx)
+        matched_t = int(match_pred_idx.numel())
+
         if use_x_only:
             pred_slice = pred_slice[:, [0, 2]]
             gt_slice = gt_slice[:, [0, 2]]
 
-        l1 = F.smooth_l1_loss(pred_slice, gt_slice, reduction='sum')
-        total_l1 = total_l1 + l1
+        # Normalize coordinates to avoid oversized pixel-space losses dominating CE.
+        if coord_scale is None:
+            scale = torch.clamp(gt_slice.abs().max(), min=1.0)
+        else:
+            scale = torch.tensor(float(coord_scale), device=pred_slice.device, dtype=pred_slice.dtype)
+        pred_norm = pred_slice / scale
+        gt_norm = gt_slice / scale
+
+        # Per-sample mean over coords, then weighted by supervised timesteps.
+        l1 = F.smooth_l1_loss(pred_norm, gt_norm, reduction='mean')
+        total_l1 = total_l1 + l1 * matched_t
 
         if (not use_x_only) and iou_weight > 0.0:
             ious = _bbox_iou(pred_slice, gt_slice)
             # IoU loss: 1 - IoU
             total_iou = total_iou + (1.0 - ious).sum()
 
-        count += max_t
+        count += matched_t
 
     if count == 0:
         return torch.tensor(0.0, device=predicted_boxes.device)
