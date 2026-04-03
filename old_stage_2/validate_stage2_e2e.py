@@ -48,6 +48,8 @@ from config import (
     ROI_BOX_LOSS_WEIGHT,
     ROI_POOL_SIZE,
     STAGE2_READING_ORDER_POLICY,
+    STAGE2_CTC_TIME_EXPAND_FACTOR,
+    STAGE2_USE_ROI_POSITIONAL_ENCODING,
     USE_ROI_ATTENTION,
 )
 from model.kuronet import DetectorHead, EncoderWrapper, ROIContextEncoder, ROISequenceEncoder, UNet
@@ -82,14 +84,227 @@ def _edit_distance(a: str, b: str) -> int:
     return prev[-1]
 
 
-def _sort_boxes_reading_order(boxes: Sequence[Sequence[float]], orientation: str) -> List[List[float]]:
+def _sort_boxes_and_labels_reading_order(
+    boxes: Sequence[Sequence[float]],
+    labels: Optional[Sequence[int]],
+    orientation: str,
+) -> Tuple[List[List[float]], Optional[List[int]]]:
     if boxes is None or len(boxes) == 0:
-        return []
+        return [], [] if labels is not None else None
     if orientation == "vertical":
         idx = sorted(range(len(boxes)), key=lambda i: (-boxes[i][0], boxes[i][1]))
     else:
         idx = sorted(range(len(boxes)), key=lambda i: (boxes[i][1], boxes[i][0]))
-    return [[float(v) for v in boxes[i]] for i in idx]
+    boxes_sorted = [[float(v) for v in boxes[i]] for i in idx]
+    if labels is None:
+        return boxes_sorted, None
+    labels_sorted = [int(labels[i]) for i in idx]
+    return boxes_sorted, labels_sorted
+
+
+def _sort_boxes_reading_order(boxes: Sequence[Sequence[float]], orientation: str) -> List[List[float]]:
+    boxes_sorted, _ = _sort_boxes_and_labels_reading_order(boxes, None, orientation)
+    return boxes_sorted
+
+
+def _rebuild_text_ids_from_sorted_labels(
+    labels_sorted_batch: Sequence[Sequence[int]],
+    pad_id: int,
+    sos_id: int,
+    eos_id: int,
+    device: str,
+) -> Optional[torch.Tensor]:
+    if labels_sorted_batch is None:
+        return None
+
+    seqs: List[torch.Tensor] = []
+    max_len = 0
+    for labels_sorted in labels_sorted_batch:
+        seq = [int(sos_id)] + [int(x) for x in labels_sorted] + [int(eos_id)]
+        t = torch.tensor(seq, dtype=torch.long, device=device)
+        seqs.append(t)
+        max_len = max(max_len, int(t.numel()))
+
+    if len(seqs) == 0:
+        return None
+
+    text_ids_sorted = torch.full(
+        (len(seqs), max_len),
+        fill_value=int(pad_id),
+        dtype=torch.long,
+        device=device,
+    )
+    for i, t in enumerate(seqs):
+        text_ids_sorted[i, : t.numel()] = t
+    return text_ids_sorted
+
+
+def _build_gt_boxes_and_sorted_text_ids(
+    boxes_batch: Sequence[Any],
+    labels_batch: Sequence[Any],
+    orientations: Optional[Sequence[str]],
+    reading_order_policy: str,
+    pad_id: int,
+    sos_id: int,
+    eos_id: int,
+) -> Tuple[List[torch.Tensor], Optional[torch.Tensor], List[List[int]]]:
+    out_boxes: List[torch.Tensor] = []
+    out_label_ids: List[List[int]] = []
+
+    batch_size = len(boxes_batch) if boxes_batch is not None else 0
+    for i in range(batch_size):
+        b = boxes_batch[i]
+        l = labels_batch[i] if labels_batch is not None and i < len(labels_batch) else None
+
+        if b is None:
+            out_boxes.append(torch.empty((0, 4), dtype=torch.float32, device=DEVICE))
+            out_label_ids.append([])
+            continue
+
+        boxes_i_list = b.to(DEVICE, dtype=torch.float32).detach().cpu().tolist()
+        labels_i_list = [int(x) for x in l.detach().cpu().tolist()] if l is not None else []
+        orientation_hint = orientations[i] if orientations is not None and i < len(orientations) else None
+        sort_orientation = _resolve_sort_orientation(orientation_hint, boxes_i_list, reading_order_policy)
+        boxes_sorted, labels_sorted = _sort_boxes_and_labels_reading_order(
+            boxes_i_list,
+            labels_i_list,
+            sort_orientation,
+        )
+
+        if len(boxes_sorted) == 0:
+            out_boxes.append(torch.empty((0, 4), dtype=torch.float32, device=DEVICE))
+        else:
+            out_boxes.append(torch.tensor(boxes_sorted, dtype=torch.float32, device=DEVICE))
+        out_label_ids.append(labels_sorted if labels_sorted is not None else [])
+
+    text_ids_sorted = _rebuild_text_ids_from_sorted_labels(
+        out_label_ids,
+        pad_id=pad_id,
+        sos_id=sos_id,
+        eos_id=eos_id,
+        device=DEVICE,
+    )
+    return out_boxes, text_ids_sorted, out_label_ids
+
+
+def _expand_ctc_timesteps(enc_outputs: torch.Tensor, enc_mask: torch.Tensor, factor: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    f = max(1, int(factor))
+    if f == 1:
+        return enc_outputs, enc_mask
+    return enc_outputs.repeat_interleave(f, dim=1), enc_mask.repeat_interleave(f, dim=1)
+
+
+def _prepare_ctc_targets(
+    text_ids: torch.Tensor,
+    pad_id: int,
+    sos_id: int,
+    eos_id: int,
+    input_lengths: torch.Tensor,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    targets = []
+    target_lengths = []
+    keep_indices = []
+
+    for i in range(text_ids.size(0)):
+        ids = text_ids[i]
+        ids = ids[ids != pad_id]
+        if ids.numel() == 0:
+            continue
+        if ids[0].item() == sos_id:
+            ids = ids[1:]
+        if ids.numel() > 0 and ids[-1].item() == eos_id:
+            ids = ids[:-1]
+        if ids.numel() == 0:
+            continue
+
+        # strict CTC feasibility: target_len + adjacent_repeats <= input_len
+        if ids.numel() > 1:
+            adj_repeats = int((ids[1:] == ids[:-1]).sum().item())
+        else:
+            adj_repeats = 0
+        min_required = int(ids.numel()) + adj_repeats
+        if min_required > int(input_lengths[i].item()):
+            continue
+
+        targets.append(ids)
+        target_lengths.append(ids.numel())
+        keep_indices.append(i)
+
+    if len(targets) == 0:
+        return None, None, None
+
+    targets_concat = torch.cat(targets)
+    target_lengths_t = torch.tensor(target_lengths, dtype=torch.long, device=text_ids.device)
+    keep_indices_t = torch.tensor(keep_indices, dtype=torch.long, device=text_ids.device)
+    return targets_concat, target_lengths_t, keep_indices_t
+
+
+def _compute_gt_roi_recognition_sanity(
+    encoder: EncoderWrapper,
+    roi_sequence_encoder: ROISequenceEncoder,
+    roi_aux_head: nn.Module,
+    dataloader: DataLoader,
+    vocab: VocabManager,
+    reading_order_policy: str,
+) -> Dict[str, Any]:
+    top1_correct = 0.0
+    top5_correct = 0.0
+    total = 0.0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            prepared = _filter_stage2_batch(batch, DEVICE)
+            if prepared is None:
+                continue
+
+            images = prepared["images"]
+            boxes_batch = prepared["boxes_batch"]
+            labels_batch = prepared["labels_batch"]
+            orientations = prepared["orientations"]
+
+            if boxes_batch is None or labels_batch is None:
+                continue
+
+            boxes_for_encoder, _, labels_sorted_batch = _build_gt_boxes_and_sorted_text_ids(
+                boxes_batch=boxes_batch,
+                labels_batch=labels_batch,
+                orientations=orientations,
+                reading_order_policy=reading_order_policy,
+                pad_id=vocab.pad_id,
+                sos_id=vocab.sos_id,
+                eos_id=vocab.eos_id,
+            )
+
+            feats_2d = encoder(images, return_2d=True)
+            roi_seq, roi_mask = roi_sequence_encoder(feats_2d, boxes_for_encoder, image_size=IMAGE_SIZE)
+            roi_logits = roi_aux_head(roi_seq)
+
+            for i in range(len(labels_sorted_batch)):
+                labels_sorted = labels_sorted_batch[i]
+                if labels_sorted is None or len(labels_sorted) == 0:
+                    continue
+
+                roi_len = int(roi_mask[i].sum().item())
+                k = min(roi_len, len(labels_sorted), int(roi_logits.size(1)))
+                if k <= 0:
+                    continue
+
+                logits_i = roi_logits[i, :k, :]
+                targets_i = torch.tensor(labels_sorted[:k], dtype=torch.long, device=logits_i.device)
+
+                pred_top1 = logits_i.argmax(dim=-1)
+                top1_correct += float((pred_top1 == targets_i).sum().item())
+
+                top5 = logits_i.topk(k=min(5, logits_i.size(-1)), dim=-1).indices
+                top5_correct += float((top5 == targets_i.unsqueeze(1)).any(dim=1).sum().item())
+                total += float(k)
+
+    denom = max(1.0, total)
+    return {
+        "samples": int(total),
+        "top1_accuracy": float(top1_correct / denom),
+        "top5_accuracy": float(top5_correct / denom),
+    }
 
 
 def _infer_reading_orientation_from_boxes(boxes: Sequence[Sequence[float]]) -> str:
@@ -161,6 +376,76 @@ def _build_boxes_for_stage2_validation(
             boxes_i = _sort_boxes_reading_order(boxes_i, sort_orientation)
             out.append(torch.tensor(boxes_i, dtype=torch.float32, device=DEVICE))
         return out
+
+    with torch.no_grad():
+        features = unet(images)
+        det_out = detector(features)
+        heat_probs = torch.sigmoid(det_out["heatmap"])
+        bbox_reg = det_out["bbox"]
+        _, _, hf, wf = features.shape
+
+        out: List[torch.Tensor] = []
+        for i in range(images.size(0)):
+            pred_boxes_i, _, _ = extract_boxes_from_heatmap(
+                heatmap_probs=heat_probs[i:i + 1],
+                bbox_reg=bbox_reg[i:i + 1],
+                confidence_thresh=confidence,
+                output_size=(hf, wf),
+                image_size=IMAGE_SIZE,
+                top_k=top_k,
+                nms_iou=nms_iou,
+                min_box_size=4.0,
+                debug=False,
+            )
+
+            orientation_hint = orientations[i] if orientations is not None and i < len(orientations) else None
+            sort_orientation = _resolve_sort_orientation(orientation_hint, pred_boxes_i, reading_order_policy)
+            pred_boxes_i = _sort_boxes_reading_order(pred_boxes_i, sort_orientation)
+
+            if len(pred_boxes_i) == 0:
+                out.append(torch.empty((0, 4), dtype=torch.float32, device=DEVICE))
+            else:
+                out.append(torch.tensor(pred_boxes_i, dtype=torch.float32, device=DEVICE))
+
+        return out
+
+
+def _filter_stage2_batch(batch: Dict[str, Any], device: str) -> Optional[Dict[str, Any]]:
+    """Filter and align Stage 2 batch tensors/lists exactly once."""
+    images = batch["image"].to(device)
+    text_ids = batch.get("text_ids", None)
+    text_ids = text_ids.to(device) if text_ids is not None else None
+    boxes_batch = batch.get("boxes", None)
+    labels_batch = batch.get("labels", None)
+    orientations = batch.get("orientations", None)
+    text_ids_present = batch.get("text_ids_present", None)
+
+    if text_ids is None:
+        return None
+
+    if text_ids_present is not None:
+        valid_idx = text_ids_present.to(device).nonzero(as_tuple=False).squeeze(1)
+        if valid_idx.numel() == 0:
+            return None
+
+        images = images.index_select(0, valid_idx)
+        text_ids = text_ids.index_select(0, valid_idx)
+        valid_idx_cpu = valid_idx.detach().cpu().tolist()
+
+        if orientations is not None:
+            orientations = [orientations[i] for i in valid_idx_cpu]
+        if boxes_batch is not None:
+            boxes_batch = [boxes_batch[i] for i in valid_idx_cpu]
+        if labels_batch is not None:
+            labels_batch = [labels_batch[i] for i in valid_idx_cpu]
+
+    return {
+        "images": images,
+        "text_ids": text_ids,
+        "boxes_batch": boxes_batch,
+        "labels_batch": labels_batch,
+        "orientations": orientations,
+    }
 
     with torch.no_grad():
         features = unet(images)
@@ -687,6 +972,7 @@ def _compute_stage2_loss_metrics(
     reading_order_policy: str,
     ctc_head: Optional[nn.Module] = None,
     aux_ctc_weight: float = 0.0,
+    ctc_time_expand_factor: int = 1,
 ) -> Dict[str, float]:
     """
     Compute teacher-forced Stage 2 validation losses using the chosen box source.
@@ -708,31 +994,20 @@ def _compute_stage2_loss_metrics(
 
     with torch.no_grad():
         for batch in dataloader:
-            images = batch["image"].to(DEVICE)
-            text_ids = batch.get("text_ids", None)
-            text_ids_present = batch.get("text_ids_present", None)
-            orientations = batch.get("orientations", None)
-            boxes_batch = batch.get("boxes", None)
-
-            if text_ids is None or text_ids_present is None:
+            prepared = _filter_stage2_batch(batch, DEVICE)
+            if prepared is None:
                 continue
 
-            valid_idx = text_ids_present.nonzero(as_tuple=False).squeeze(1)
-            if valid_idx.numel() == 0:
-                continue
+            images = prepared["images"]
+            text_ids = prepared["text_ids"]
+            boxes_batch = prepared["boxes_batch"]
+            labels_batch = prepared["labels_batch"]
+            orientations = prepared["orientations"]
 
-            images = images.index_select(0, valid_idx.to(images.device))
-            text_ids = text_ids.to(DEVICE)
-            valid_idx_cpu = valid_idx.detach().cpu().tolist()
+            if orientations is None:
+                orientations = ["horizontal"] * images.size(0)
 
-            if orientations is not None and len(orientations) >= max(valid_idx_cpu) + 1:
-                orientations = [orientations[i] for i in valid_idx_cpu]
-            else:
-                orientations = ["horizontal"] * len(valid_idx_cpu)
-
-            if boxes_batch is not None and len(boxes_batch) >= max(valid_idx_cpu) + 1:
-                boxes_batch = [boxes_batch[i] for i in valid_idx_cpu]
-            else:
+            if boxes_batch is None:
                 boxes_batch = [None for _ in range(images.size(0))]
 
             gt_boxes_for_loss: List[torch.Tensor] = []
@@ -742,22 +1017,32 @@ def _compute_stage2_loss_metrics(
                 else:
                     gt_boxes_for_loss.append(b.to(DEVICE, dtype=torch.float32))
 
-            input_seq = text_ids[:, :-1]
-            targets = text_ids[:, 1:]
-
             if roi_sequence_encoder is not None and context_encoder is not None:
-                boxes_for_encoder = _build_boxes_for_stage2_validation(
-                    images=images,
-                    boxes_batch=boxes_batch,
-                    orientations=orientations,
-                    use_gt_boxes=use_gt_boxes,
-                    unet=unet,
-                    detector=detector,
-                    confidence=confidence,
-                    top_k=top_k,
-                    nms_iou=nms_iou,
-                    reading_order_policy=reading_order_policy,
-                )
+                if use_gt_boxes:
+                    boxes_for_encoder, text_ids_sorted, _ = _build_gt_boxes_and_sorted_text_ids(
+                        boxes_batch=boxes_batch,
+                        labels_batch=labels_batch if labels_batch is not None else [None for _ in range(images.size(0))],
+                        orientations=orientations,
+                        reading_order_policy=reading_order_policy,
+                        pad_id=vocab.pad_id,
+                        sos_id=vocab.sos_id,
+                        eos_id=vocab.eos_id,
+                    )
+                    seq_text_ids = text_ids_sorted if text_ids_sorted is not None else text_ids
+                else:
+                    boxes_for_encoder = _build_boxes_for_stage2_validation(
+                        images=images,
+                        boxes_batch=boxes_batch,
+                        orientations=orientations,
+                        use_gt_boxes=use_gt_boxes,
+                        unet=unet,
+                        detector=detector,
+                        confidence=confidence,
+                        top_k=top_k,
+                        nms_iou=nms_iou,
+                        reading_order_policy=reading_order_policy,
+                    )
+                    seq_text_ids = text_ids
 
                 feats_2d = encoder(images, return_2d=True)
                 enc_roi, roi_mask = roi_sequence_encoder(feats_2d, boxes_for_encoder, image_size=IMAGE_SIZE)
@@ -767,11 +1052,15 @@ def _compute_stage2_loss_metrics(
                 for i in range(len(boxes_for_encoder)):
                     decode_len = int(boxes_for_encoder[i].size(0)) + 2
                     decode_len_sum += decode_len
-                    gt_len_sum += float((text_ids[i] != vocab.pad_id).sum().item())
+                    gt_len_sum += float((seq_text_ids[i] != vocab.pad_id).sum().item())
                     total_sequences += 1
             else:
                 orientation = orientations[0] if orientations else "horizontal"
                 enc_outputs, enc_mask = encoder(images, orientation=orientation)
+                seq_text_ids = text_ids
+
+            input_seq = seq_text_ids[:, :-1]
+            targets = seq_text_ids[:, 1:]
 
             decoder_output = decoder(
                 input_seq=input_seq,
@@ -807,39 +1096,22 @@ def _compute_stage2_loss_metrics(
             if ctc_loss_fn is not None:
                 # ctc_loss_fn only exists when ctc_head is configured.
                 ctc_head_module = cast(nn.Module, ctc_head)
-                ctc_logits = ctc_head_module(enc_outputs)
+                enc_outputs_ctc, enc_mask_ctc = _expand_ctc_timesteps(enc_outputs, enc_mask, ctc_time_expand_factor)
+                ctc_logits = ctc_head_module(enc_outputs_ctc)
                 ctc_log_probs = ctc_logits.float().log_softmax(dim=-1).permute(1, 0, 2).contiguous()
-                ctc_input_lengths = enc_mask.sum(dim=1).clamp(min=1).to(dtype=torch.long)
+                ctc_input_lengths = enc_mask_ctc.sum(dim=1).clamp(min=1).to(dtype=torch.long)
 
-                targets_ctc = []
-                target_lengths = []
-                keep_indices = []
+                targets_concat, target_lengths, keep_indices = _prepare_ctc_targets(
+                    text_ids=seq_text_ids,
+                    pad_id=vocab.pad_id,
+                    sos_id=vocab.sos_id,
+                    eos_id=vocab.eos_id,
+                    input_lengths=ctc_input_lengths,
+                )
 
-                for i in range(text_ids.size(0)):
-                    ids = text_ids[i]
-                    ids = ids[ids != vocab.pad_id]
-                    if ids.numel() == 0:
-                        continue
-                    if ids[0].item() == vocab.sos_id:
-                        ids = ids[1:]
-                    if ids.numel() > 0 and ids[-1].item() == vocab.eos_id:
-                        ids = ids[:-1]
-                    if ids.numel() == 0:
-                        continue
-                    if ids.numel() > int(ctc_input_lengths[i].item()):
-                        continue
-
-                    targets_ctc.append(ids)
-                    target_lengths.append(ids.numel())
-                    keep_indices.append(i)
-
-                if len(targets_ctc) == 0:
+                if targets_concat is None:
                     loss_ctc = torch.tensor(0.0, device=DEVICE)
                 else:
-                    targets_concat = torch.cat(targets_ctc).to(DEVICE)
-                    target_lengths = torch.tensor(target_lengths, dtype=torch.long, device=DEVICE)
-                    keep_indices = torch.tensor(keep_indices, dtype=torch.long, device=DEVICE)
-
                     loss_ctc = ctc_loss_fn(
                         ctc_log_probs[:, keep_indices, :],
                         targets_concat,
@@ -975,6 +1247,7 @@ def validate_stage2_e2e(
 
 
     ctc_head = None
+    roi_aux_head = None
     if "ctc_head_state_dict" in ckpt2:
         # infer output dim from checkpoint
         ctc_out_dim = int(ckpt2["ctc_head_state_dict"]["weight"].shape[0])
@@ -992,6 +1265,7 @@ def validate_stage2_e2e(
             in_dim=256,
             roi_size=roi_pool_size,
             out_dim=roi_embed_dim,
+            use_geo_positional_encoding=bool(ckpt2.get("stage2_use_roi_positional_encoding", STAGE2_USE_ROI_POSITIONAL_ENCODING)),
         ).to(DEVICE)
         context_encoder = ROIContextEncoder(
             in_dim=roi_embed_dim,
@@ -1006,6 +1280,13 @@ def validate_stage2_e2e(
             print(f"[WARN] ROI module strict load failed, retrying non-strict: {exc}")
             roi_sequence_encoder.load_state_dict(ckpt2["roi_sequence_encoder_state_dict"], strict=False)
             context_encoder.load_state_dict(ckpt2["context_encoder_state_dict"], strict=False)
+
+        if "roi_aux_head_state_dict" in ckpt2:
+            aux_out_dim = int(ckpt2["roi_aux_head_state_dict"]["weight"].shape[0])
+            aux_in_dim = int(ckpt2["roi_aux_head_state_dict"]["weight"].shape[1])
+            roi_aux_head = nn.Linear(aux_in_dim, aux_out_dim).to(DEVICE)
+            roi_aux_head.load_state_dict(ckpt2["roi_aux_head_state_dict"], strict=True)
+            roi_aux_head.eval()
 
     decoder.load_state_dict(ckpt2["decoder_state_dict"], strict=True)
     encoder.eval()
@@ -1035,6 +1316,7 @@ def validate_stage2_e2e(
             reading_order_policy=reading_order_policy,
             ctc_head=ctc_head,
             aux_ctc_weight=float(ckpt2.get("stage2_aux_ctc_weight", 0.0)),
+            ctc_time_expand_factor=int(ckpt2.get("stage2_ctc_time_expand_factor", STAGE2_CTC_TIME_EXPAND_FACTOR)),
         )
 
     if stage2_decode_boxes in ("gt", "both"):
@@ -1054,6 +1336,18 @@ def validate_stage2_e2e(
             reading_order_policy=reading_order_policy,
             ctc_head=ctc_head,
             aux_ctc_weight=float(ckpt2.get("stage2_aux_ctc_weight", 0.0)),
+            ctc_time_expand_factor=int(ckpt2.get("stage2_ctc_time_expand_factor", STAGE2_CTC_TIME_EXPAND_FACTOR)),
+        )
+
+    recognition_sanity_gt = None
+    if roi_aux_head is not None and roi_sequence_encoder is not None:
+        recognition_sanity_gt = _compute_gt_roi_recognition_sanity(
+            encoder=encoder,
+            roi_sequence_encoder=roi_sequence_encoder,
+            roi_aux_head=roi_aux_head,
+            dataloader=dataloader,
+            vocab=vocab,
+            reading_order_policy=reading_order_policy,
         )
 
     if stage2_decode_boxes == "pred":
@@ -1132,32 +1426,22 @@ def validate_stage2_e2e(
 
     with torch.no_grad():
         for batch in pbar:
-            images = batch["image"].to(DEVICE)
-            boxes_batch = batch.get("boxes", [])
-            labels_batch = batch.get("labels", [])
-            orientations = batch.get("orientations", ["horizontal"] * images.size(0))
-            text_ids = batch["text_ids"]
-            text_ids_present = batch.get("text_ids_present", None)
-
-            if text_ids is None or text_ids_present is None:
+            prepared = _filter_stage2_batch(batch, DEVICE)
+            if prepared is None:
                 continue
 
-            valid_idx = text_ids_present.nonzero(as_tuple=False).squeeze(1)
-            if valid_idx.numel() == 0:
-                continue
+            images = prepared["images"]
+            text_ids = prepared["text_ids"]
+            gt_boxes_valid = prepared["boxes_batch"]
+            gt_labels_valid = prepared["labels_batch"]
+            orientations = prepared["orientations"]
 
-            # Keep alignment with collate behavior.
-            images = images.index_select(0, valid_idx.to(images.device))
-            text_ids = text_ids.to(DEVICE)
-            valid_idx_list = valid_idx.detach().cpu().tolist()
-
-            if len(orientations) >= max(valid_idx_list) + 1:
-                orientations = [orientations[i] for i in valid_idx_list]
-            else:
-                orientations = ["horizontal"] * len(valid_idx_list)
-
-            gt_boxes_valid = [boxes_batch[i] for i in valid_idx_list]
-            gt_labels_valid = [labels_batch[i] for i in valid_idx_list]
+            if orientations is None:
+                orientations = ["horizontal"] * images.size(0)
+            if gt_boxes_valid is None:
+                gt_boxes_valid = [None for _ in range(images.size(0))]
+            if gt_labels_valid is None:
+                gt_labels_valid = [None for _ in range(images.size(0))]
 
             features = unet(images)
             det_out = detector(features)
@@ -1335,6 +1619,7 @@ def validate_stage2_e2e(
                 "mean_gt_len": stage2_stats[primary_decode_mode].get("gt_len_sum", 0.0) / max(1, total_samples),
             },
             "stage2_validation_losses": loss_metrics,
+            "recognition_sanity_gt_roi": recognition_sanity_gt,
             "detection_to_text_proxy": {
                 "exact_match": proxy_exact / max(1, total_samples),
                 "mean_cer": proxy_cer_sum / max(1, total_samples),
@@ -1447,6 +1732,13 @@ def validate_stage2_e2e(
         f"exact={metrics['detection_to_text_proxy']['exact_match']:.4f}, "
         f"cer={metrics['detection_to_text_proxy']['mean_cer']:.4f}"
     )
+    if metrics.get("recognition_sanity_gt_roi") is not None:
+        print(
+            "recognition sanity (GT ROI) -> "
+            f"top1={metrics['recognition_sanity_gt_roi']['top1_accuracy']:.4f}, "
+            f"top5={metrics['recognition_sanity_gt_roi']['top5_accuracy']:.4f}, "
+            f"n={metrics['recognition_sanity_gt_roi']['samples']}"
+        )
     print(
         "stage1 detection -> "
         f"precision={det_metrics['precision']:.4f}, "

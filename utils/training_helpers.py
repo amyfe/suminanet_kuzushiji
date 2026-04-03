@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from config import BBOX_WEIGHT, DETECTOR_HEATMAP_SIGMA, FOCAL_ALPHA, FOCAL_GAMMA, POS_WEIGHT
+from config import STAGE1_BBOX_WEIGHT, STAGE1_HEATMAP_SIGMA, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_POS_WEIGHT
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
 
@@ -155,7 +155,7 @@ def validate_detector(unet, detector, dataloader, device, use_mixed_precision, b
                 output_size=(hf, wf),
                 image_size=tuple(images.shape[-2:]),
                 device=device,
-                sigma=DETECTOR_HEATMAP_SIGMA,
+                sigma=STAGE1_HEATMAP_SIGMA,
                 bbox_radius=bbox_radius,
             )
 
@@ -166,12 +166,12 @@ def validate_detector(unet, detector, dataloader, device, use_mixed_precision, b
             loss_heatmap = focal_loss_heatmap(
                 heat_logits,
                 gt_heat,
-                alpha=FOCAL_ALPHA,
-                gamma=FOCAL_GAMMA,
-                pos_weight=POS_WEIGHT,
+                alpha=STAGE1_FOCAL_ALPHA,
+                gamma=STAGE1_FOCAL_GAMMA,
+                pos_weight=STAGE1_POS_WEIGHT,
             )
             loss_bbox = masked_bbox_smoothl1_loss(bbox_reg, gt_bbox, gt_bbox_mask)
-            loss = loss_heatmap + BBOX_WEIGHT * loss_bbox
+            loss = loss_heatmap + STAGE1_BBOX_WEIGHT * loss_bbox
 
             if batch_idx == 0:
                 print("\n[VAL DEBUG]")

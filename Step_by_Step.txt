@@ -1,0 +1,26 @@
+Schritt 1:
+FeatureProjector
+
+Schritt 2:
+proposal_utils.py
+
+Schritt 3:
+ROIPoolEncoder
+
+Schritt 4:
+ROIRefinementHead
+
+Schritt 5:
+ROIReadingOrder
+
+Schritt 6:
+ROITokenProjector
+
+Schritt 7:
+HybridKuroNetRecognizer
+
+Schritt 8:
+stage2_targets.py und stage2_losses.py
+
+Schritt 9:
+train_stage2_hybrid.py
