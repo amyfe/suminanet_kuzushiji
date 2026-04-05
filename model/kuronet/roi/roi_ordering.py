@@ -51,9 +51,54 @@ Das passt zu deiner aktuellen Padding-Logik. Wenn du später irgendwo Löcher in
 
 from __future__ import annotations
 
+from math import isfinite
 from typing import List
 
 import torch
+
+
+def infer_reading_orientation_from_boxes(boxes, debug: bool = False) -> str:
+    """Infer reading direction from nearest-neighbor center distances."""
+    if boxes is None or len(boxes) < 2:
+        if debug:
+            print("[ROI ORI DEBUG] n=0/1 -> vertical (fallback)")
+        return "vertical"
+
+    centers = torch.tensor(
+        [[0.5 * (float(b[0]) + float(b[2])), 0.5 * (float(b[1]) + float(b[3]))] for b in boxes],
+        dtype=torch.float32,
+    )
+
+    dx = torch.cdist(centers[:, :1], centers[:, :1], p=1)
+    dy = torch.cdist(centers[:, 1:2], centers[:, 1:2], p=1)
+
+    # Mask self-distances out of nearest-neighbor computations.
+    # Using eye * inf produces NaNs because 0 * inf is undefined.
+    dx.fill_diagonal_(float("inf"))
+    dy.fill_diagonal_(float("inf"))
+
+    mean_min_dx = float(dx.min(dim=1).values.mean().item())
+    mean_min_dy = float(dy.min(dim=1).values.mean().item())
+
+    if not (isfinite(mean_min_dx) and isfinite(mean_min_dy)):
+        if debug:
+            print(
+                f"[ROI ORI DEBUG] non-finite distances | mean_min_dx={mean_min_dx} | "
+                f"mean_min_dy={mean_min_dy} -> vertical (fallback)"
+            )
+        return "vertical"
+
+    # Vertical pages tend to form tight x-aligned columns (small nearest-neighbor dx),
+    # while horizontal pages tend to form tight y-aligned rows (small nearest-neighbor dy).
+    orientation = "vertical" if mean_min_dx <= mean_min_dy else "horizontal"
+
+    if debug:
+        print(
+            f"[ROI ORI DEBUG] n={len(boxes)} | mean_min_dx={mean_min_dx:.4f} | "
+            f"mean_min_dy={mean_min_dy:.4f} | orientation={orientation}"
+        )
+
+    return orientation
 
 
 class ROIReadingOrder:

@@ -154,13 +154,17 @@ class HybridKuroNetRecognizer(nn.Module):
         roi_feat_dim: int = 256,
         refine_hidden_dim: int = 256,
         token_dim: int = 256,
+        token_hidden_dim: int | None = None,
+        token_use_score_branch: bool = True,
         context_hidden_dim: int = 256,
+        context_num_layers: int = 1,
         decoder_embed_dim: int = 128,
         decoder_hidden_dim: int = 256,
 
         det_score_thresh: float = 0.40,
         det_top_k: int = 256,
         det_nms_iou: float = 0.5,
+        det_min_box_size: float = 1.0,
 
         use_aux_head: bool = False,
         dropout: float = 0.1,
@@ -173,6 +177,7 @@ class HybridKuroNetRecognizer(nn.Module):
         self.det_score_thresh = float(det_score_thresh)
         self.det_top_k = int(det_top_k)
         self.det_nms_iou = float(det_nms_iou)
+        self.det_min_box_size = float(det_min_box_size)
 
         self.feature_projector = FeatureProjector(
             in_channels=backbone_out_channels,
@@ -187,36 +192,45 @@ class HybridKuroNetRecognizer(nn.Module):
             conv_channels=proj_dim,
             out_dim=roi_feat_dim,
             dropout=dropout,
+            predict_aux_logits=use_aux_head,
+            vocab_size=vocab_size if use_aux_head else None,
         )
 
         self.roi_refine = ROIRefinementHead(
             feat_dim=roi_feat_dim,
             hidden_dim=refine_hidden_dim,
             dropout=dropout,
-            predict_aux_logits=use_aux_head,
-            vocab_size=vocab_size if use_aux_head else None,
         )
 
         self.roi_order = ROIReadingOrder(line_merge_thresh_ratio=0.6)
 
         self.roi_tokens = ROITokenProjector(
-            feat_dim=roi_feat_dim,
+            roi_feat_dim=roi_feat_dim,
             token_dim=token_dim,
-            hidden_dim=token_dim,
+            hidden_dim=int(token_hidden_dim) if token_hidden_dim is not None else token_dim,
             dropout=dropout,
-            use_score_branch=True,
+            use_score_branch=bool(token_use_score_branch),
         )
 
         self.context_encoder = ROIContextEncoder(
             in_dim=token_dim,
             hidden_dim=context_hidden_dim,
             out_dim=context_hidden_dim,
-            num_layers=1,
+            num_layers=int(context_num_layers),
             dropout=dropout,
             mode="bigru",
             use_layernorm=True,
             use_residual=True,
         )
+
+        self.aux_head_context = None
+        if use_aux_head:
+            self.aux_head_context = nn.Sequential(
+                nn.Linear(context_hidden_dim, refine_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Linear(refine_hidden_dim, vocab_size),
+            )
 
         self.decoder = SeqDecoderAttention(
             embed_dim=decoder_embed_dim,
@@ -260,7 +274,7 @@ class HybridKuroNetRecognizer(nn.Module):
             score_thresh=self.det_score_thresh,
             top_k=self.det_top_k,
             nms_iou=self.det_nms_iou,
-            min_size=1.0,
+            min_size=self.det_min_box_size,
         )
 
         return det_out, coarse_boxes_list, coarse_scores_list
@@ -316,8 +330,12 @@ class HybridKuroNetRecognizer(nn.Module):
             image_size=image_size,
         )
 
+        roi_aux_logits = None
+        if roi_out.get("aux_logits", None) is not None:
+            roi_aux_logits = roi_out["aux_logits"]
+
         # roi_out keys:
-        #   roi_feats, roi_local, roi_boxes, roi_scores, roi_mask
+        #   roi_feats, roi_local, roi_boxes, roi_scores, roi_mask, aux_logits
 
         # 5) refine ROIs
         refine_out = self.roi_refine(
@@ -333,13 +351,14 @@ class HybridKuroNetRecognizer(nn.Module):
             boxes=refine_out["refined_boxes"],
             mask=roi_out["roi_mask"],
             orientations=orientations,
+            roi_feats=roi_out["roi_feats"],
             refined_feats=refine_out["refined_feats"],
             refine_scores=refine_out["refine_scores"],
-            aux_logits=refine_out["aux_logits"] if refine_out["aux_logits"] is not None
+            aux_logits=roi_aux_logits if roi_aux_logits is not None
             else torch.zeros(
-                (*refine_out["refined_feats"].shape[:2], self.vocab_size),
-                device=refine_out["refined_feats"].device,
-                dtype=refine_out["refined_feats"].dtype,
+                (*roi_out["roi_feats"].shape[:2], self.vocab_size),
+                device=roi_out["roi_feats"].device,
+                dtype=roi_out["roi_feats"].dtype,
             ),
         )
 
@@ -347,8 +366,9 @@ class HybridKuroNetRecognizer(nn.Module):
         if self.use_aux_head:
             ordered_aux_logits = ordered["aux_logits"]
 
-        # 7) project refined ROI states into token embeddings
+        # 7) project raw + refined ROI states into token embeddings
         token_feats, token_mask = self.roi_tokens(
+            roi_feats=ordered["roi_feats"],
             refined_feats=ordered["refined_feats"],
             refined_boxes=ordered["boxes"],
             refine_scores=ordered["refine_scores"],
@@ -361,6 +381,10 @@ class HybridKuroNetRecognizer(nn.Module):
             seq=token_feats,
             mask=token_mask,
         )
+
+        aux_logits_with_context = None
+        if self.aux_head_context is not None:
+            aux_logits_with_context = self.aux_head_context(context_feats)
 
         # 9) decode
         decoder_logits, decoder_hidden, attn_weights = self.decoder(
@@ -393,7 +417,9 @@ class HybridKuroNetRecognizer(nn.Module):
             "refined_boxes": refine_out["refined_boxes"],
             "refine_scores": refine_out["refine_scores"],
             "box_deltas": refine_out["box_deltas"],
-            "aux_logits": ordered_aux_logits,
+            "aux_logits": roi_aux_logits,
+            "aux_logits_ordered": ordered_aux_logits,
+            "aux_logits_with_context": aux_logits_with_context,
 
             "ordered_boxes": ordered["boxes"],
             "ordered_mask": ordered["mask"],

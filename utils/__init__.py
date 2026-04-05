@@ -6,6 +6,7 @@ from torch.utils.data import Dataset
 import torchvision.transforms as T
 
 from config import IMAGE_SIZE
+from model.kuronet.roi.roi_ordering import infer_reading_orientation_from_boxes
 
 
 class KuzushijiDataset(Dataset):
@@ -119,7 +120,8 @@ class KuzushijiDataset(Dataset):
 
         boxes = ann.get("boxes", [])
         labels = ann.get("labels", [])
-        orientation = ann.get("orientation", "horizontal")
+        # Reading direction is inferred from box layout (annotation orientation is not required).
+        orientation = infer_reading_orientation_from_boxes(boxes)
 
         # ---------------------------
         # Resize + rescale boxes

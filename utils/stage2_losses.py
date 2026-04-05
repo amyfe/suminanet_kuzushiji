@@ -233,6 +233,9 @@ def compute_stage2_total_loss(
     refine_neg_mask: torch.Tensor,      # (B, T)
     refine_ignore_mask: torch.Tensor,   # (B, T)
 
+    aux_target_labels: Optional[torch.Tensor] = None,
+    aux_pos_mask: Optional[torch.Tensor] = None,
+
     target_tokens: torch.Tensor,        # (B, T_dec)
     target_mask: torch.Tensor,          # (B, T_dec)
 
@@ -277,8 +280,8 @@ def compute_stage2_total_loss(
 
     loss_aux = aux_classification_loss(
         aux_logits=aux_logits,
-        target_labels=matched_gt_labels,
-        pos_mask=refine_pos_mask,
+        target_labels=matched_gt_labels if aux_target_labels is None else aux_target_labels,
+        pos_mask=refine_pos_mask if aux_pos_mask is None else aux_pos_mask,
         ignore_index=-1,
     )
 

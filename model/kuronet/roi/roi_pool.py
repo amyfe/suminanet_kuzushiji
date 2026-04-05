@@ -46,7 +46,7 @@ from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-from torchvision.ops import roi_align
+from torchvision.ops import roi_align as tv_roi_align
 
 from model.kuronet.utils import make_gn
 
@@ -76,8 +76,13 @@ class ROIPoolEncoder(nn.Module):
         conv_channels: int | None = None,
         out_dim: int = 256,
         dropout: float = 0.1,
+        predict_aux_logits: bool = False,
+        vocab_size: int | None = None,
     ):
         super().__init__()
+
+        if predict_aux_logits and (vocab_size is None or vocab_size <= 0):
+            raise ValueError("If predict_aux_logits=True, vocab_size must be a positive integer.")
 
         if conv_channels is None:
             conv_channels = in_channels
@@ -104,6 +109,20 @@ class ROIPoolEncoder(nn.Module):
         )
 
         self.empty_token = nn.Parameter(torch.zeros(1, out_dim))
+        self.predict_aux_logits = bool(predict_aux_logits)
+        self.vocab_size = int(vocab_size) if vocab_size is not None else None
+
+        self.aux_head = None
+        if self.predict_aux_logits:
+            if vocab_size is None:
+                raise ValueError("If predict_aux_logits=True, vocab_size must be a positive integer.")
+            aux_vocab_size: int = vocab_size
+            self.aux_head = nn.Sequential(
+                nn.Linear(out_dim, out_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Linear(out_dim, aux_vocab_size),
+            )
 
     def forward(
         self,
@@ -183,7 +202,7 @@ class ROIPoolEncoder(nn.Module):
             rois_cat = torch.cat(rois, dim=0)                           # (N_all, 5)
             roi_scores_flat = torch.cat(roi_scores_cat, dim=0)          # (N_all,)
 
-            pooled = roi_align(
+            pooled = tv_roi_align(  # type: ignore[operator]
                 feat_2d,
                 rois_cat,
                 output_size=self.roi_size,
@@ -238,4 +257,5 @@ class ROIPoolEncoder(nn.Module):
             "roi_boxes": roi_boxes,     # (B, T, 4)
             "roi_scores": roi_scores,   # (B, T)
             "roi_mask": roi_mask,       # (B, T)
+            "aux_logits": self.aux_head(roi_feats) if self.aux_head is not None else None,
         }

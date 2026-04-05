@@ -6,7 +6,7 @@ Nimmt coarse ROI-Features und coarse boxes und lernt:
 
 refined boxes
 ROI quality / validity
-optional local character logits
+refined features
 
 Input
 roi_feats_padded: (B, T, D)
@@ -18,7 +18,6 @@ Output
 refined_boxes:   (B, T, 4)
 refine_scores:   (B, T)      # wie vertrauenswürdig / gültig ist die ROI
 refined_feats:   (B, T, D)
-aux_logits:      optional (B, T, V_local_or_vocab)
 Was dieses Modul tun sollte
 
 Mindestens:
@@ -86,7 +85,6 @@ class ROIRefinementHead(nn.Module):
         refined_feats:   (B, T, D)
         refined_boxes:   (B, T, 4)
         refine_scores:   (B, T)      learned validity / quality
-        aux_logits:      optional (B, T, vocab_size)
         box_deltas:      (B, T, 4)
     """
 
@@ -97,13 +95,15 @@ class ROIRefinementHead(nn.Module):
         dropout: float = 0.1,
         predict_aux_logits: bool = False,
         vocab_size: int | None = None,
+        residual_scale: float = 0.5,
     ):
         super().__init__()
 
         if predict_aux_logits and (vocab_size is None or vocab_size <= 0):
             raise ValueError("If predict_aux_logits=True, vocab_size must be a positive integer.")
-
+        
         self.predict_aux_logits = predict_aux_logits
+        self.residual_scale = float(residual_scale)
         self.vocab_size = vocab_size
 
         # geometry: cx, cy, bw, bh (normalized)
@@ -147,8 +147,9 @@ class ROIRefinementHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 1),
         )
-
         if self.predict_aux_logits:
+            if vocab_size is None:
+                raise ValueError("If predict_aux_logits=True, vocab_size must be a positive integer.")
             self.aux_head = nn.Sequential(
                 nn.Linear(feat_dim, hidden_dim),
                 nn.ReLU(inplace=True),
@@ -267,7 +268,8 @@ class ROIRefinementHead(nn.Module):
         score_feat = self.score_proj(roi_scores.unsqueeze(-1))              # (B, T, H)
 
         fused_in = torch.cat([roi_feats, geom_feat, score_feat], dim=-1)    # (B, T, D+H+H)
-        refined_feats = self.fuse(fused_in)                                 # (B, T, D)
+        refined_delta = self.fuse(fused_in)
+        refined_feats = roi_feats + self.residual_scale * refined_delta                          # (B, T, D)
 
         box_deltas = self.box_delta_head(refined_feats)                     # (B, T, 4)
         refined_boxes = self._apply_box_deltas(
@@ -289,12 +291,12 @@ class ROIRefinementHead(nn.Module):
 
         aux_logits = None
         if self.aux_head is not None:
-            aux_logits = self.aux_head(refined_feats)                       # (B, T, V)
-
+            aux_in = roi_feats * roi_mask.unsqueeze(-1).to(roi_feats.dtype)  # mask before aux head if used for aux supervision
+            aux_logits = self.aux_head(aux_in)  # (B, T, V)
         return {
             "refined_feats": refined_feats,
             "refined_boxes": refined_boxes,
             "refine_scores": refine_scores,
-            "aux_logits": aux_logits,
             "box_deltas": box_deltas,
+            "aux_logits": aux_logits,
         }

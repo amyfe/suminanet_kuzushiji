@@ -1,6 +1,7 @@
-"""Macht aus refined ROI-Features + Geometrie + Scores eine Sequenz von Token-Embeddings für den Kontextencoder.
+"""Macht aus rohen und refined ROI-Features + Geometrie + Scores eine Sequenz von Token-Embeddings für den Kontextencoder.
 
 Input
+roi features (B, T, D)
 refined ROI features (B, T, D)
 refined boxes (B, T, 4)
 refine scores (B, T)
@@ -15,7 +16,7 @@ token mask (B, T)
 Hier: Feature + Geometrie + Score fusionieren
 zB token = MLP([visual_feat ; geometry_feat ; score_feat])
 
-Ziel: aus refined ROI-Features + Geometrie + Scores eine saubere Token-Sequenz machen, die in den Kontextencoder geht.
+Ziel: aus rohen ROI-Features, refined ROI-Features, Geometrie und Scores eine saubere Token-Sequenz machen, die in den Kontextencoder geht.
 
 Wichtig:
 
@@ -70,7 +71,7 @@ class ROITokenProjector(nn.Module):
 
     def __init__(
         self,
-        feat_dim: int,
+        roi_feat_dim: int,
         token_dim: int = 256,
         hidden_dim: int = 256,
         dropout: float = 0.1,
@@ -92,10 +93,10 @@ class ROITokenProjector(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout),
             )
-            fuse_in_dim = feat_dim + hidden_dim + hidden_dim
+            fuse_in_dim = roi_feat_dim + roi_feat_dim + hidden_dim + hidden_dim
         else:
             self.score_proj = None
-            fuse_in_dim = feat_dim + hidden_dim
+            fuse_in_dim = roi_feat_dim + roi_feat_dim + hidden_dim
 
         self.fuse = nn.Sequential(
             nn.Linear(fuse_in_dim, hidden_dim),
@@ -131,15 +132,25 @@ class ROITokenProjector(nn.Module):
 
     def forward(
         self,
+        roi_feats: torch.Tensor,       # (B, T, D_feat)
         refined_feats: torch.Tensor,   # (B, T, D_feat)
         refined_boxes: torch.Tensor,   # (B, T, 4)
         refine_scores: torch.Tensor,   # (B, T)
         roi_mask: torch.Tensor,        # (B, T)
         image_size: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if roi_feats.dim() != 3:
+            raise ValueError(
+                f"roi_feats must have shape (B, T, D), got {tuple(roi_feats.shape)}"
+            )
         if refined_feats.dim() != 3:
             raise ValueError(
                 f"refined_feats must have shape (B, T, D), got {tuple(refined_feats.shape)}"
+            )
+        if roi_feats.shape[:2] != refined_feats.shape[:2]:
+            raise ValueError(
+                f"roi_feats and refined_feats must agree on batch/time dimensions, got "
+                f"{tuple(roi_feats.shape[:2])} vs {tuple(refined_feats.shape[:2])}"
             )
         if refined_boxes.dim() != 3 or refined_boxes.size(-1) != 4:
             raise ValueError(
@@ -158,10 +169,14 @@ class ROITokenProjector(nn.Module):
         geom_feat = self.geom_proj(geom)
 
         if self.use_score_branch:
-            score_feat = self.score_proj(refine_scores.unsqueeze(-1))
-            fused_in = torch.cat([refined_feats, geom_feat, score_feat], dim=-1)
+            score_prob = torch.sigmoid(refine_scores.unsqueeze(-1))
+            score_proj = self.score_proj
+            if score_proj is None:
+                raise RuntimeError("score_proj is unavailable although use_score_branch=True.")
+            score_feat = score_proj(score_prob)
+            fused_in = torch.cat([roi_feats, refined_feats, geom_feat, score_feat], dim=-1)
         else:
-            fused_in = torch.cat([refined_feats, geom_feat], dim=-1)
+            fused_in = torch.cat([roi_feats, refined_feats, geom_feat], dim=-1)
 
         token_feats = self.fuse(fused_in)
         token_feats = token_feats * roi_mask.unsqueeze(-1).to(token_feats.dtype)
