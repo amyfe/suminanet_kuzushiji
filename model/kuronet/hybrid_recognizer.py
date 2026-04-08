@@ -295,6 +295,7 @@ class HybridKuroNetRecognizer(nn.Module):
         sos_id: Optional[int] = None,
         eos_id: Optional[int] = None,
         max_len: Optional[int] = None,
+        decode_constraints: Optional[dict] = None,
     ) -> dict:
         if images.dim() != 4:
             raise ValueError(f"images must have shape (B, C, H, W), got {tuple(images.shape)}")
@@ -386,8 +387,15 @@ class HybridKuroNetRecognizer(nn.Module):
         if self.aux_head_context is not None:
             aux_logits_with_context = self.aux_head_context(context_feats)
 
-        # 9) decode
-        decoder_logits, decoder_hidden, attn_weights = self.decoder(
+                # 9) decode
+        decoder_token_bias = None
+        if self.use_aux_head:
+            if aux_logits_with_context is not None:
+                decoder_token_bias = aux_logits_with_context
+            elif ordered_aux_logits is not None:
+                decoder_token_bias = ordered_aux_logits
+
+        decoder_logits, decoder_hidden, attn_weights, stop_logits = self.decoder(
             enc_outputs=context_feats,
             enc_mask=context_mask,
             input_seq=input_seq,
@@ -396,6 +404,8 @@ class HybridKuroNetRecognizer(nn.Module):
             sos_id=sos_id,
             eos_id=eos_id,
             max_len=max_len,
+            encoder_token_bias=decoder_token_bias,
+            decode_constraints=decode_constraints,
         )
 
         return {
@@ -434,4 +444,6 @@ class HybridKuroNetRecognizer(nn.Module):
             "decoder_logits": decoder_logits,
             "decoder_hidden": decoder_hidden,
             "attn_weights": attn_weights,
+            "stop_logits": stop_logits,
+            "decoder_token_bias": decoder_token_bias,
         }

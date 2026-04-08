@@ -39,7 +39,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     token_hidden_dim = trial.suggest_categorical("token_hidden_dim", [256, 384, 512])
     context_hidden_dim = trial.suggest_categorical("context_hidden_dim", [256, 384, 512])
     context_num_layers = trial.suggest_categorical("context_num_layers", [1, 2])
-    phase_a2_tf_end = trial.suggest_float("phase_a2_tf_end", 0.90, 1.00)
+    phase_a_tf_end = trial.suggest_float("phase_a_tf_end", 0.90, 1.00)
 
     model_overrides = {
         "det_score_thresh": det_score_thresh,
@@ -51,8 +51,8 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
         "context_num_layers": context_num_layers,
     }
 
-    # Make A2 TF-end searchable without changing config.py.
-    train_stage2.STAGE2_PHASE_A2_TF_END = float(phase_a2_tf_end)
+    # Make A TF-end searchable without changing config.py.
+    train_stage2.STAGE2_PHASE_A_TF_END = float(phase_a_tf_end)
 
     trial_ckpt_dir = Path(args.output_dir) / f"trial_{trial.number}"
     trial_ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -62,7 +62,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
         num_epochs=args.epochs,
         lr=args.lr,
         checkpoint_dir=trial_ckpt_dir,
-        phase="A2",
+        phase="A",
         resume_model_ckpt=None,
         model_overrides=model_overrides,
         val_max_batches=args.val_max_batches,
@@ -102,8 +102,8 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Optuna search for Stage-2 A2 proposal + architecture tuning")
-    parser.add_argument("--epochs", type=int, default=2, help="A2 epochs per trial")
+    parser = argparse.ArgumentParser(description="Optuna search for Stage-2 A proposal + architecture tuning")
+    parser.add_argument("--epochs", type=int, default=2, help="A epochs per trial")
     parser.add_argument("--n-trials", type=int, default=20, help="Number of Optuna trials")
     parser.add_argument("--global-max-trials", type=int, default=0, help="Shared cap across parallel workers (0 disables)")
     parser.add_argument("--timeout", type=int, default=0, help="Timeout in seconds (0 disables)")
@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-duplicate", type=float, default=0.15, help="Penalty weight for duplicate positives")
     parser.add_argument("--weight-negative", type=float, default=0.002, help="Penalty weight for negatives per image")
 
-    parser.add_argument("--study-name", type=str, default="stage2_a2_optuna")
+    parser.add_argument("--study-name", type=str, default="stage2_a_optuna")
     parser.add_argument("--storage", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--sampler", type=str, default="tpe", choices=["tpe", "random"])
@@ -128,12 +128,12 @@ def main() -> None:
     args = parse_args()
 
     if not args.output_dir:
-        args.output_dir = str(CHECKPOINT_DIR / "optuna_stage2_a2")
+        args.output_dir = str(CHECKPOINT_DIR / "optuna_stage2_a")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.storage:
-        args.storage = f"sqlite:///{(out_dir / 'optuna_stage2_a2.db').as_posix()}"
+        args.storage = f"sqlite:///{(out_dir / 'optuna_stage2_a.db').as_posix()}"
 
     if args.val_max_batches <= 0:
         args.val_max_batches = None

@@ -217,7 +217,50 @@ def decoder_cross_entropy_loss(
 
     return per_token_loss.mean()
 
+def decoder_stop_bce_loss(
+    stop_logits: torch.Tensor,    # (B, T_dec)
+    target_tokens: torch.Tensor,  # (B, T_dec)
+    target_mask: torch.Tensor,    # (B, T_dec)
+    eos_id: int,
+    pos_weight: float = 1.0,
+) -> torch.Tensor:
+    """
+    BCE stop loss:
+    target = 1 exactly on EOS token positions among valid decoder targets.
+    """
+    if stop_logits.dim() != 2:
+        raise ValueError(f"stop_logits must have shape (B, T), got {tuple(stop_logits.shape)}")
+    if target_tokens.dim() != 2:
+        raise ValueError(f"target_tokens must have shape (B, T), got {tuple(target_tokens.shape)}")
+    if target_mask.dim() != 2:
+        raise ValueError(f"target_mask must have shape (B, T), got {tuple(target_mask.shape)}")
 
+    if stop_logits.shape != target_tokens.shape:
+        raise ValueError(
+            f"stop_logits shape {tuple(stop_logits.shape)} must match target_tokens shape {tuple(target_tokens.shape)}"
+        )
+
+    valid_mask = target_mask.bool()
+    if valid_mask.sum() == 0:
+        return stop_logits.new_tensor(0.0)
+
+    targets = target_tokens.eq(int(eos_id)).to(stop_logits.dtype)
+
+    logits_valid = stop_logits[valid_mask]
+    targets_valid = targets[valid_mask]
+
+    pos_weight_tensor = torch.tensor(
+        float(pos_weight),
+        device=stop_logits.device,
+        dtype=stop_logits.dtype,
+    )
+
+    return F.binary_cross_entropy_with_logits(
+        logits_valid,
+        targets_valid,
+        pos_weight=pos_weight_tensor,
+        reduction="mean",
+    )
 def compute_stage2_total_loss(
     *,
     refined_boxes: torch.Tensor,        # (B, T, 4)
@@ -225,6 +268,7 @@ def compute_stage2_total_loss(
     refine_scores: torch.Tensor,        # (B, T)
     aux_logits: Optional[torch.Tensor], # (B, T, V) or None
     decoder_logits: torch.Tensor,       # (B, T_dec, V)
+    stop_logits: Optional[torch.Tensor], # (B, T_dec) or None
 
     matched_gt_boxes: torch.Tensor,     # (B, T, 4)
     target_deltas: torch.Tensor,        # (B, T, 4)
@@ -244,11 +288,13 @@ def compute_stage2_total_loss(
     lambda_score: float = 0.5,
     lambda_aux: float = 0.2,
     lambda_decoder: float = 1.0,
+    lambda_stop: float = 0.0,
 
     refine_pos_weight: float = 1.0,
     decoder_label_smoothing: float = 0.0,
     decoder_eos_id: Optional[int] = None,
     decoder_eos_weight: float = 1.0,
+    decoder_stop_pos_weight: float = 1.0,
 ) -> dict:
     """
     Compute full Option-C Stage-2 loss.
@@ -294,12 +340,22 @@ def compute_stage2_total_loss(
         eos_weight=decoder_eos_weight,
     )
 
+    loss_stop = decoder_logits.new_tensor(0.0)
+    if stop_logits is not None and decoder_eos_id is not None and float(lambda_stop) > 0.0:
+        loss_stop = decoder_stop_bce_loss(
+            stop_logits=stop_logits,
+            target_tokens=target_tokens,
+            target_mask=target_mask,
+            eos_id=int(decoder_eos_id),
+            pos_weight=float(decoder_stop_pos_weight),
+        )
     total_loss = (
         float(lambda_box) * loss_box +
         float(lambda_delta) * loss_delta +
         float(lambda_score) * loss_score +
         float(lambda_aux) * loss_aux +
-        float(lambda_decoder) * loss_decoder
+        float(lambda_decoder) * loss_decoder +
+        float(lambda_stop) * loss_stop
     )
 
     return {
@@ -309,4 +365,5 @@ def compute_stage2_total_loss(
         "loss_score": loss_score,
         "loss_aux": loss_aux,
         "loss_decoder": loss_decoder,
+        "loss_stop": loss_stop,
     }
