@@ -35,7 +35,7 @@ from model.kuronet import DetectorHead, UNet
 from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
-from utils.training_helpers import collate_fn, masked_bbox_smoothl1_loss
+from utils.training_helpers.helper_stage1 import collate_fn, masked_bbox_smoothl1_loss
 from utils.vocab import VocabManager
 from validate_stage1 import compute_detection_metrics, extract_boxes_from_heatmap
 

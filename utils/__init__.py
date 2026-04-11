@@ -97,7 +97,7 @@ class KuzushijiDataset(Dataset):
                 img_path = f"{book_id}/images/{fn}"
 
             self.items.append({
-                "ann_file": ann_file,
+                "ann": ann,
                 "img_path": self.root_dir / img_path
             })
 
@@ -109,14 +109,11 @@ class KuzushijiDataset(Dataset):
     # ----------------------------------------------------------
     def __getitem__(self, idx):
         item = self.items[idx]
-        ann_file = item["ann_file"]
         img_path = item["img_path"]
+        ann = item["ann"]
 
         # Load image
         image = Image.open(img_path).convert("RGB")
-
-        with open(ann_file, "r", encoding="utf-8") as f:
-            ann = json.load(f)
 
         boxes = ann.get("boxes", [])
         labels = ann.get("labels", [])

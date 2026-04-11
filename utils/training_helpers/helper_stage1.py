@@ -15,8 +15,9 @@ from utils.focal_loss import focal_loss_heatmap
 
 
 def prune_existing_checkpoints(ckpt_dir: Path, old_name: str = "checkpoint_old.pt") -> None:
-    """At start: keep only the newest checkpoint, rename it to old_name."""
-    ckpts = sorted(ckpt_dir.glob("*.pt"), key=lambda p: p.stat().st_mtime)
+    """At start: keep the newest non-best checkpoint, rename it to old_name."""
+    ckpts = [p for p in ckpt_dir.glob("*.pt") if not p.name.endswith("_best.pt")]
+    ckpts = sorted(ckpts, key=lambda p: p.stat().st_mtime)
     if not ckpts:
         return
     newest = ckpts[-1]
@@ -41,8 +42,8 @@ def prune_existing_checkpoints(ckpt_dir: Path, old_name: str = "checkpoint_old.p
 
 
 def prune_to_keep_last_n(ckpt_dir: Path, keep: int = 2, exclude: str = "checkpoint_old.pt") -> None:
-    """Keep only the newest N checkpoints (excluding a preserved old file)."""
-    ckpts = [p for p in ckpt_dir.glob("*.pt") if p.name != exclude]
+    """Keep only the newest N non-best checkpoints (excluding preserved files)."""
+    ckpts = [p for p in ckpt_dir.glob("*.pt") if p.name != exclude and not p.name.endswith("_best.pt")]
     ckpts = sorted(ckpts, key=lambda p: p.stat().st_mtime)
     if len(ckpts) <= keep:
         return
@@ -70,25 +71,24 @@ def collate_fn(batch, pad_id):
     labels = [b.get("labels", torch.empty((0,), dtype=torch.long)) for b in batch]
     orientations = [b.get("orientation", "horizontal") for b in batch]
 
-    # Text sequences - fill missing with None instead of filtering
+    # Text sequences - keep batch alignment by inserting a short all-pad placeholder
+    # for samples without transcripts. This preserves B-way correspondence between
+    # images, boxes, labels, and decoder supervision tensors.
     text_ids_list = []
     text_lengths_list = []
+    text_ids_present = []
     for b in batch:
-        if "text_ids" in b and b["text_ids"] is not None:
+        has_text_ids = "text_ids" in b and b["text_ids"] is not None
+        text_ids_present.append(has_text_ids)
+        if has_text_ids:
             text_ids_list.append(b["text_ids"])
             text_lengths_list.append(len(b["text_ids"]))
         else:
-            text_ids_list.append(None)
+            text_ids_list.append(torch.full((2,), int(pad_id), dtype=torch.long))
             text_lengths_list.append(0)
 
-    # Pad sequences (skip None entries)
-    valid_text_ids = [t for t in text_ids_list if t is not None]
-    if len(valid_text_ids) == 0:
-        text_padded = None
-        text_lengths = torch.tensor(text_lengths_list, dtype=torch.long)
-    else:
-        text_padded = nn.utils.rnn.pad_sequence(valid_text_ids, batch_first=True, padding_value=pad_id)
-        text_lengths = torch.tensor(text_lengths_list, dtype=torch.long)
+    text_padded = nn.utils.rnn.pad_sequence(text_ids_list, batch_first=True, padding_value=pad_id)
+    text_lengths = torch.tensor(text_lengths_list, dtype=torch.long)
 
     return {
         "image": images,
@@ -97,7 +97,7 @@ def collate_fn(batch, pad_id):
         "boxes": boxes,
         "labels": labels,
         "orientations": orientations,
-        "text_ids_present": torch.tensor([t is not None for t in text_ids_list], dtype=torch.bool),
+        "text_ids_present": torch.tensor(text_ids_present, dtype=torch.bool),
     }
 
 

@@ -127,6 +127,37 @@ class ROIReadingOrder:
     def _valid_count(mask_b: torch.Tensor) -> int:
         return int(mask_b.sum().item())
 
+    def _primary_axis_monotonic_fraction(
+        self,
+        boxes_sorted_valid: torch.Tensor,
+        orientation: str,
+    ) -> tuple[float, float]:
+        """
+        Compute a lightweight ordering-quality diagnostic on sorted valid boxes.
+
+        Returns:
+            monotonic_fraction, violation_fraction
+        """
+        n = int(boxes_sorted_valid.size(0))
+        if n <= 1:
+            return 1.0, 0.0
+
+        if orientation == "horizontal":
+            primary = (boxes_sorted_valid[:, 1] + boxes_sorted_valid[:, 3]) * 0.5
+            scale = (boxes_sorted_valid[:, 3] - boxes_sorted_valid[:, 1]).clamp_min(1.0).median()
+            tol = float(self.line_merge_thresh_ratio * scale.item())
+            ok = primary[1:] >= (primary[:-1] - tol)
+        elif orientation == "vertical":
+            primary = (boxes_sorted_valid[:, 0] + boxes_sorted_valid[:, 2]) * 0.5
+            scale = (boxes_sorted_valid[:, 2] - boxes_sorted_valid[:, 0]).clamp_min(1.0).median()
+            tol = float(self.line_merge_thresh_ratio * scale.item())
+            ok = primary[1:] <= (primary[:-1] + tol)
+        else:
+            return 1.0, 0.0
+
+        mono = float(ok.float().mean().item()) if ok.numel() > 0 else 1.0
+        return mono, 1.0 - mono
+
     def _horizontal_sort_indices(self, boxes: torch.Tensor) -> torch.Tensor:
         """
         Horizontal reading order:
@@ -310,6 +341,9 @@ class ROIReadingOrder:
         sorted_boxes = torch.zeros_like(boxes)
         sorted_mask = torch.zeros_like(mask)
         sort_indices = torch.zeros((bsz, t_max), device=boxes.device, dtype=torch.long)
+        ordering_primary_mono = torch.ones((bsz,), device=boxes.device, dtype=boxes.dtype)
+        ordering_primary_viol = torch.zeros((bsz,), device=boxes.device, dtype=boxes.dtype)
+        ordering_valid_counts = mask.to(dtype=torch.long).sum(dim=1)
 
         sorted_named = {
             name: torch.zeros_like(tensor)
@@ -328,6 +362,15 @@ class ROIReadingOrder:
             sorted_boxes[b] = result[0]
             sorted_mask[b] = result[1]
 
+            valid_t = self._valid_count(sorted_mask[b])
+            if valid_t > 0:
+                mono, viol = self._primary_axis_monotonic_fraction(
+                    boxes_sorted_valid=sorted_boxes[b, :valid_t],
+                    orientation=orientations[b],
+                )
+                ordering_primary_mono[b] = mono
+                ordering_primary_viol[b] = viol
+
             offset = 2
             for i, name in enumerate(named_tensors.keys()):
                 sorted_named[name][b] = result[offset + i]
@@ -338,6 +381,11 @@ class ROIReadingOrder:
             "boxes": sorted_boxes,
             "mask": sorted_mask,
             "sort_indices": sort_indices,
+            "ordering_diagnostics": {
+                "primary_monotonic_fraction": ordering_primary_mono,
+                "primary_violation_fraction": ordering_primary_viol,
+                "valid_counts": ordering_valid_counts,
+            },
         }
         out.update(sorted_named)
         return out

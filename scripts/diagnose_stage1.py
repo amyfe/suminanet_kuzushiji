@@ -8,7 +8,7 @@ import json
 from config import DATA_DIR, DEVICE, BATCH_SIZE, IMAGE_SIZE, NUM_WORKERS
 from model.kuronet import UNet, DetectorHead
 from utils import KuzushijiDataset
-from utils.training_helpers import collate_fn
+from utils.training_helpers.helper_stage1 import collate_fn
 from utils.vocab import VocabManager
 from torch.utils.data import DataLoader
 

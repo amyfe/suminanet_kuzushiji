@@ -241,12 +241,12 @@ class HybridKuroNetRecognizer(nn.Module):
             init_from_encoder=True,
             sampling_method="argmax",
             dropout=dropout,
+            pointer_window_radius=2,
         )
 
         self.vocab_size = vocab_size
         self.use_aux_head = bool(use_aux_head)
 
-    @torch.no_grad()
     def _extract_detector_proposals(
         self,
         shared_feats: torch.Tensor,
@@ -279,6 +279,162 @@ class HybridKuroNetRecognizer(nn.Module):
 
         return det_out, coarse_boxes_list, coarse_scores_list
 
+    def encode_images(
+        self,
+        images: torch.Tensor,
+        orientations: List[str],
+        coarse_boxes_list: Optional[List[torch.Tensor]] = None,
+        coarse_scores_list: Optional[List[torch.Tensor]] = None,
+    ) -> dict:
+        if images.dim() != 4:
+            raise ValueError(f"images must have shape (B, C, H, W), got {tuple(images.shape)}")
+
+        bsz, _, h_img, w_img = images.shape
+        image_size = (h_img, w_img)
+
+        if len(orientations) != bsz:
+            raise ValueError(
+                f"orientations length {len(orientations)} does not match batch size {bsz}"
+            )
+
+        shared_feats = self.backbone(images)
+
+        if coarse_boxes_list is None or coarse_scores_list is None:
+            det_out, coarse_boxes_list, coarse_scores_list = self._extract_detector_proposals(
+                shared_feats=shared_feats,
+                image_size=image_size,
+            )
+        else:
+            det_out = None
+
+        proj_feats = self.feature_projector(shared_feats)
+
+        roi_out = self.roi_pool(
+            feat_2d=proj_feats,
+            proposal_boxes_list=coarse_boxes_list,
+            proposal_scores_list=coarse_scores_list,
+            image_size=image_size,
+        )
+
+        roi_aux_logits = roi_out.get("aux_logits", None)
+
+        refine_out = self.roi_refine(
+            roi_feats=roi_out["roi_feats"],
+            roi_boxes=roi_out["roi_boxes"],
+            roi_scores=roi_out["roi_scores"],
+            roi_mask=roi_out["roi_mask"],
+            image_size=image_size,
+        )
+
+        ordered = self.roi_order.sort_batch(
+            boxes=refine_out["refined_boxes"],
+            mask=roi_out["roi_mask"],
+            orientations=orientations,
+            roi_feats=roi_out["roi_feats"],
+            refined_feats=refine_out["refined_feats"],
+            refine_scores=refine_out["refine_scores"],
+            aux_logits=roi_aux_logits if roi_aux_logits is not None
+            else torch.zeros(
+                (*roi_out["roi_feats"].shape[:2], self.vocab_size),
+                device=roi_out["roi_feats"].device,
+                dtype=roi_out["roi_feats"].dtype,
+            ),
+        )
+
+        ordered_aux_logits = ordered["aux_logits"] if self.use_aux_head else None
+
+        token_feats, token_mask = self.roi_tokens(
+            roi_feats=ordered["roi_feats"],
+            refined_feats=ordered["refined_feats"],
+            refined_boxes=ordered["boxes"],
+            refine_scores=ordered["refine_scores"],
+            roi_mask=ordered["mask"],
+            image_size=image_size,
+        )
+
+        context_feats, context_mask = self.context_encoder(
+            seq=token_feats,
+            mask=token_mask,
+        )
+
+        aux_logits_with_context = None
+        if self.aux_head_context is not None:
+            aux_logits_with_context = self.aux_head_context(context_feats)
+
+        decoder_token_bias = None
+        if self.use_aux_head:
+            if aux_logits_with_context is not None:
+                decoder_token_bias = aux_logits_with_context
+            elif ordered_aux_logits is not None:
+                decoder_token_bias = ordered_aux_logits
+
+        return {
+            "shared_feats": shared_feats,
+            "detector_outputs": det_out,
+            "coarse_boxes_list": coarse_boxes_list,
+            "coarse_scores_list": coarse_scores_list,
+            "proj_feats": proj_feats,
+            "roi_feats": roi_out["roi_feats"],
+            "roi_local": roi_out["roi_local"],
+            "roi_boxes": roi_out["roi_boxes"],
+            "roi_scores": roi_out["roi_scores"],
+            "roi_mask": roi_out["roi_mask"],
+            "refined_feats": refine_out["refined_feats"],
+            "refined_boxes": refine_out["refined_boxes"],
+            "refine_scores": refine_out["refine_scores"],
+            "box_deltas": refine_out["box_deltas"],
+            "aux_logits": roi_aux_logits,
+            "aux_logits_ordered": ordered_aux_logits,
+            "aux_logits_with_context": aux_logits_with_context,
+            "ordered_boxes": ordered["boxes"],
+            "ordered_mask": ordered["mask"],
+            "sort_indices": ordered["sort_indices"],
+            "ordering_diagnostics": ordered.get("ordering_diagnostics", None),
+            "token_feats": token_feats,
+            "token_mask": token_mask,
+            "context_feats": context_feats,
+            "context_mask": context_mask,
+            "decoder_token_bias": decoder_token_bias,
+        }
+
+    def decode_from_encoded(
+        self,
+        encoded: dict,
+        targets: Optional[torch.Tensor] = None,
+        teacher_forcing_ratio: float = 0.0,
+        input_seq: Optional[torch.Tensor] = None,
+        sos_id: Optional[int] = None,
+        eos_id: Optional[int] = None,
+        max_len: Optional[int] = None,
+        oracle_pointer_positions: Optional[torch.Tensor] = None,
+        decode_constraints: Optional[dict] = None,
+    ) -> dict:
+        decoder_logits, decoder_hidden, attn_weights, stop_logits, action_logis, pointer_positions, emitted_token_ids = self.decoder(
+            enc_outputs=encoded["context_feats"],
+            enc_mask=encoded["context_mask"],
+            input_seq=input_seq,
+            targets=targets,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+            sos_id=sos_id,
+            eos_id=eos_id,
+            max_len=max_len,
+            encoder_token_bias=encoded.get("decoder_token_bias", None),
+            oracle_pointer_positions=oracle_pointer_positions,
+            decode_constraints=decode_constraints,
+        )
+
+        outputs = dict(encoded)
+        outputs.update({
+            "decoder_logits": decoder_logits,
+            "decoder_hidden": decoder_hidden,
+            "attn_weights": attn_weights,
+            "stop_logits": stop_logits,
+            "action_logits": action_logis,
+            "pointer_positions": pointer_positions,
+            "emitted_token_ids": emitted_token_ids,
+        })
+        return outputs
+
     def forward(
         self,
         images: torch.Tensor,                     # (B, 3, H, W)
@@ -295,155 +451,23 @@ class HybridKuroNetRecognizer(nn.Module):
         sos_id: Optional[int] = None,
         eos_id: Optional[int] = None,
         max_len: Optional[int] = None,
+        oracle_pointer_positions: Optional[torch.Tensor] = None,
         decode_constraints: Optional[dict] = None,
     ) -> dict:
-        if images.dim() != 4:
-            raise ValueError(f"images must have shape (B, C, H, W), got {tuple(images.shape)}")
-
-        bsz, _, h_img, w_img = images.shape
-        image_size = (h_img, w_img)
-
-        if len(orientations) != bsz:
-            raise ValueError(
-                f"orientations length {len(orientations)} does not match batch size {bsz}"
-            )
-
-        # 1) shared backbone features
-        shared_feats = self.backbone(images)                      # (B, C_backbone, Hf, Wf)
-
-        # 2) coarse proposals from detector, unless externally provided
-        if coarse_boxes_list is None or coarse_scores_list is None:
-            det_out, coarse_boxes_list, coarse_scores_list = self._extract_detector_proposals(
-                shared_feats=shared_feats,
-                image_size=image_size,
-            )
-        else:
-            det_out = None
-
-        # 3) project features for Stage 2
-        proj_feats = self.feature_projector(shared_feats)         # (B, C_proj, Hf, Wf)
-
-        # 4) pool local ROI features
-        roi_out = self.roi_pool(
-            feat_2d=proj_feats,
-            proposal_boxes_list=coarse_boxes_list,
-            proposal_scores_list=coarse_scores_list,
-            image_size=image_size,
-        )
-
-        roi_aux_logits = None
-        if roi_out.get("aux_logits", None) is not None:
-            roi_aux_logits = roi_out["aux_logits"]
-
-        # roi_out keys:
-        #   roi_feats, roi_local, roi_boxes, roi_scores, roi_mask, aux_logits
-
-        # 5) refine ROIs
-        refine_out = self.roi_refine(
-            roi_feats=roi_out["roi_feats"],
-            roi_boxes=roi_out["roi_boxes"],
-            roi_scores=roi_out["roi_scores"],
-            roi_mask=roi_out["roi_mask"],
-            image_size=image_size,
-        )
-
-        # 6) reorder according to reading order
-        ordered = self.roi_order.sort_batch(
-            boxes=refine_out["refined_boxes"],
-            mask=roi_out["roi_mask"],
+        encoded = self.encode_images(
+            images=images,
             orientations=orientations,
-            roi_feats=roi_out["roi_feats"],
-            refined_feats=refine_out["refined_feats"],
-            refine_scores=refine_out["refine_scores"],
-            aux_logits=roi_aux_logits if roi_aux_logits is not None
-            else torch.zeros(
-                (*roi_out["roi_feats"].shape[:2], self.vocab_size),
-                device=roi_out["roi_feats"].device,
-                dtype=roi_out["roi_feats"].dtype,
-            ),
+            coarse_boxes_list=coarse_boxes_list,
+            coarse_scores_list=coarse_scores_list,
         )
-
-        ordered_aux_logits = None
-        if self.use_aux_head:
-            ordered_aux_logits = ordered["aux_logits"]
-
-        # 7) project raw + refined ROI states into token embeddings
-        token_feats, token_mask = self.roi_tokens(
-            roi_feats=ordered["roi_feats"],
-            refined_feats=ordered["refined_feats"],
-            refined_boxes=ordered["boxes"],
-            refine_scores=ordered["refine_scores"],
-            roi_mask=ordered["mask"],
-            image_size=image_size,
-        )
-
-        # 8) contextualize token embeddings
-        context_feats, context_mask = self.context_encoder(
-            seq=token_feats,
-            mask=token_mask,
-        )
-
-        aux_logits_with_context = None
-        if self.aux_head_context is not None:
-            aux_logits_with_context = self.aux_head_context(context_feats)
-
-                # 9) decode
-        decoder_token_bias = None
-        if self.use_aux_head:
-            if aux_logits_with_context is not None:
-                decoder_token_bias = aux_logits_with_context
-            elif ordered_aux_logits is not None:
-                decoder_token_bias = ordered_aux_logits
-
-        decoder_logits, decoder_hidden, attn_weights, stop_logits = self.decoder(
-            enc_outputs=context_feats,
-            enc_mask=context_mask,
-            input_seq=input_seq,
+        return self.decode_from_encoded(
+            encoded,
             targets=targets,
             teacher_forcing_ratio=teacher_forcing_ratio,
+            input_seq=input_seq,
             sos_id=sos_id,
             eos_id=eos_id,
             max_len=max_len,
-            encoder_token_bias=decoder_token_bias,
+            oracle_pointer_positions=oracle_pointer_positions,
             decode_constraints=decode_constraints,
         )
-
-        return {
-            "shared_feats": shared_feats,
-            "detector_outputs": det_out,
-
-            "coarse_boxes_list": coarse_boxes_list,
-            "coarse_scores_list": coarse_scores_list,
-
-            "proj_feats": proj_feats,
-
-            "roi_feats": roi_out["roi_feats"],
-            "roi_local": roi_out["roi_local"],
-            "roi_boxes": roi_out["roi_boxes"],
-            "roi_scores": roi_out["roi_scores"],
-            "roi_mask": roi_out["roi_mask"],
-
-            "refined_feats": refine_out["refined_feats"],
-            "refined_boxes": refine_out["refined_boxes"],
-            "refine_scores": refine_out["refine_scores"],
-            "box_deltas": refine_out["box_deltas"],
-            "aux_logits": roi_aux_logits,
-            "aux_logits_ordered": ordered_aux_logits,
-            "aux_logits_with_context": aux_logits_with_context,
-
-            "ordered_boxes": ordered["boxes"],
-            "ordered_mask": ordered["mask"],
-            "sort_indices": ordered["sort_indices"],
-
-            "token_feats": token_feats,
-            "token_mask": token_mask,
-
-            "context_feats": context_feats,
-            "context_mask": context_mask,
-
-            "decoder_logits": decoder_logits,
-            "decoder_hidden": decoder_hidden,
-            "attn_weights": attn_weights,
-            "stop_logits": stop_logits,
-            "decoder_token_bias": decoder_token_bias,
-        }

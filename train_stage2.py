@@ -20,6 +20,8 @@ from config import (
     NUM_WORKERS,
     NUM_EPOCHS,
     LR,
+    STAGE2_ACTION_ALIGNMENT_FULL_EPOCH,
+    STAGE2_ACTION_ALIGNMENT_START_EPOCH,
     STAGE2_CONTEXT_HIDDEN_DIM,
     STAGE2_CONTEXT_NUM_LAYERS,
     STAGE2_DECODER_EMBED_DIM,
@@ -29,8 +31,19 @@ from config import (
     STAGE2_DET_NMS_IOU,
     STAGE2_DET_SCORE_THRESH,
     STAGE2_DET_TOP_K,
+    STAGE2_LAMBDA_ACTION,
+    STAGE2_LAMBDA_FREE_PREFIX,
     STAGE2_LAMBDA_STOP,
-    STAGE2_PHASE_B_STOP_THRESHOLD,
+    STAGE2_FREE_PREFIX_EVERY_N_STEPS,
+    STAGE2_TRAIN_FREE_DECODE_BATCHES,
+    STAGE2_TRAIN_DECODER_STATS_EVERY_N_STEPS,
+    STAGE2_TRAIN_FREE_DIAG_MAX_LEN,
+    STAGE2_VAL_FREE_DECODE_BATCHES,
+    STAGE2_FREE_RECOVERY_WINDOW,
+    STAGE2_FREE_RECOVERY_WEIGHT,
+    STAGE2_USE_CHUNKED_FREE_DECODE,
+    STAGE2_ENABLE_TQDM,
+    STAGE2_PROGRESS_POSTFIX_EVERY_N_STEPS,
     STAGE2_PROJ_DIM,
     STAGE2_REFINE_HIDDEN_DIM,
     STAGE2_ROI_FEAT_DIM,
@@ -50,6 +63,8 @@ from config import (
     STAGE2_REFINE_POS_WEIGHT,
     STAGE2_DECODER_LABEL_SMOOTHING,
     STAGE2_DECODER_EOS_WEIGHT,
+    STAGE2_ACTION_AUX_WEIGHT,
+    VALIDATION_BATCHES,
     STAGE2_TF_SCHEDULE,
     STAGE2_VAL_MAX_DECODE_LEN,
     STAGE2_DEBUG_BATCH_STATS,
@@ -70,12 +85,15 @@ from config import (
     STAGE2_PHASE_B_LAMBDA_SCORE,
     STAGE2_PHASE_B_LAMBDA_AUX,
     STAGE2_PHASE_B_LAMBDA_DECODER,
-    STAGE2_PHASE_B_LAMBDA_DECODER_FREE,
     STAGE2_PHASE_B_TF_START,
     STAGE2_PHASE_B_TF_END,
     STAGE2_PHASE_B_FREE_REPETITION_PENALTY,
     STAGE2_PHASE_B_FREE_BLOCK_IMMEDIATE_REPEAT,
     STAGE2_PHASE_B_FREE_MIN_STEPS,
+    STAGE2_PHASE_B_TRAIN_FREE_REPETITION_PENALTY,
+    STAGE2_PHASE_B_TRAIN_FREE_BLOCK_IMMEDIATE_REPEAT,
+    STAGE2_PHASE_B_TRAIN_FREE_MIN_STEPS,
+    STAGE2_LAMBDA_STOP_FREE_SCALE,
     
 )
 
@@ -83,8 +101,7 @@ from model.kuronet import UNet, DetectorHead
 from model.kuronet.hybrid_recognizer import HybridKuroNetRecognizer
 
 from utils import KuzushijiDataset
-from utils.text_normalization import render_tokens
-from utils.training_helpers import (
+from utils.training_helpers.helper_stage1 import (
     collate_fn,
     prune_existing_checkpoints,
     prune_to_keep_last_n,
@@ -95,61 +112,30 @@ from utils.stage2_targets import (
     build_refinement_targets,
     build_decoder_targets,
 )
-from utils.stage2_losses import compute_stage2_total_loss
+from utils.stage2_losses import compute_stage2_total_loss, compute_free_decoder_prefix_losses
+from utils.stage2_losses import build_decoder_roi_targets_monotonic
 from utils.stage2_losses import aux_classification_loss
 
-def _decode_text_from_ids(ids, vocab):
-    chars = vocab.decode([int(x) for x in ids], remove_special=True)
-    return render_tokens(chars)
-
-def _count_valid_rois_per_image(roi_mask: torch.Tensor) -> list[int]:
-    return [int(v) for v in roi_mask.to(dtype=torch.long).sum(dim=1).tolist()]
-
-
-def _count_mask_per_image(mask: torch.Tensor) -> list[int]:
-    return [int(v) for v in mask.to(dtype=torch.long).sum(dim=1).tolist()]
-
-
-def _load_compatible_state_dict(module: torch.nn.Module, state_dict: dict) -> None:
-    """Load only tensors whose names and shapes match the current module."""
-    current_state = module.state_dict()
-    compatible_state = {}
-    skipped_keys: list[str] = []
-
-    for key, value in state_dict.items():
-        if key in current_state and current_state[key].shape == value.shape:
-            compatible_state[key] = value
-        else:
-            skipped_keys.append(key)
-
-    missing_keys = [key for key in current_state.keys() if key not in compatible_state]
-    module.load_state_dict(compatible_state, strict=False)
-
-    print(
-        f"Loaded resume checkpoint partially: {len(compatible_state)} tensors matched, "
-        f"{len(skipped_keys)} skipped, {len(missing_keys)} left initialized."
-    )
-    if skipped_keys:
-        preview = ", ".join(skipped_keys[:8])
-        suffix = "..." if len(skipped_keys) > 8 else ""
-        print(f"Skipped incompatible keys: {preview}{suffix}")
-
-
-def _normalize_orientation_label(label: str) -> str:
-    key = str(label).strip().lower()
-    if key in {"horizontal", "h", "hor"}:
-        return "horizontal"
-    if key in {"vertical", "v", "ver"}:
-        return "vertical"
-    return "other"
-
-
-def _valid_proposal_mask(boxes: torch.Tensor, roi_mask: torch.Tensor) -> torch.Tensor:
-    return (
-        roi_mask.bool()
-        & boxes[..., 2].gt(boxes[..., 0])
-        & boxes[..., 3].gt(boxes[..., 1])
-    )
+from utils.training_helpers.helper_stage2 import (
+    _decode_free_by_reading_units,
+    _detach_encoded_for_free_decode,
+    _get_action_class_weights,
+    _load_compatible_state_dict,
+    _normalize_orientation_label,
+    compute_simple_token_accuracy,
+    greedy_decode_from_logits,
+    reorder_by_sort_indices,
+)
+from utils.training_helpers.logging_stage2 import (
+    _debug_aux_alignment,
+    _finalize_aux_branch_stats,
+    _finalize_decoder_epoch_stats,
+    _init_aux_branch_stats,
+    _init_decoder_epoch_stats,
+    _update_decoder_epoch_stats,
+    _update_refinement_epoch_stats,
+    log_stage2_batch_debug,
+)
 
 def get_phase_settings(phase: str, overrides: Optional[dict] = None) -> dict:
     overrides = overrides or {}
@@ -163,7 +149,6 @@ def get_phase_settings(phase: str, overrides: Optional[dict] = None) -> dict:
             "lambda_score": float(STAGE2_PHASE_A_LAMBDA_SCORE),
             "lambda_aux": float(STAGE2_PHASE_A_LAMBDA_AUX),
             "lambda_decoder": float(STAGE2_PHASE_A_LAMBDA_DECODER),
-            "lambda_decoder_free": 0.0,
             "tf_start": float(STAGE2_PHASE_A_TF_START),
             "tf_end": float(STAGE2_PHASE_A_TF_END),
             "tf_schedule": STAGE2_TF_SCHEDULE,
@@ -173,6 +158,9 @@ def get_phase_settings(phase: str, overrides: Optional[dict] = None) -> dict:
             "raw_aux_weight": 0.0,
             "context_aux_weight": 1.0,
             "decode_constraints": None,
+            "free_prefix_every_n_steps": 1,
+            "train_free_decode_batches": 0,
+            "val_free_decode_batches": 0,
         }
         return settings
     elif phase == "B":
@@ -184,7 +172,7 @@ def get_phase_settings(phase: str, overrides: Optional[dict] = None) -> dict:
             "lambda_score": float(STAGE2_PHASE_B_LAMBDA_SCORE),
             "lambda_aux": float(STAGE2_PHASE_B_LAMBDA_AUX),
             "lambda_decoder": float(STAGE2_PHASE_B_LAMBDA_DECODER),
-            "lambda_decoder_free": float(STAGE2_PHASE_B_LAMBDA_DECODER_FREE),
+            "lambda_free_prefix": float(STAGE2_LAMBDA_FREE_PREFIX),
             "tf_start": float(STAGE2_PHASE_B_TF_START),
             "tf_end": float(STAGE2_PHASE_B_TF_END),
             "tf_schedule": STAGE2_TF_SCHEDULE,
@@ -194,27 +182,47 @@ def get_phase_settings(phase: str, overrides: Optional[dict] = None) -> dict:
             "raw_aux_weight": 0.5,
             "context_aux_weight": 0.5,
             "decode_constraints": {
-                "repetition_penalty": float( STAGE2_PHASE_B_FREE_REPETITION_PENALTY),
-                "block_immediate_repeat": bool( STAGE2_PHASE_B_FREE_BLOCK_IMMEDIATE_REPEAT),
+                "repetition_penalty": float(STAGE2_PHASE_B_FREE_REPETITION_PENALTY),
+                "block_immediate_repeat": bool(STAGE2_PHASE_B_FREE_BLOCK_IMMEDIATE_REPEAT),
                 "min_steps": int(STAGE2_PHASE_B_FREE_MIN_STEPS),
-                "require_stop_for_eos": True,
-                "stop_threshold": float( STAGE2_PHASE_B_STOP_THRESHOLD),
+                "require_stop_for_eos": False,
+                "stop_threshold": 0.0,
                 "eos_bonus_scale": 0.0,
                 "min_progress_for_eos": 0.0,
                 "min_coverage_for_eos": 0.0,
-                "aux_bias_topk": 0
+                "aux_bias_topk": 0,
             },
+            "train_decode_constraints": {
+                "repetition_penalty": float(STAGE2_PHASE_B_TRAIN_FREE_REPETITION_PENALTY),
+                "block_immediate_repeat": bool(STAGE2_PHASE_B_TRAIN_FREE_BLOCK_IMMEDIATE_REPEAT),
+                "min_steps": int(STAGE2_PHASE_B_TRAIN_FREE_MIN_STEPS),
+                "require_stop_for_eos": False,
+                "stop_threshold": 0.0,
+                "eos_bonus_scale": 0.0,
+                "min_progress_for_eos": 0.0,
+                "min_coverage_for_eos": 0.0,
+                "aux_bias_topk": 0,
+            },
+            "free_prefix_every_n_steps": int(overrides.get("free_prefix_every_n_steps", STAGE2_FREE_PREFIX_EVERY_N_STEPS)),
+            "train_free_decode_batches": int(overrides.get("train_free_decode_batches", STAGE2_TRAIN_FREE_DECODE_BATCHES)),
+            "val_free_decode_batches": int(overrides.get("val_free_decode_batches", STAGE2_VAL_FREE_DECODE_BATCHES)),
+            "free_stop_loss_scale": float(overrides.get("free_stop_loss_scale", STAGE2_LAMBDA_STOP_FREE_SCALE)),
         }
 
         dc = settings["decode_constraints"]
+        train_dc = settings["train_decode_constraints"]
         if "repetition_penalty" in overrides:
             dc["repetition_penalty"] = float(overrides["repetition_penalty"])
         if "block_immediate_repeat" in overrides:
             dc["block_immediate_repeat"] = bool(overrides["block_immediate_repeat"])
         if "min_steps" in overrides:
             dc["min_steps"] = int(overrides["min_steps"])
-        if "stop_threshold" in overrides:
-            dc["stop_threshold"] = float(overrides["stop_threshold"])
+        if "train_repetition_penalty" in overrides:
+            train_dc["repetition_penalty"] = float(overrides["train_repetition_penalty"])
+        if "train_block_immediate_repeat" in overrides:
+            train_dc["block_immediate_repeat"] = bool(overrides["train_block_immediate_repeat"])
+        if "train_min_steps" in overrides:
+            train_dc["min_steps"] = int(overrides["train_min_steps"])
 
         return settings
     else:
@@ -245,6 +253,18 @@ def _select_model_score(val_metrics: dict, phase: str) -> float:
 
     if phase == "B":
         free_summary = val_metrics["decoder_summary"].get("free_decoding", None)
+        free_samples = int(free_summary.get("samples", 0)) if free_summary is not None else 0
+        if free_summary is None or free_samples <= 0:
+            # Fallback for runs where free-decoding diagnostics are disabled.
+            # Avoid rewarding missing FREE metrics as if they were perfect.
+            return (
+                -1.10 * float(decoder_summary["mean_cer"])
+                + 0.40 * float(decoder_summary["eos_hit_fraction"])
+                - 0.20 * abs(float(decoder_summary["mean_length_ratio"]) - 1.0)
+                + 0.20 * float(active_aux["top1"])
+                + 0.10 * float(prop["unique_coverage_ratio"])
+            )
+
         free_len_ratio = float(free_summary["mean_length_ratio"]) if free_summary is not None else 1.0
         free_dom = float(free_summary.get("mean_dominant_share", 0.0))
         return (
@@ -264,7 +284,7 @@ def set_trainable_modules_for_phase(model: HybridKuroNetRecognizer, phase: str) 
 
     # default: everything off except backbone/detector policy handled elsewhere
     for name, p in model.named_parameters():
-        if name.startswith("backbone.") or name.startswith("detector."):
+        if name.startswith("backbone.") or name.startswith("detector.") or name.startswith("aux_head."):
             continue
         p.requires_grad = False
 
@@ -312,456 +332,6 @@ def set_trainable_modules_for_phase(model: HybridKuroNetRecognizer, phase: str) 
     else:
         raise ValueError(f"Unsupported phase '{phase}'")
 
-
-def reorder_by_sort_indices(values: torch.Tensor, sort_indices: torch.Tensor) -> torch.Tensor:
-    """
-    Reorder tensors by per-sample sort indices.
-
-    values: (B, T) or (B, T, C)
-    sort_indices: (B, T)
-    """
-    if values.dim() == 2:
-        return values.gather(dim=1, index=sort_indices)
-    if values.dim() == 3:
-        expanded = sort_indices.unsqueeze(-1).expand(-1, -1, values.size(-1))
-        return values.gather(dim=1, index=expanded)
-    raise ValueError(f"Unsupported tensor rank for reorder_by_sort_indices: {values.dim()}")
-
-
-def _aux_top1_accuracy(aux_logits: torch.Tensor, labels: torch.Tensor, pos_mask: torch.Tensor) -> float:
-    valid = pos_mask & labels.ne(-1)
-    if not valid.any():
-        return 0.0
-    pred = aux_logits.argmax(dim=-1)
-    return float((pred[valid] == labels[valid]).float().mean().item())
-
-
-def _debug_one_sample_alignment(
-    outputs: dict,
-    refine_targets: dict,
-    vocab: VocabManager,
-    sample_idx: int = 0,
-    limit: int = 20,
-) -> None:
-    sort_idx = outputs["sort_indices"][sample_idx].detach().cpu()
-    labels_unsorted = refine_targets["matched_gt_labels"][sample_idx].detach().cpu()
-    pos_unsorted = refine_targets["refine_pos_mask"][sample_idx].detach().cpu()
-
-    labels_sorted = labels_unsorted[sort_idx]
-    pos_sorted = pos_unsorted[sort_idx]
-
-    pred_unsorted = outputs["aux_logits"][sample_idx].argmax(dim=-1).detach().cpu()
-    pred_ordered = None
-    if outputs.get("aux_logits_ordered", None) is not None:
-        pred_ordered = outputs["aux_logits_ordered"][sample_idx].argmax(dim=-1).detach().cpu()
-
-    def decode_ids(ids: torch.Tensor, show_id: bool = False):
-        """Decode token IDs to text. If show_id=True, format as ID|char for clarity."""
-        out = []
-        for x in ids.tolist():
-            x = int(x)
-            if x < 0:
-                out.append("<IGN>" if not show_id else f"{x}|<IGN>")
-            else:
-                txt = _ids_to_text([x], vocab)
-                if show_id:
-                    out.append(f"{x}|{txt if txt else f'?'}")
-                else:
-                    out.append(txt if txt else f"<{x}>")
-        return out
-
-    tqdm.write(f"[AUX ALIGN DEBUG] sample={sample_idx}")
-    tqdm.write(f"sort_idx[:{limit}]         = {sort_idx[:limit].tolist()}")
-    tqdm.write(f"labels_unsorted[:{limit}]  = {labels_unsorted[:limit].tolist()}")
-    tqdm.write(f"labels_sorted[:{limit}]    = {labels_sorted[:limit].tolist()}")
-    tqdm.write(f"pos_unsorted[:{limit}]     = {pos_unsorted[:limit].tolist()}")
-    tqdm.write(f"pos_sorted[:{limit}]       = {pos_sorted[:limit].tolist()}")
-    tqdm.write(f"pred_aux_uns[:{limit}]     = {pred_unsorted[:limit].tolist()}")
-    if pred_ordered is not None:
-        tqdm.write(f"pred_aux_ord[:{limit}]     = {pred_ordered[:limit].tolist()}")
-    tqdm.write(f"labels_unsorted (id|char)  = {decode_ids(labels_unsorted[:limit], show_id=True)}")
-    tqdm.write(f"labels_sorted (id|char)    = {decode_ids(labels_sorted[:limit], show_id=True)}")
-    tqdm.write(f"pred_aux_uns (id|char)     = {decode_ids(pred_unsorted[:limit], show_id=True)}")
-    if pred_ordered is not None:
-        tqdm.write(f"pred_aux_ord txt      = {decode_ids(pred_ordered[:limit])}")
-
-
-def _debug_aux_alignment(
-    outputs: dict,
-    refine_targets: dict,
-    vocab: VocabManager,
-    limit: int,
-) -> None:
-    aux_unsorted = outputs.get("aux_logits", None)
-    sort_indices = outputs.get("sort_indices", None)
-    if aux_unsorted is None or sort_indices is None:
-        tqdm.write("[AUX ALIGN DEBUG] skipped: missing aux_logits or sort_indices")
-        return
-
-    labels_unsorted = refine_targets["matched_gt_labels"]
-    pos_unsorted = refine_targets["refine_pos_mask"]
-
-    labels_sorted = reorder_by_sort_indices(labels_unsorted, sort_indices)
-    pos_sorted = reorder_by_sort_indices(pos_unsorted.long(), sort_indices).bool()
-
-    loss_unsorted = aux_classification_loss(aux_unsorted, labels_unsorted, pos_unsorted)
-    acc_unsorted = _aux_top1_accuracy(aux_unsorted, labels_unsorted, pos_unsorted)
-    valid_uns = int((pos_unsorted & labels_unsorted.ne(-1)).sum().item())
-    valid_sorted = int((pos_sorted & labels_sorted.ne(-1)).sum().item())
-    aux_ordered = outputs.get("aux_logits_ordered", None)
-    if aux_ordered is not None:
-        loss_sorted = aux_classification_loss(aux_ordered, labels_sorted, pos_sorted)
-        acc_sorted = _aux_top1_accuracy(aux_ordered, labels_sorted, pos_sorted)
-        loss_mismatch = aux_classification_loss(aux_ordered, labels_unsorted, pos_unsorted)
-        acc_mismatch = _aux_top1_accuracy(aux_ordered, labels_unsorted, pos_unsorted)
-
-        tqdm.write(
-            "[AUX ALIGN DEBUG] "
-            f"loss uns={float(loss_unsorted.item()):.4f} | "
-            f"loss sorted={float(loss_sorted.item()):.4f} | "
-            f"loss mismatch={float(loss_mismatch.item()):.4f}"
-            f"valid uns={valid_uns} | valid sorted={valid_sorted}"
-        )
-        tqdm.write(
-            "[AUX ALIGN DEBUG] "
-            f"acc uns={acc_unsorted:.4f} | "
-            f"acc sorted={acc_sorted:.4f} | "
-            f"acc mismatch={acc_mismatch:.4f}"
-        )
-    else:
-        loss_sorted_reindexed = aux_classification_loss(aux_unsorted, labels_sorted, pos_sorted)
-        acc_sorted_reindexed = _aux_top1_accuracy(aux_unsorted, labels_sorted, pos_sorted)
-        tqdm.write(
-            "[AUX ALIGN DEBUG] "
-            f"loss uns={float(loss_unsorted.item()):.4f} | "
-            f"loss sorted-reindexed={float(loss_sorted_reindexed.item()):.4f}"
-            f"valid uns={valid_uns} | valid sorted={valid_sorted}"
-        )
-        tqdm.write(
-            "[AUX ALIGN DEBUG] "
-            f"acc uns={acc_unsorted:.4f} | "
-            f"acc sorted-reindexed={acc_sorted_reindexed:.4f}"
-        )
-
-    _debug_one_sample_alignment(outputs, refine_targets, vocab=vocab, sample_idx=0, limit=limit)
-    
-def _strip_special_tokens(ids: list[int], pad_id: int, sos_id: int, eos_id: int) -> list[int]:
-    out: list[int] = []
-    for token_id in ids:
-        token_id = int(token_id)
-        if token_id in (pad_id, sos_id):
-            continue
-        if token_id == eos_id:
-            break
-        out.append(token_id)
-    return out
-
-
-def _ids_to_text(ids: list[int], vocab: VocabManager) -> str:
-    return _decode_text_from_ids(ids, vocab)
-
-
-def _edit_distance(a: str, b: str) -> int:
-    if a == b:
-        return 0
-    if not a:
-        return len(b)
-    if not b:
-        return len(a)
-
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, start=1):
-        curr = [i]
-        for j, cb in enumerate(b, start=1):
-            cost = 0 if ca == cb else 1
-            curr.append(min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost))
-        prev = curr
-    return prev[-1]
-
-
-def _sequence_cer(pred_text: str, gt_text: str) -> float:
-    return _edit_distance(pred_text, gt_text) / max(1, len(gt_text))
-
-def _dominant_token_share(token_ids: list[int]) -> float:
-    if len(token_ids) == 0:
-        return 0.0
-    c = Counter(token_ids)
-    return max(c.values()) / len(token_ids)
-
-
-def _max_repeat_run(token_ids: list[int]) -> int:
-    if len(token_ids) == 0:
-        return 0
-    best = 1
-    curr = 1
-    for i in range(1, len(token_ids)):
-        if token_ids[i] == token_ids[i - 1]:
-            curr += 1
-            if curr > best:
-                best = curr
-        else:
-            curr = 1
-    return best
-
-
-def _unique_token_ratio(token_ids: list[int]) -> float:
-    if len(token_ids) == 0:
-        return 0.0
-    return len(set(token_ids)) / len(token_ids)
-
-def _summarize_top_counter(counter: Counter, vocab: VocabManager, limit: int = 8) -> list[dict]:
-    total = max(1, sum(counter.values()))
-    summary = []
-    for token_id, count in counter.most_common(limit):
-        token_text = _ids_to_text([int(token_id)], vocab)
-        summary.append({
-            "token_id": int(token_id),
-            "token": token_text if token_text else f"<{int(token_id)}>",
-            "count": int(count),
-            "share": float(count / total),
-        })
-    return summary
-
-
-def _summarize_error_pairs(counter: Counter, vocab: VocabManager, limit: int = 8) -> list[dict]:
-    summary = []
-    for (gt_id, pred_id), count in counter.most_common(limit):
-        gt_text = _ids_to_text([int(gt_id)], vocab)
-        pred_text = _ids_to_text([int(pred_id)], vocab)
-        summary.append({
-            "gt_id": int(gt_id),
-            "pred_id": int(pred_id),
-            "gt": gt_text if gt_text else f"<{int(gt_id)}>",
-            "pred": pred_text if pred_text else f"<{int(pred_id)}>",
-            "count": int(count),
-        })
-    return summary
-
-
-def _init_aux_branch_stats() -> dict:
-    return {
-        "total": 0,
-        "correct_top1": 0,
-        "correct_top5": 0,
-        "pred_counter": Counter(),
-        "error_pair_counter": Counter(),
-    }
-
-
-def _update_aux_branch_stats(
-    branch_stats: dict,
-    aux_logits: torch.Tensor,
-    matched_labels: torch.Tensor,
-    aux_valid: torch.Tensor,
-) -> None:
-    if not aux_valid.any():
-        return
-
-    valid_logits = aux_logits[aux_valid]
-    valid_labels = matched_labels[aux_valid]
-    if valid_logits.numel() == 0:
-        return
-
-    pred_labels = valid_logits.argmax(dim=-1)
-    branch_stats["total"] += int(valid_labels.numel())
-    branch_stats["correct_top1"] += int((pred_labels == valid_labels).sum().item())
-
-    topk = min(5, int(valid_logits.size(-1)))
-    topk_ids = valid_logits.topk(k=topk, dim=-1).indices
-    top5_hits = topk_ids.eq(valid_labels.unsqueeze(1)).any(dim=1)
-    branch_stats["correct_top5"] += int(top5_hits.sum().item())
-
-    gt_list = valid_labels.detach().cpu().tolist()
-    pred_list = pred_labels.detach().cpu().tolist()
-    for gt_id, pred_id in zip(gt_list, pred_list):
-        gt_id = int(gt_id)
-        pred_id = int(pred_id)
-        branch_stats["pred_counter"][pred_id] += 1
-        if gt_id != pred_id:
-            branch_stats["error_pair_counter"][(gt_id, pred_id)] += 1
-
-
-def _finalize_aux_branch_stats(branch_stats: dict, vocab: VocabManager, available: bool) -> dict:
-    total = int(branch_stats["total"])
-    denom = max(1, total)
-    return {
-        "available": bool(available),
-        "total": total,
-        "top1": float(branch_stats["correct_top1"] / denom),
-        "top5": float(branch_stats["correct_top5"] / denom),
-        "top_predictions": _summarize_top_counter(branch_stats["pred_counter"], vocab),
-        "top_errors": _summarize_error_pairs(branch_stats["error_pair_counter"], vocab),
-    }
-
-
-def _update_refinement_epoch_stats(stats: dict, outputs: dict, refine_targets: dict, gt_labels_list):
-    proposal_mask = _valid_proposal_mask(outputs["roi_boxes"], outputs["roi_mask"])
-    pos_mask = refine_targets["refine_pos_mask"] & proposal_mask
-    neg_mask = refine_targets["refine_neg_mask"] & proposal_mask
-    ign_mask = refine_targets["refine_ignore_mask"] & proposal_mask
-
-    valid_props_per_image = proposal_mask.sum(dim=1)
-    stats["images_with_zero_valid_props"] += int(valid_props_per_image.eq(0).sum().item())
-
-    stats["images"] += int(outputs["roi_boxes"].size(0))
-    stats["proposals"] += int(proposal_mask.sum().item())
-    stats["positives"] += int(pos_mask.sum().item())
-    stats["negatives"] += int(neg_mask.sum().item())
-    stats["ignores"] += int(ign_mask.sum().item())
-    stats["gt_tokens"] += int(sum(int(x.numel()) for x in gt_labels_list))
-
-    matched_iou = refine_targets["matched_iou"]
-    stats["matched_iou_sum"] += float(matched_iou[pos_mask].sum().item())
-    stats["matched_iou_count"] += int(pos_mask.sum().item())
-
-    matched_gt_index = refine_targets["matched_gt_index"]
-    for b in range(int(outputs["roi_boxes"].size(0))):
-        pos_idx_b = pos_mask[b]
-        if not pos_idx_b.any():
-            continue
-        matched_gt_b = matched_gt_index[b][pos_idx_b]
-        matched_gt_b = matched_gt_b[matched_gt_b.ge(0)]
-        if matched_gt_b.numel() == 0:
-            continue
-        unique_gt_b = int(torch.unique(matched_gt_b).numel())
-        pos_count_b = int(pos_idx_b.sum().item())
-        stats["unique_gt_matched"] += unique_gt_b
-        stats["duplicate_positive_matches"] += max(0, pos_count_b - unique_gt_b)
-
-    refine_scores = outputs["refine_scores"]
-    if refine_scores is not None:
-        valid_scores = refine_scores[proposal_mask]
-        if valid_scores.numel() > 0:
-            score_prob = torch.sigmoid(valid_scores)
-            stats["score_logit_sum"] += float(valid_scores.sum().item())
-            stats["score_logit_sq_sum"] += float((valid_scores * valid_scores).sum().item())
-            stats["score_prob_sum"] += float(score_prob.sum().item())
-            stats["score_prob_sq_sum"] += float((score_prob * score_prob).sum().item())
-            stats["score_count"] += int(valid_scores.numel())
-
-    matched_labels = refine_targets["matched_gt_labels"]
-    aux_valid = pos_mask & matched_labels.ne(-1)
-
-    if outputs["aux_logits"] is not None:
-        _update_aux_branch_stats(
-            branch_stats=stats["aux_without_context_encode"],
-            aux_logits=outputs["aux_logits"],
-            matched_labels=matched_labels,
-            aux_valid=aux_valid,
-        )
-
-    aux_with_context = outputs.get("aux_logits_with_context", None)
-    if aux_with_context is not None:
-        sort_indices = outputs.get("sort_indices", None)
-        if sort_indices is not None:
-            matched_labels_ctx = reorder_by_sort_indices(matched_labels, sort_indices)
-            pos_mask_ctx = reorder_by_sort_indices(pos_mask.long(), sort_indices).bool()
-        else:
-            matched_labels_ctx = matched_labels
-            pos_mask_ctx = pos_mask
-
-        aux_valid_ctx = pos_mask_ctx & matched_labels_ctx.ne(-1)
-        _update_aux_branch_stats(
-            branch_stats=stats["aux_with_context_encode"],
-            aux_logits=aux_with_context,
-            matched_labels=matched_labels_ctx,
-            aux_valid=aux_valid_ctx,
-        )
-
-
-def _update_decoder_epoch_stats(
-    stats: dict,
-    pred_ids_batch: torch.Tensor,
-    text_ids_batch: torch.Tensor,
-    vocab: VocabManager,
-):
-    stats.setdefault("dominant_share_sum", 0.0)
-    stats.setdefault("max_repeat_run_sum", 0.0)
-    stats.setdefault("unique_ratio_sum", 0.0)
-    stats.setdefault("length_ratio_sum", 0.0)
-
-    for pred_ids, gt_ids in zip(pred_ids_batch.detach().cpu().tolist(), text_ids_batch.detach().cpu().tolist()):
-        pred_tokens = _strip_special_tokens(pred_ids, vocab.pad_id, vocab.sos_id, vocab.eos_id)
-        gt_tokens = _strip_special_tokens(gt_ids, vocab.pad_id, vocab.sos_id, vocab.eos_id)
-
-        pred_text = _ids_to_text(pred_tokens, vocab)
-        gt_text = _ids_to_text(gt_tokens, vocab)
-        dominant_share = _dominant_token_share(pred_tokens)
-        max_run = _max_repeat_run(pred_tokens)
-        unique_ratio = _unique_token_ratio(pred_tokens)
-        length_ratio = len(pred_tokens) / max(1, len(gt_tokens))
-
-        stats["samples"] += 1
-        stats["dominant_share_sum"] += dominant_share
-        stats["max_repeat_run_sum"] += max_run
-        stats["unique_ratio_sum"] += unique_ratio
-        stats["length_ratio_sum"] += length_ratio
-        stats["pred_len_sum"] += len(pred_tokens)
-        stats["gt_len_sum"] += len(gt_tokens)
-        stats["cer_sum"] += _sequence_cer(pred_text, gt_text)
-        stats["exact"] += int(pred_text == gt_text)
-
-        if vocab.eos_id in pred_ids:
-            stats["eos_hit"] += 1
-
-        for token_id in pred_tokens:
-            stats["pred_token_counter"][int(token_id)] += 1
-
-        compare_len = min(len(pred_tokens), len(gt_tokens))
-        for idx in range(compare_len):
-            if pred_tokens[idx] != gt_tokens[idx]:
-                stats["error_pair_counter"][(int(gt_tokens[idx]), int(pred_tokens[idx]))] += 1
-
-        if len(stats["examples"]) < stats["example_limit"]:
-            stats["examples"].append({
-                "gt": gt_text,
-                "pred": pred_text,
-                "cer": _sequence_cer(pred_text, gt_text),
-                "pred_len": len(pred_tokens),
-                "gt_len": len(gt_tokens),
-                "eos_hit": bool(vocab.eos_id in pred_ids),
-            })
-
-
-def _finalize_decoder_epoch_stats(stats: dict, vocab: VocabManager) -> dict:
-    decoder_samples = max(1, stats["samples"])
-    return {
-        "samples": stats["samples"],
-        "eos_hit_fraction": stats["eos_hit"] / decoder_samples,
-        "mean_pred_len": stats["pred_len_sum"] / decoder_samples,
-        "mean_gt_len": stats["gt_len_sum"] / decoder_samples,
-        "mean_cer": stats["cer_sum"] / decoder_samples,
-        "exact_match_fraction": stats["exact"] / decoder_samples,
-        "mean_dominant_share": stats["dominant_share_sum"] / decoder_samples,
-        "mean_max_repeat_run": stats["max_repeat_run_sum"] / decoder_samples,
-        "mean_unique_ratio": stats["unique_ratio_sum"] / decoder_samples,
-        "mean_length_ratio": stats["length_ratio_sum"] / decoder_samples,
-        "top_tokens": _summarize_top_counter(stats["pred_token_counter"], vocab),
-        "top_errors": _summarize_error_pairs(stats["error_pair_counter"], vocab),
-        "examples": stats["examples"],
-    }
-
-
-def log_stage2_batch_debug(
-    phase: str,
-    epoch: Optional[int],
-    batch_idx: int,
-    roi_mask: torch.Tensor,
-    refine_targets: dict,
-):
-    proposals_per_image = _count_valid_rois_per_image(roi_mask)
-    positives_per_image = _count_mask_per_image(refine_targets["refine_pos_mask"])
-    negatives_per_image = _count_mask_per_image(refine_targets["refine_neg_mask"])
-    ignored_per_image = _count_mask_per_image(refine_targets["refine_ignore_mask"])
-
-    epoch_text = f" epoch={epoch + 1}" if epoch is not None else ""
-    tqdm.write(
-        f"[{phase}] batch={batch_idx:04d}{epoch_text} | "
-        f"proposals/img={proposals_per_image} | "
-        f"pos/img={positives_per_image} | "
-        f"neg/img={negatives_per_image} | "
-        f"ign/img={ignored_per_image}"
-    )
 
 def _compute_phase_aux_loss(
     outputs: dict,
@@ -820,12 +390,6 @@ def _compute_phase_aux_loss(
         "loss_aux_raw": loss_aux_raw,
         "loss_aux_ctx": loss_aux_ctx,
     }
-
-
-def _decoder_is_active(phase_settings: dict) -> bool:
-    return float(phase_settings["lambda_decoder"]) > 0.0
-
-
 
 def load_vocab() -> VocabManager:
     ann_files = sorted(list((Path(DATA_DIR) / "annotations").glob("*.json")))
@@ -972,45 +536,11 @@ def move_gt_lists_to_device(gt_list, dtype=None):
             continue
 
         if x.numel() == 0:
-            out.append(x.to(device=DEVICE))
+            out.append(x.to(device=DEVICE, non_blocking=True))
         else:
-            out.append(x.to(device=DEVICE, dtype=dtype) if dtype is not None else x.to(device=DEVICE))
+            out.append(x.to(device=DEVICE, dtype=dtype, non_blocking=True) if dtype is not None else x.to(device=DEVICE, non_blocking=True))
     return out
 
-
-def _strip_after_eos(ids: torch.Tensor, eos_id: int) -> torch.Tensor:
-    """
-    Cut sequence after first EOS (inclusive).
-    """
-    ids = ids.detach().cpu()
-    eos_pos = (ids == eos_id).nonzero(as_tuple=False)
-    if eos_pos.numel() == 0:
-        return ids
-    first = int(eos_pos[0].item())
-    return ids[:first + 1]
-
-
-def greedy_decode_from_logits(logits: torch.Tensor) -> torch.Tensor:
-    """
-    logits: (B, T, V)
-    returns: (B, T)
-    """
-    return logits.argmax(dim=-1)
-
-
-def compute_simple_token_accuracy(
-    pred_ids: torch.Tensor,
-    tgt_ids: torch.Tensor,
-    tgt_mask: torch.Tensor,
-) -> float:
-    """
-    Position-wise token accuracy on masked positions.
-    """
-    valid = tgt_mask.bool()
-    if valid.sum() == 0:
-        return 0.0
-    correct = (pred_ids[valid] == tgt_ids[valid]).float().mean()
-    return float(correct.item())
 
 
 @torch.no_grad()
@@ -1021,6 +551,8 @@ def validate_stage2(
     phase: str = "A",
     max_batches: Optional[int] = None,
     runtime_overrides: Optional[dict] = None,
+    current_epoch: Optional[int] = None,
+    total_epochs: Optional[int] = None,
 ):
     model.eval()
     if FREEZE_BACKBONE:
@@ -1032,6 +564,7 @@ def validate_stage2(
     lambda_stop = float(runtime_overrides.get("lambda_stop", STAGE2_LAMBDA_STOP))
     decoder_eos_weight = float(runtime_overrides.get("decoder_eos_weight", STAGE2_DECODER_EOS_WEIGHT))
     val_max_decode_len = int(runtime_overrides.get("val_max_decode_len", STAGE2_VAL_MAX_DECODE_LEN))
+    val_free_decode_batches = int(phase_settings.get("val_free_decode_batches", STAGE2_VAL_FREE_DECODE_BATCHES))
     total_loss = 0.0
     total_box = 0.0
     total_delta = 0.0
@@ -1039,6 +572,8 @@ def validate_stage2(
     total_aux = 0.0
     total_decoder = 0.0
     total_acc = 0.0
+    total_action = 0.0
+    val_action_alignment_mix = 0.0
     n_batches = 0
     total_stop = 0.0
 
@@ -1059,56 +594,36 @@ def validate_stage2(
         "score_prob_sum": 0.0,
         "score_prob_sq_sum": 0.0,
         "score_count": 0,
+        "ordering_primary_mono_sum": 0.0,
+        "ordering_primary_viol_sum": 0.0,
+        "ordering_weight_sum": 0.0,
         "aux_without_context_encode": _init_aux_branch_stats(),
         "aux_with_context_encode": _init_aux_branch_stats(),
     }
 
-    decoder_stats_tf = {
-        "samples": 0,
-        "pred_len_sum": 0,
-        "gt_len_sum": 0,
-        "cer_sum": 0.0,
-        "exact": 0,
-        "eos_hit": 0,
-        "dominant_share_sum": 0.0,
-        "max_repeat_run_sum": 0.0,
-        "unique_ratio_sum": 0.0,
-        "length_ratio_sum": 0.0,
-        "pred_token_counter": Counter(),
-        "error_pair_counter": Counter(),
-        "examples": [],
-        "example_limit": 3,
-    }
-    decoder_stats_free = {
-        "samples": 0,
-        "pred_len_sum": 0,
-        "gt_len_sum": 0,
-        "cer_sum": 0.0,
-        "exact": 0,
-        "eos_hit": 0,
-        "dominant_share_sum": 0.0,
-        "max_repeat_run_sum": 0.0,
-        "unique_ratio_sum": 0.0,
-        "length_ratio_sum": 0.0,
-        "pred_token_counter": Counter(),
-        "error_pair_counter": Counter(),
-        "examples": [],
-        "example_limit": 3,
-    }
+    decoder_stats_tf = _init_decoder_epoch_stats(example_limit=3, pointer_example_limit=3)
+    decoder_stats_free = _init_decoder_epoch_stats(example_limit=3, pointer_example_limit=3)
     val_orientation_counts: Counter[str] = Counter()
 
     pad_id = vocab.pad_id
     sos_id = vocab.sos_id
     eos_id = vocab.eos_id
 
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc="Stage2 Validation", leave=False)):
+    for batch_idx, batch in enumerate(
+        tqdm(
+            val_loader,
+            desc="Stage2 Validation",
+            leave=False,
+            disable=not bool(STAGE2_ENABLE_TQDM),
+        )
+    ):
         if max_batches is not None and batch_idx >= int(max_batches):
             break
-        images = batch["image"].to(DEVICE)
+        images = batch["image"].to(DEVICE, non_blocking=True)
         text_ids = batch["text_ids"]
         if text_ids is None:
             continue
-        text_ids = text_ids.to(DEVICE)
+        text_ids = text_ids.to(DEVICE, non_blocking=True)
         orientations = batch["orientations"]
         val_orientation_counts.update(_normalize_orientation_label(x) for x in orientations)
 
@@ -1120,15 +635,26 @@ def validate_stage2(
             pad_id=pad_id,
         )
 
-        outputs = model(
+        encoded = model.encode_images(
             images=images,
             orientations=orientations,
+        )
+        oracle_pointer_positions = build_decoder_roi_targets_monotonic(
+            target_tokens=dec_targets["target_tokens"],
+            target_mask=dec_targets["target_mask"],
+            enc_mask=encoded.get("context_mask", None),
+            eos_id=int(eos_id),
+        )
+
+        outputs = model.decode_from_encoded(
+            encoded,
             input_seq=dec_targets["decoder_inputs"],
             targets=dec_targets["target_tokens"],
             teacher_forcing_ratio=1.0,   # oder 1.0 für echte teacher-forced diagnostics
             sos_id=sos_id,
             eos_id=eos_id,
             max_len=None,
+            oracle_pointer_positions=oracle_pointer_positions,
         )
 
         refine_targets = build_refinement_targets(
@@ -1156,6 +682,10 @@ def validate_stage2(
                 aux_logits=None,
                 decoder_logits=outputs["decoder_logits"],
                 stop_logits=outputs.get("stop_logits", None),
+                action_logits=outputs.get("action_logits", None),
+                attn_weights=outputs.get("attn_weights", None),
+                enc_mask=outputs.get("context_mask", None),
+                encoder_token_bias=outputs.get("decoder_token_bias", None),
 
                 matched_gt_boxes=refine_targets["matched_gt_boxes"],
                 target_deltas=refine_targets["target_deltas"],
@@ -1173,6 +703,20 @@ def validate_stage2(
                 lambda_aux=0.0,
                 lambda_decoder=phase_settings["lambda_decoder"],
                 lambda_stop=lambda_stop,
+                lambda_action= STAGE2_LAMBDA_ACTION ,
+                action_aux_weight=STAGE2_ACTION_AUX_WEIGHT,
+                action_class_weights=_get_action_class_weights(
+                    device=outputs["decoder_logits"].device,
+                    dtype=outputs["decoder_logits"].dtype,
+                ),
+                current_epoch=(0 if current_epoch is None else int(current_epoch)),
+                total_epochs=(
+                    int(phase_settings.get("epochs", 1))
+                    if total_epochs is None
+                    else int(total_epochs)
+                ),
+                action_alignment_start_epoch=STAGE2_ACTION_ALIGNMENT_START_EPOCH,
+                action_alignment_full_epoch=STAGE2_ACTION_ALIGNMENT_FULL_EPOCH,
                 decoder_stop_pos_weight=STAGE2_DECODER_STOP_POS_WEIGHT,
                 refine_pos_weight=STAGE2_REFINE_POS_WEIGHT,
                 decoder_label_smoothing=STAGE2_DECODER_LABEL_SMOOTHING,
@@ -1191,6 +735,7 @@ def validate_stage2(
         losses["loss_aux_raw"] = aux_parts["loss_aux_raw"]
         losses["loss_aux_ctx"] = aux_parts["loss_aux_ctx"]
         losses["loss_total"] = base_losses["loss_total"] + losses["loss_aux"]
+        val_action_alignment_mix = float(losses.get("action_alignment_mix", 0.0))
 
         if STAGE2_DEBUG_AUX_ALIGNMENT and batch_idx == 0:
             _debug_aux_alignment(
@@ -1220,26 +765,43 @@ def validate_stage2(
         total_aux += float(losses["loss_aux"].item())
         total_decoder += float(losses["loss_decoder"].item())
         total_stop += float(losses.get("loss_stop", torch.tensor(0.0)).item())
+        total_action += float(losses.get("loss_action", torch.tensor(0.0)).item())
         total_acc += batch_acc
         n_batches += 1
 
         _update_refinement_epoch_stats(proposal_stats, outputs, refine_targets, gt_labels_list)
         if pred_ids is not None:
-            _update_decoder_epoch_stats(decoder_stats_tf, pred_ids, dec_targets["target_tokens"], vocab)
-        if phase_settings["log_free_decoder"]:
-            free_outputs = model(
-                images=images,
-                orientations=orientations,
-                targets=None,
-                teacher_forcing_ratio=0.0,
-                input_seq=None,
+            _update_decoder_epoch_stats(
+                decoder_stats_tf,
+                pred_ids,
+                dec_targets["target_tokens"],
+                vocab,
+                action_logits_batch=outputs.get("action_logits", None),
+                pointer_positions_batch=outputs.get("pointer_positions", None),
+                valid_mask_batch=dec_targets["target_mask"],
+                action_targets_batch=losses.get("action_targets", None),
+            )
+        if phase_settings["log_free_decoder"] and batch_idx < val_free_decode_batches:
+            free_decoded = _decode_free_by_reading_units(
+                model,
+                encoded,
+                orientations,
+                vocab,
                 sos_id=sos_id,
                 eos_id=eos_id,
                 max_len=val_max_decode_len,
                 decode_constraints=phase_settings.get("decode_constraints"),
             )
-            free_pred_ids = greedy_decode_from_logits(free_outputs["decoder_logits"])
-            _update_decoder_epoch_stats(decoder_stats_free, free_pred_ids, text_ids, vocab)
+            _update_decoder_epoch_stats(
+                decoder_stats_free,
+                free_decoded["pred_ids"],
+                text_ids,
+                vocab,
+                action_logits_batch=free_decoded.get("action_logits", None),
+                pointer_positions_batch=free_decoded.get("pointer_positions", None),
+                valid_mask_batch=free_decoded.get("valid_mask", None),
+                action_targets_batch=None,
+            )
         
     denom = max(1, n_batches)
     proposal_denom_images = max(1, proposal_stats["images"])
@@ -1270,6 +832,8 @@ def validate_stage2(
         "val_decoder": total_decoder / denom,
         "val_token_acc": total_acc / denom,
         "val_stop": total_stop / denom,
+        "val_action": total_action / denom,
+        "val_action_alignment_mix": val_action_alignment_mix if n_batches > 0 else 0.0,
         "proposal_summary": {
             "images": proposal_stats["images"],
             "orientation_counts": {
@@ -1290,6 +854,8 @@ def validate_stage2(
             "avg_negatives_per_image": proposal_neg / proposal_denom_images,
             "avg_ignores_per_image": proposal_ign / proposal_denom_images,
             "avg_matched_iou_on_positives": proposal_stats["matched_iou_sum"] / max(1, proposal_stats["matched_iou_count"]),
+            "ordering_primary_monotonic_fraction": proposal_stats["ordering_primary_mono_sum"] / max(1.0, proposal_stats["ordering_weight_sum"]),
+            "ordering_primary_violation_fraction": proposal_stats["ordering_primary_viol_sum"] / max(1.0, proposal_stats["ordering_weight_sum"]),
             "refine_score_logit_mean": proposal_stats["score_logit_sum"] / max(1, proposal_stats["score_count"]),
             "refine_score_logit_std": (
                 max(
@@ -1342,7 +908,6 @@ def train_stage2_hybrid(
     model_overrides = model_overrides or {}
     phase_settings = get_phase_settings(phase, overrides=model_overrides)
     lambda_stop = float(model_overrides.get("lambda_stop", STAGE2_LAMBDA_STOP))
-    lambda_decoder_free = float(phase_settings.get("lambda_decoder_free", 0.0))
     decoder_eos_weight = float(model_overrides.get("decoder_eos_weight", STAGE2_DECODER_EOS_WEIGHT))
     prune_existing_checkpoints(checkpoint_dir)
 
@@ -1425,8 +990,17 @@ def train_stage2_hybrid(
         total_decoder = 0.0
         total_decoder_free = 0.0
         total_acc = 0.0
+        total_action = 0.0
+        total_action_free = 0.0
+        train_action_alignment_mix = 0.0
         n_batches = 0
         total_stop = 0.0
+        total_stop_free = 0.0
+        total_free_prefix_tokens = 0.0
+        total_free_control_tokens = 0.0
+        total_free_target_tokens = 0.0
+        total_free_prefix_sequences = 0.0
+        total_free_recovery_tokens = 0.0
 
         train_proposal_stats = {
             "images": 0,
@@ -1445,19 +1019,33 @@ def train_stage2_hybrid(
             "score_prob_sum": 0.0,
             "score_prob_sq_sum": 0.0,
             "score_count": 0,
+            "ordering_primary_mono_sum": 0.0,
+            "ordering_primary_viol_sum": 0.0,
+            "ordering_weight_sum": 0.0,
             "aux_without_context_encode": _init_aux_branch_stats(),
             "aux_with_context_encode": _init_aux_branch_stats(),
         }
         train_orientation_counts: Counter[str] = Counter()
+        decoder_stats_tf = _init_decoder_epoch_stats(example_limit=3, pointer_example_limit=3)
+        decoder_stats_free = _init_decoder_epoch_stats(example_limit=3, pointer_example_limit=3)
+        train_free_eval_batches = int(phase_settings.get("train_free_decode_batches", STAGE2_TRAIN_FREE_DECODE_BATCHES))
+        free_prefix_every_n_steps = max(1, int(phase_settings.get("free_prefix_every_n_steps", STAGE2_FREE_PREFIX_EVERY_N_STEPS)))
+        train_decoder_stats_every_n_steps = max(1, int(model_overrides.get("train_decoder_stats_every_n_steps", STAGE2_TRAIN_DECODER_STATS_EVERY_N_STEPS)))
+        train_free_diag_max_len = max(16, int(model_overrides.get("train_free_diag_max_len", STAGE2_TRAIN_FREE_DIAG_MAX_LEN)))
 
-        pbar = tqdm(train_loader, desc=f"Stage2 Epoch {epoch+1}/{num_epochs}", mininterval=10.0)
+        pbar = tqdm(
+            train_loader,
+            desc=f"Stage2 Epoch {epoch+1}/{num_epochs}",
+            mininterval=10.0,
+            disable=not bool(STAGE2_ENABLE_TQDM),
+        )
 
         for step, batch in enumerate(pbar):
-            images = batch["image"].to(DEVICE)
+            images = batch["image"].to(DEVICE, non_blocking=True)
             text_ids = batch["text_ids"]
             if text_ids is None:
                 continue
-            text_ids = text_ids.to(DEVICE)
+            text_ids = text_ids.to(DEVICE, non_blocking=True)
 
             orientations = batch["orientations"]
             train_orientation_counts.update(_normalize_orientation_label(x) for x in orientations)
@@ -1470,15 +1058,26 @@ def train_stage2_hybrid(
             )
 
             with torch.cuda.amp.autocast(enabled=USE_MIXED_PRECISION and str(DEVICE).startswith("cuda")):
-                outputs = model(
+                encoded = model.encode_images(
                     images=images,
                     orientations=orientations,
+                )
+                oracle_pointer_positions = build_decoder_roi_targets_monotonic(
+                    target_tokens=dec_targets["target_tokens"],
+                    target_mask=dec_targets["target_mask"],
+                    enc_mask=encoded.get("context_mask", None),
+                    eos_id=int(eos_id),
+                )
+
+                outputs = model.decode_from_encoded(
+                    encoded,
                     input_seq=dec_targets["decoder_inputs"],
                     targets=dec_targets["target_tokens"],
                     teacher_forcing_ratio=tf_ratio,
                     sos_id=sos_id,
                     eos_id=eos_id,
                     max_len=None,
+                    oracle_pointer_positions=oracle_pointer_positions,
                 )
                 refine_targets = build_refinement_targets(
                     coarse_boxes=outputs["roi_boxes"],
@@ -1505,6 +1104,10 @@ def train_stage2_hybrid(
                     aux_logits=None,
                     decoder_logits=outputs["decoder_logits"],
                     stop_logits=outputs.get("stop_logits", None),
+                    action_logits=outputs.get("action_logits", None),
+                    attn_weights=outputs.get("attn_weights", None),
+                    enc_mask=outputs.get("context_mask", None),
+                    encoder_token_bias=outputs.get("decoder_token_bias", None),
 
                     matched_gt_boxes=refine_targets["matched_gt_boxes"],
                     target_deltas=refine_targets["target_deltas"],
@@ -1522,6 +1125,16 @@ def train_stage2_hybrid(
                     lambda_aux=0.0,
                     lambda_decoder=phase_settings["lambda_decoder"],
                     lambda_stop=lambda_stop,
+                    lambda_action= STAGE2_LAMBDA_ACTION ,
+                    action_aux_weight=STAGE2_ACTION_AUX_WEIGHT,
+                    action_class_weights=_get_action_class_weights(
+                        device=outputs["decoder_logits"].device,
+                        dtype=outputs["decoder_logits"].dtype,
+                    ),
+                    current_epoch=epoch,
+                    total_epochs=num_epochs,
+                    action_alignment_start_epoch=STAGE2_ACTION_ALIGNMENT_START_EPOCH,
+                    action_alignment_full_epoch=STAGE2_ACTION_ALIGNMENT_FULL_EPOCH,
                     refine_pos_weight=STAGE2_REFINE_POS_WEIGHT,
                     decoder_label_smoothing=STAGE2_DECODER_LABEL_SMOOTHING,
                     decoder_eos_id=eos_id,
@@ -1534,36 +1147,80 @@ def train_stage2_hybrid(
                     refine_targets=refine_targets,
                     phase_settings=phase_settings,
                 )
+                free_loss_dict = {
+                    "loss_decoder_free": base_losses["loss_total"].new_tensor(0.0),
+                    "loss_stop_free": base_losses["loss_total"].new_tensor(0.0),
+                    "loss_action_free": base_losses["loss_total"].new_tensor(0.0),
+                    "loss_total_free": base_losses["loss_total"].new_tensor(0.0),
+                    "prefix_decoder_tokens": base_losses["loss_total"].new_tensor(0, dtype=torch.long),
+                    "prefix_control_tokens": base_losses["loss_total"].new_tensor(0, dtype=torch.long),
+                    "prefix_target_tokens": base_losses["loss_total"].new_tensor(0, dtype=torch.long),
+                    "prefix_sequence_count": base_losses["loss_total"].new_tensor(0, dtype=torch.long),
+                    "recovery_decoder_tokens": base_losses["loss_total"].new_tensor(0, dtype=torch.long),
+                }
+                free_outputs = None
 
-                losses = dict(base_losses)
-                losses["loss_aux"] = phase_settings["lambda_aux"] * aux_total
-                losses["loss_aux_raw"] = aux_parts["loss_aux_raw"]
-                losses["loss_aux_ctx"] = aux_parts["loss_aux_ctx"]
-                losses["loss_decoder_free"] = base_losses["loss_total"].new_tensor(0.0)
-
-                if lambda_decoder_free > 0.0:
-                    free_outputs = model(
-                        images=images,
-                        orientations=orientations,
+                if (
+                    phase.upper() == "B"
+                    and float(phase_settings.get("lambda_free_prefix", 0.0)) > 0.0
+                    and (step % free_prefix_every_n_steps == 0)
+                ):
+                    encoded_free = _detach_encoded_for_free_decode(encoded)
+                    free_outputs = model.decode_from_encoded(
+                        encoded_free,
                         targets=None,
                         teacher_forcing_ratio=0.0,
                         input_seq=None,
                         sos_id=sos_id,
                         eos_id=eos_id,
                         max_len=int(dec_targets["target_tokens"].size(1)),
-                        decode_constraints=phase_settings.get("decode_constraints"),
+                        decode_constraints=phase_settings.get("train_decode_constraints", phase_settings.get("decode_constraints")),
                     )
-                    free_ce = compute_free_decoder_prefix_ce_loss(
+
+                    free_loss_dict = compute_free_decoder_prefix_losses(
                         free_decoder_logits=free_outputs["decoder_logits"],
+                        free_pred_ids=free_outputs.get("emitted_token_ids", None),
+                        free_stop_logits=free_outputs.get("stop_logits", None),
+                        free_action_logits=free_outputs.get("action_logits", None),
+                        free_attn_weights=free_outputs.get("attn_weights", None),
                         target_tokens=dec_targets["target_tokens"],
                         target_mask=dec_targets["target_mask"],
-                        decoder_label_smoothing=STAGE2_DECODER_LABEL_SMOOTHING,
-                        decoder_eos_id=eos_id,
-                        decoder_eos_weight=decoder_eos_weight,
+                        enc_mask=free_outputs.get("context_mask", None),
+                        encoder_token_bias=free_outputs.get("decoder_token_bias", None),
+                        eos_id=int(eos_id),
+                        label_smoothing=STAGE2_DECODER_LABEL_SMOOTHING,
+                        eos_weight=decoder_eos_weight,
+                        stop_pos_weight=STAGE2_DECODER_STOP_POS_WEIGHT,
+                        lambda_stop=lambda_stop,
+                        lambda_action=float(model_overrides.get("lambda_action", STAGE2_LAMBDA_ACTION)),
+                        action_aux_weight=0.35,
+                        action_class_weights=None,
+                        current_epoch=epoch,
+                        total_epochs=num_epochs,
+                        action_alignment_start_epoch=2,
+                        action_alignment_full_epoch=6,
+                        action_degenerate_same_fraction_threshold=0.90,
+                        action_degenerate_zero_fraction_threshold=0.90,
+                        recovery_window=int(model_overrides.get("free_recovery_window", STAGE2_FREE_RECOVERY_WINDOW)),
+                        recovery_weight=float(model_overrides.get("free_recovery_weight", STAGE2_FREE_RECOVERY_WEIGHT)),
                     )
-                    losses["loss_decoder_free"] = lambda_decoder_free * free_ce
 
-                losses["loss_total"] = base_losses["loss_total"] + losses["loss_aux"] + losses["loss_decoder_free"]
+                losses = dict(base_losses)
+                free_prefix_weight = float(phase_settings.get("lambda_free_prefix", 0.0))
+                free_stop_scale = float(phase_settings.get("free_stop_loss_scale", 1.0))
+                losses["loss_decoder_free"] = free_prefix_weight * free_loss_dict["loss_decoder_free"]
+                losses["loss_stop_free"] = free_prefix_weight * free_stop_scale * float(lambda_stop) * free_loss_dict["loss_stop_free"]
+                losses["loss_action_free"] = free_prefix_weight * float(model_overrides.get("lambda_action", STAGE2_LAMBDA_ACTION)) * free_loss_dict["loss_action_free"]
+                losses["loss_total_free"] = (
+                    losses["loss_decoder_free"]
+                    + losses["loss_stop_free"]
+                    + losses["loss_action_free"]
+                )
+                losses["loss_aux"] = phase_settings["lambda_aux"] * aux_total
+                losses["loss_aux_raw"] = aux_parts["loss_aux_raw"]
+                losses["loss_aux_ctx"] = aux_parts["loss_aux_ctx"]
+                losses["loss_total"] = base_losses["loss_total"] + losses["loss_aux"] + losses["loss_total_free"]
+                train_action_alignment_mix = float(losses.get("action_alignment_mix", 0.0))
 
                 _update_refinement_epoch_stats(train_proposal_stats, outputs, refine_targets, gt_labels_list)
 
@@ -1598,7 +1255,49 @@ def train_stage2_hybrid(
                     tgt_mask=dec_targets["target_mask"],
                 )
             else:
+                pred_ids = None
                 batch_acc = 0.0
+
+            should_update_train_decoder_stats = (step % train_decoder_stats_every_n_steps) == 0
+            if pred_ids is not None and should_update_train_decoder_stats:
+                _update_decoder_epoch_stats(
+                    decoder_stats_tf,
+                    pred_ids,
+                    dec_targets["target_tokens"],
+                    vocab,
+                    action_logits_batch=outputs.get("action_logits", None),
+                    pointer_positions_batch=outputs.get("pointer_positions", None),
+                    valid_mask_batch=dec_targets["target_mask"],
+                    action_targets_batch=losses.get("action_targets", None),
+                )
+
+            should_log_train_free = (
+                bool(phase_settings.get("log_free_decoder", False))
+                and train_free_eval_batches > 0
+                and step < train_free_eval_batches
+            )
+            if should_log_train_free:
+                with torch.no_grad():
+                    free_decoded = _decode_free_by_reading_units(
+                        model,
+                        encoded,
+                        orientations,
+                        vocab,
+                        sos_id=sos_id,
+                        eos_id=eos_id,
+                        max_len=min(train_free_diag_max_len, STAGE2_VAL_MAX_DECODE_LEN),
+                        decode_constraints=phase_settings.get("train_decode_constraints", phase_settings.get("decode_constraints")),
+                    )
+                    _update_decoder_epoch_stats(
+                        decoder_stats_free,
+                        free_decoded["pred_ids"],
+                        text_ids,
+                        vocab,
+                        action_logits_batch=free_decoded.get("action_logits", None),
+                        pointer_positions_batch=free_decoded.get("pointer_positions", None),
+                        valid_mask_batch=free_decoded.get("valid_mask", None),
+                        action_targets_batch=None,
+                    )
 
             total_loss += float(losses["loss_total"].item())
             total_box += float(losses["loss_box"].item())
@@ -1606,21 +1305,34 @@ def train_stage2_hybrid(
             total_score += float(losses["loss_score"].item())
             total_aux += float(losses["loss_aux"].item())
             total_decoder += float(losses["loss_decoder"].item())
-            total_decoder_free += float(losses["loss_decoder_free"].item())
+            total_decoder_free += float(losses.get("loss_decoder_free", torch.tensor(0.0)).item())
+            total_action += float(losses.get("loss_action", torch.tensor(0.0)).item())
+            total_action_free += float(losses.get("loss_action_free", torch.tensor(0.0)).item())
             total_acc += batch_acc
             n_batches += 1
             total_stop += float(losses.get("loss_stop", torch.tensor(0.0)).item())
+            total_stop_free += float(losses.get("loss_stop_free", torch.tensor(0.0)).item())
+            total_free_prefix_tokens += float(free_loss_dict.get("prefix_decoder_tokens", 0))
+            total_free_control_tokens += float(free_loss_dict.get("prefix_control_tokens", 0))
+            total_free_target_tokens += float(free_loss_dict.get("prefix_target_tokens", 0))
+            total_free_prefix_sequences += float(free_loss_dict.get("prefix_sequence_count", 0))
+            total_free_recovery_tokens += float(free_loss_dict.get("recovery_decoder_tokens", 0))
 
-            pbar.set_postfix({
-                "loss": total_loss / max(1, n_batches),
-                "dec": total_decoder / max(1, n_batches),
-                "dec_free": total_decoder_free / max(1, n_batches),
-                "stop": total_stop / max(1, n_batches),
-                "box": total_box / max(1, n_batches),
-                "delta": total_delta / max(1, n_batches),
-                "acc": total_acc / max(1, n_batches),
-                "tf": tf_ratio,
-            })
+            if bool(STAGE2_ENABLE_TQDM) and (step % max(1, int(STAGE2_PROGRESS_POSTFIX_EVERY_N_STEPS)) == 0):
+                pbar.set_postfix({
+                    "loss": total_loss / max(1, n_batches),
+                    "dec": total_decoder / max(1, n_batches),
+                    "fdec": total_decoder_free / max(1, n_batches),
+                    "stop": total_stop / max(1, n_batches),
+                    "fstop": total_stop_free / max(1, n_batches),
+                    "box": total_box / max(1, n_batches),
+                    "delta": total_delta / max(1, n_batches),
+                    "acc": total_acc / max(1, n_batches),
+                    "tf": tf_ratio,
+                    "act": total_action / max(1, n_batches),
+                    "fact": total_action_free / max(1, n_batches),
+                    "fpfx": total_free_prefix_tokens / max(1.0, total_free_prefix_sequences),
+                })
 
         if n_batches > 0 and (n_batches % GRADIENT_ACCUMULATION_STEPS) != 0:
             if scaler is not None:
@@ -1664,6 +1376,19 @@ def train_stage2_hybrid(
             "train_decoder_free": total_decoder_free / max(1, n_batches),
             "train_token_acc": total_acc / max(1, n_batches),
             "train_stop": total_stop / max(1, n_batches),
+            "train_stop_free": total_stop_free / max(1, n_batches),
+            "train_action": total_action / max(1, n_batches),
+            "train_action_free": total_action_free / max(1, n_batches),
+            "train_action_alignment_mix": train_action_alignment_mix if n_batches > 0 else 0.0,
+            "train_free_prefix_len": total_free_prefix_tokens / max(1.0, total_free_prefix_sequences),
+            "train_free_control_len": total_free_control_tokens / max(1.0, total_free_prefix_sequences),
+            "train_free_prefix_ratio": total_free_prefix_tokens / max(1.0, total_free_target_tokens),
+            "train_free_control_ratio": total_free_control_tokens / max(1.0, total_free_target_tokens),
+            "train_free_recovery_ratio": total_free_recovery_tokens / max(1.0, total_free_target_tokens),
+            "decoder_summary": {
+                "teacher_forcing": _finalize_decoder_epoch_stats(decoder_stats_tf, vocab),
+                "free_decoding": _finalize_decoder_epoch_stats(decoder_stats_free, vocab),
+            },
             "proposal_summary": {
                 "images": train_proposal_stats["images"],
                 "orientation_counts": {
@@ -1684,6 +1409,8 @@ def train_stage2_hybrid(
                 "avg_negatives_per_image": train_proposal_stats["negatives"] / max(1, train_proposal_stats["images"]),
                 "avg_ignores_per_image": train_proposal_stats["ignores"] / max(1, train_proposal_stats["images"]),
                 "avg_matched_iou_on_positives": train_proposal_stats["matched_iou_sum"] / max(1, train_proposal_stats["matched_iou_count"]),
+                "ordering_primary_monotonic_fraction": train_proposal_stats["ordering_primary_mono_sum"] / max(1.0, train_proposal_stats["ordering_weight_sum"]),
+                "ordering_primary_violation_fraction": train_proposal_stats["ordering_primary_viol_sum"] / max(1.0, train_proposal_stats["ordering_weight_sum"]),
                 "refine_score_logit_mean": train_proposal_stats["score_logit_sum"] / max(1, train_proposal_stats["score_count"]),
                 "refine_score_logit_std": (
                     max(
@@ -1717,14 +1444,19 @@ def train_stage2_hybrid(
             phase=phase,
             max_batches=val_max_batches,
             runtime_overrides=model_overrides,
+            current_epoch=epoch,
+            total_epochs=num_epochs,
         )
 
         print(
             f"\nEpoch {epoch+1}/{num_epochs} | "
             f"Train loss={train_metrics['train_loss']:.4f} "
             f"(dec={train_metrics['train_decoder']:.4f}, "
-            f"dec_free={train_metrics['train_decoder_free']:.4f}, "
+            f"fdec={train_metrics['train_decoder_free']:.4f}, "
             f"stop={train_metrics['train_stop']:.4f}, "
+            f"fstop={train_metrics['train_stop_free']:.4f}, "
+            f"act={train_metrics['train_action']:.4f}, "
+            f"fact={train_metrics['train_action_free']:.4f}, "
             f"box={train_metrics['train_box']:.4f}, "
             f"delta={train_metrics['train_delta']:.4f}, "
             f"score={train_metrics['train_score']:.4f}, "
@@ -1732,7 +1464,6 @@ def train_stage2_hybrid(
             f"acc={train_metrics['train_token_acc']:.4f}) | "
             f"Val loss={val_metrics['val_loss']:.4f} "
             f"(dec={val_metrics['val_decoder']:.4f}, "
-            f"dec_free={val_metrics['val_decoder_free']:.4f}, "
             f"stop={val_metrics['val_stop']:.4f}, "
             f"box={val_metrics['val_box']:.4f}, "
             f"delta={val_metrics['val_delta']:.4f}, "
@@ -1749,6 +1480,8 @@ def train_stage2_hybrid(
         train_aux_w = train_prop["aux_summary"]["with_context_encode"]
         val_aux_wo = val_prop["aux_summary"]["without_context_encode"]
         val_aux_w = val_prop["aux_summary"]["with_context_encode"]
+        train_dec_tf = train_metrics["decoder_summary"]["teacher_forcing"]
+        train_dec_free = train_metrics["decoder_summary"]["free_decoding"]
         val_dec_tf = val_metrics["decoder_summary"]["teacher_forcing"]
         val_dec_free = val_metrics["decoder_summary"]["free_decoding"]
 
@@ -1770,6 +1503,7 @@ def train_stage2_hybrid(
             f"neg/img={train_prop['avg_negatives_per_image']:.2f}, "
             f"ign/img={train_prop['avg_ignores_per_image']:.2f}, "
             f"mean IoU+={train_prop['avg_matched_iou_on_positives']:.3f}, "
+            f"ord_mono={train_prop['ordering_primary_monotonic_fraction']:.3f}, "
             f"prec_proxy={train_prop['positive_precision_proxy']:.3f}, "
             f"aux acc+={train_prop['aux_accuracy_on_positives']:.3f} | "
             f"val avg props/img={val_prop['avg_proposals_per_image']:.2f}, "
@@ -1782,6 +1516,7 @@ def train_stage2_hybrid(
             f"neg/img={val_prop['avg_negatives_per_image']:.2f}, "
             f"ign/img={val_prop['avg_ignores_per_image']:.2f}, "
             f"mean IoU+={val_prop['avg_matched_iou_on_positives']:.3f}, "
+            f"ord_mono={val_prop['ordering_primary_monotonic_fraction']:.3f}, "
             f"prec_proxy={val_prop['positive_precision_proxy']:.3f}, "
             f"aux acc+={val_prop['aux_accuracy_on_positives']:.3f}, "
             f"aux top5+={val_prop['aux_top5_on_positives']:.3f}"
@@ -1809,37 +1544,104 @@ def train_stage2_hybrid(
             )
             print(f"Aux top predictions (val, with context encode): {val_aux_w['top_predictions']}")
             print(f"Aux top errors (val, with context encode): {val_aux_w['top_errors']}")
-        if phase_settings["log_free_decoder"]:
-            print(
-                "Decoder summary | "
-                f"TF EOS hit={val_dec_tf['eos_hit_fraction']:.3f}, "
-                f"TF CER={val_dec_tf['mean_cer']:.4f}, "
-                f"TF len={val_dec_tf['mean_pred_len']:.2f}/{val_dec_tf['mean_gt_len']:.2f} | "
-                f"FREE EOS hit={val_dec_free['eos_hit_fraction']:.3f}, "
-                f"FREE CER={val_dec_free['mean_cer']:.4f}, "
-                f"FREE len={val_dec_free['mean_pred_len']:.2f}/{val_dec_free['mean_gt_len']:.2f}, "
-                f"FREE len_ratio={val_dec_free['mean_length_ratio']:.3f}, "
-                f"FREE dom={val_dec_free['mean_dominant_share']:.3f}, "
-                f"FREE run={val_dec_free['mean_max_repeat_run']:.2f}, "
-                f"FREE uniq={val_dec_free['mean_unique_ratio']:.3f}, "
-                f"FREE exact={val_dec_free['exact_match_fraction']:.3f}"
-            )
-            print(f"Decoder top tokens (FREE): {val_dec_free['top_tokens']}")
-            print(f"Decoder top errors (FREE): {val_dec_free['top_errors']}")
-            if val_dec_free["examples"]:
-                print("Decoder qualitative examples:")
-                for idx, example in enumerate(val_dec_free["examples"], start=1):
-                    print(
-                        f"  [{idx}] CER={example['cer']:.3f} len={example['pred_len']}/{example['gt_len']} "
-                        f"EOS={int(example['eos_hit'])} | GT={example['gt']} | Pred={example['pred']}"
-                    )
-        else:
-            print(
-                "Decoder summary | "
-                f"TF EOS hit={val_dec_tf['eos_hit_fraction']:.3f}, "
-                f"TF CER={val_dec_tf['mean_cer']:.4f}, "
-                f"TF len={val_dec_tf['mean_pred_len']:.2f}/{val_dec_tf['mean_gt_len']:.2f}"
-            )
+        print(
+            "Decoder train TF | "
+            f"EOS hit={train_dec_tf['eos_hit_fraction']:.3f}, "
+            f"len_ratio={train_dec_tf['mean_length_ratio']:.3f}, "
+            f"CER={train_dec_tf['mean_cer']:.4f}, "
+            f"exact={train_dec_tf['exact_match_fraction']:.3f}, "
+            f"action stay/adv/stop="
+            f"{train_dec_tf['action_pred_distribution']['fractions']['stay']:.2f}/"
+            f"{train_dec_tf['action_pred_distribution']['fractions']['advance']:.2f}/"
+            f"{train_dec_tf['action_pred_distribution']['fractions']['stop']:.2f}, "
+            f"action_match={train_dec_tf['action_match_fraction']:.3f}, "
+            f"ptr adv/stay/reg="
+            f"{train_dec_tf['pointer_summary']['advance_fraction']:.2f}/"
+            f"{train_dec_tf['pointer_summary']['stay_fraction']:.2f}/"
+            f"{train_dec_tf['pointer_summary']['regress_fraction']:.2f}"
+        )
+        print(
+            "Decoder train FREE | "
+            f"EOS hit={train_dec_free['eos_hit_fraction']:.3f}, "
+            f"len_ratio={train_dec_free['mean_length_ratio']:.3f}, "
+            f"CER={train_dec_free['mean_cer']:.4f}, "
+            f"exact={train_dec_free['exact_match_fraction']:.3f}, "
+            f"prefix_len={train_metrics['train_free_prefix_len']:.2f}, "
+            f"prefix_ratio={train_metrics['train_free_prefix_ratio']:.3f}, "
+            f"rec_ratio={train_metrics['train_free_recovery_ratio']:.3f}, "
+            f"action stay/adv/stop="
+            f"{train_dec_free['action_pred_distribution']['fractions']['stay']:.2f}/"
+            f"{train_dec_free['action_pred_distribution']['fractions']['advance']:.2f}/"
+            f"{train_dec_free['action_pred_distribution']['fractions']['stop']:.2f}, "
+            f"ptr adv/stay/reg="
+            f"{train_dec_free['pointer_summary']['advance_fraction']:.2f}/"
+            f"{train_dec_free['pointer_summary']['stay_fraction']:.2f}/"
+            f"{train_dec_free['pointer_summary']['regress_fraction']:.2f}"
+        )
+        print(
+            "Decoder val TF | "
+            f"EOS hit={val_dec_tf['eos_hit_fraction']:.3f}, "
+            f"len_ratio={val_dec_tf['mean_length_ratio']:.3f}, "
+            f"CER={val_dec_tf['mean_cer']:.4f}, "
+            f"exact={val_dec_tf['exact_match_fraction']:.3f}, "
+            f"action stay/adv/stop="
+            f"{val_dec_tf['action_pred_distribution']['fractions']['stay']:.2f}/"
+            f"{val_dec_tf['action_pred_distribution']['fractions']['advance']:.2f}/"
+            f"{val_dec_tf['action_pred_distribution']['fractions']['stop']:.2f}, "
+            f"action_match={val_dec_tf['action_match_fraction']:.3f}, "
+            f"ptr adv/stay/reg="
+            f"{val_dec_tf['pointer_summary']['advance_fraction']:.2f}/"
+            f"{val_dec_tf['pointer_summary']['stay_fraction']:.2f}/"
+            f"{val_dec_tf['pointer_summary']['regress_fraction']:.2f}"
+        )
+        print(
+            "Decoder val FREE | "
+            f"EOS hit={val_dec_free['eos_hit_fraction']:.3f}, "
+            f"len_ratio={val_dec_free['mean_length_ratio']:.3f}, "
+            f"CER={val_dec_free['mean_cer']:.4f}, "
+            f"exact={val_dec_free['exact_match_fraction']:.3f}, "
+            f"action stay/adv/stop="
+            f"{val_dec_free['action_pred_distribution']['fractions']['stay']:.2f}/"
+            f"{val_dec_free['action_pred_distribution']['fractions']['advance']:.2f}/"
+            f"{val_dec_free['action_pred_distribution']['fractions']['stop']:.2f}, "
+            f"ptr adv/stay/reg="
+            f"{val_dec_free['pointer_summary']['advance_fraction']:.2f}/"
+            f"{val_dec_free['pointer_summary']['stay_fraction']:.2f}/"
+            f"{val_dec_free['pointer_summary']['regress_fraction']:.2f}"
+        )
+        print(
+            "Action diag | "
+            f"train TF pred={train_dec_tf['action_pred_distribution']['fractions']['stay']:.2f}/"
+            f"{train_dec_tf['action_pred_distribution']['fractions']['advance']:.2f}/"
+            f"{train_dec_tf['action_pred_distribution']['fractions']['stop']:.2f}, "
+            f"target={train_dec_tf['action_target_distribution']['fractions']['stay']:.2f}/"
+            f"{train_dec_tf['action_target_distribution']['fractions']['advance']:.2f}/"
+            f"{train_dec_tf['action_target_distribution']['fractions']['stop']:.2f}, "
+            f"match={train_dec_tf['action_match_fraction']:.3f} | "
+            f"val TF pred={val_dec_tf['action_pred_distribution']['fractions']['stay']:.2f}/"
+            f"{val_dec_tf['action_pred_distribution']['fractions']['advance']:.2f}/"
+            f"{val_dec_tf['action_pred_distribution']['fractions']['stop']:.2f}, "
+            f"target={val_dec_tf['action_target_distribution']['fractions']['stay']:.2f}/"
+            f"{val_dec_tf['action_target_distribution']['fractions']['advance']:.2f}/"
+            f"{val_dec_tf['action_target_distribution']['fractions']['stop']:.2f}, "
+            f"match={val_dec_tf['action_match_fraction']:.3f}"
+        )
+        print(
+            "Action diag FREE | "
+            f"train pred={train_dec_free['action_pred_distribution']['fractions']['stay']:.2f}/"
+            f"{train_dec_free['action_pred_distribution']['fractions']['advance']:.2f}/"
+            f"{train_dec_free['action_pred_distribution']['fractions']['stop']:.2f}, "
+            f"ptr={train_dec_free['pointer_summary']['advance_fraction']:.2f}/"
+            f"{train_dec_free['pointer_summary']['stay_fraction']:.2f}/"
+            f"{train_dec_free['pointer_summary']['regress_fraction']:.2f} | "
+            f"val pred={val_dec_free['action_pred_distribution']['fractions']['stay']:.2f}/"
+            f"{val_dec_free['action_pred_distribution']['fractions']['advance']:.2f}/"
+            f"{val_dec_free['action_pred_distribution']['fractions']['stop']:.2f}, "
+            f"ptr={val_dec_free['pointer_summary']['advance_fraction']:.2f}/"
+            f"{val_dec_free['pointer_summary']['stay_fraction']:.2f}/"
+            f"{val_dec_free['pointer_summary']['regress_fraction']:.2f}"
+        )
+        print(f"Pointer examples (val FREE): {val_dec_free['pointer_examples']}")
 
         current_score = _select_model_score(val_metrics, phase)
         # Composite model score is defined such that higher is better for both phases.
@@ -1915,7 +1717,7 @@ def main():
             f"  - {last_ckpt}"
         )
 
-    checkpoint_dir = CHECKPOINT_DIR / f"stage2_hybrid_phase_test_{selected_phase}"
+    checkpoint_dir = CHECKPOINT_DIR / f"stage2_hybrid_phase_{selected_phase}"
     resume_model_ckpt = None
     if selected_phase == "B":
         print("Phase B selected: will attempt to resume from Phase A best checkpoint.")
@@ -1936,6 +1738,7 @@ def main():
         checkpoint_dir=checkpoint_dir,
         phase=selected_phase,
         resume_model_ckpt=resume_model_ckpt,
+        val_max_batches=VALIDATION_BATCHES,
     )
 
 

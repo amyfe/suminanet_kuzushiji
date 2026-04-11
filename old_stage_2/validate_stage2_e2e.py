@@ -57,7 +57,7 @@ from model.kuronet.decoder.attention import SeqDecoderAttention
 from utils import KuzushijiDataset
 from utils.detection_utils import compute_roi_box_loss
 from utils.text_normalization import render_tokens
-from utils.training_helpers import collate_fn
+from utils.training_helpers.helper_stage1 import collate_fn
 from utils.vocab import VocabManager
 from validate_stage1 import compute_detection_metrics, compute_iou_batch, extract_boxes_from_heatmap
 

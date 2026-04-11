@@ -51,7 +51,7 @@ from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets, compute_roi_box_loss
 from utils.focal_loss import focal_loss_heatmap
 from utils.text_normalization import render_tokens
-from utils.training_helpers import (
+from utils.training_helpers.helper_stage1 import (
     collate_fn,
     masked_bbox_smoothl1_loss,
     prune_existing_checkpoints,

@@ -1,38 +1,26 @@
-"""Two-stage training pipeline: Stage 1 (detection) + Stage 2 (classification)"""
-import sys
-import json
-import random
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import torch.cuda.amp as amp
 from pathlib import Path
 from tqdm import tqdm
 
 from config import (
-    DATA_DIR, DEVICE, BATCH_SIZE, STAGE1_DROPOUT_RATE, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, WEIGHT_DECAY,
-    GRADIENT_ACCUMULATION_STEPS, CHECKPOINT_DIR, USE_MIXED_PRECISION, DETECTOR_HEATMAP_SIGMA,
-    FOCAL_ALPHA, FOCAL_GAMMA, POS_WEIGHT, BBOX_WEIGHT, 
+    DATA_DIR, DEVICE, BATCH_SIZE, STAGE1_BBOX_WEIGHT, STAGE1_DROPOUT_RATE, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_HEATMAP_SIGMA, STAGE1_POS_WEIGHT, WEIGHT_DECAY,
+    GRADIENT_ACCUMULATION_STEPS, CHECKPOINT_DIR, USE_MIXED_PRECISION
 )
-from model.kuronet import UNet, DetectorHead, ROISequenceEncoder, ROIContextEncoder
-from model.kuronet.encoder_wrapper import EncoderWrapper
-from model.kuronet.decoder.attention import SeqDecoderAttention
+from model.kuronet import UNet, DetectorHead
 from utils import KuzushijiDataset
-from utils.detection_utils import build_detection_targets, compute_roi_box_loss
+from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
 from utils.text_normalization import render_tokens
-from utils.training_helpers import (
+from utils.training_helpers.helper_stage1 import (
     collate_fn,
     masked_bbox_smoothl1_loss,
     prune_existing_checkpoints,
-    prune_to_keep_last_n,
-    scheduled_teacher_forcing,
     validate_detector,
 )
 from utils.vocab import VocabManager
-from validate_stage1 import extract_boxes_from_heatmap
 
 def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3, val_split=None):
     """Stage 1: Train DetectorHead to localize characters.
@@ -142,18 +130,18 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                     output_size=(Hf, Wf),
                     image_size=tuple(images.shape[-2:]),
                     device=DEVICE,
-                    sigma=DETECTOR_HEATMAP_SIGMA,
+                    sigma=STAGE1_HEATMAP_SIGMA,
                     bbox_radius=bbox_radius,
                 )
                 # Compute losses with detailed tracking
                 loss_heatmap = focal_loss_heatmap(
-                    outputs["heatmap"], gt_heat, alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA, pos_weight=POS_WEIGHT
+                    outputs["heatmap"], gt_heat, alpha=STAGE1_FOCAL_ALPHA, gamma=STAGE1_FOCAL_GAMMA, pos_weight=STAGE1_POS_WEIGHT
                 )
                 # Lower pos_thresh for bbox (include broader region around peak) and increase bbox weight
                 loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_bbox_mask)
                                 
                 # Balanced loss: heatmap for localization, bbox for accurate box dimensions
-                loss = loss_heatmap + BBOX_WEIGHT * loss_bbox  
+                loss = loss_heatmap + STAGE1_BBOX_WEIGHT * loss_bbox  
                 loss = loss / GRADIENT_ACCUMULATION_STEPS
             
             if scaler is not None:
@@ -378,28 +366,11 @@ def train_sequence_stage(detector_ckpt_path, num_epochs=10, lr=None, checkpoint_
     
     return unet, detector, None, None  # Placeholder for encoder and decoder (to be implemented)
 
-def train(stage1 = True, stage2 = False, args=None):  
+def train(args=None):  
     print("="*60)
     print("STAGE 1: TRAINING DETECTOR (Spatial Localization)")
     print("="*60)
-    if stage1 == True:
-        unet, detector = train_detector_stage(num_epochs=NUM_EPOCHS, lr=None)
-    
-    if stage2 == True:
-        print("="*60)
-        print("STAGE 2: TRAINING SEQUENCE MODEL (Contextual Understanding)")
-        print("="*60)
-        # Use best checkpoint if it exists, otherwise use last epoch
-        best_ckpt = CHECKPOINT_DIR / "stage1_detection" / "detector_best.pt"
-        last_ckpt = CHECKPOINT_DIR / "stage1_detection" / f"detector_epoch{NUM_EPOCHS}.pt"
-        detector_ckpt = best_ckpt if best_ckpt.exists() else last_ckpt
-        
-        encoder, roi_sequence_encoder, context_encoder, decoder = train_sequence_stage(
-            detector_ckpt_path=detector_ckpt,
-            num_epochs=NUM_EPOCHS,
-            lr=None,
-            use_ctc_warmup=STAGE2_USE_CTC_WARMUP,
-        )
+    unet, detector = train_detector_stage(num_epochs=NUM_EPOCHS, lr=None)
         
 if __name__ == "__main__":
-    train(stage1=False, stage2=True)  
+    train()  
