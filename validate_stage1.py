@@ -112,15 +112,10 @@ def extract_boxes_from_heatmap(
     for y, x, sc in zip(ys, xs, scores_np):
         dx, dy, bw, bh = bbox_np[:, y, x]
 
-        bw = max(bw, 0.1)  # Minimum 0.1 grid units
-        bh = max(bh, 0.1)
-
         cx = (x + dx) * stride_w
         cy = (y + dy) * stride_h
-        w  = bw * stride_w
-        h  = bh * stride_h
-        w = max(w, min_box_size)
-        h = max(h, min_box_size)
+        w  = max(bw * stride_w, min_box_size)
+        h  = max(bh * stride_h, min_box_size)
 
         y1 = cy - 0.5 * h
         x2 = cx + 0.5 * w

@@ -60,39 +60,37 @@ class FocalLoss(nn.Module):
             return loss
 
 
-def focal_loss_heatmap(pred, target, alpha=0.25, gamma=2.0, pos_weight=1.0):
-    """Focal loss specifically for heatmap predictions.
-    
+def focal_loss_heatmap(pred, target, alpha=0.25, gamma=2.0, pos_weight=1.0, pos_threshold=0.3):
+    """Focal loss for soft Gaussian heatmap predictions.
+
+    Uses pos_threshold (default 0.3) instead of 0.5 to decide positive vs negative.
+    With sigma≈2 pixels, a pixel 1.5σ from center has target≈0.32, which should be
+    treated as a positive — the old 0.5 threshold incorrectly penalized it as background.
+
     Args:
-        pred: (B, 1, H, W) predicted heatmap logits (raw, before sigmoid)
-        target: (B, 1, H, W) target heatmap [0, 1]
-        alpha: Weighting for positive class
-        gamma: Focusing parameter
-        pos_weight: Additional weight for positive pixels
-        
-    Returns:
-        Focal loss value
+        pred: (B, 1, H, W) raw logits (before sigmoid)
+        target: (B, 1, H, W) soft Gaussian heatmap targets in [0, 1]
+        alpha: Weight for positive pixels
+        gamma: Focal exponent
+        pos_weight: Additional scalar weight on positive BCE terms
+        pos_threshold: Gaussian value above which a pixel is treated as positive
     """
-    # Flatten
     pred_flat = pred.view(-1)
     target_flat = target.view(-1)
-    
-    # Probabilities
+
     p = torch.sigmoid(pred_flat)
-    p_t = torch.where(target_flat > 0.5, p, 1 - p)
-    
-    # Focal weight
+    pos_mask = target_flat >= pos_threshold
+    p_t = torch.where(pos_mask, p, 1 - p)
+
     focal_weight = (1 - p_t) ** gamma
-    
-    # CE loss with pos_weight
+
     ce_loss = F.binary_cross_entropy_with_logits(
-        pred_flat, target_flat, reduction='none', pos_weight=torch.tensor(pos_weight, device=pred.device)
+        pred_flat, target_flat, reduction='none',
+        pos_weight=torch.tensor(pos_weight, device=pred.device),
     )
-    
-    # Apply alpha
-    alpha_t = torch.where(target_flat > 0.5, alpha, 1 - alpha)
-    
-    # Focal loss
-    loss = alpha_t * focal_weight * ce_loss
-    
-    return loss.mean()
+
+    alpha_t = torch.where(pos_mask,
+                          torch.full_like(target_flat, alpha),
+                          torch.full_like(target_flat, 1.0 - alpha))
+
+    return (alpha_t * focal_weight * ce_loss).mean()

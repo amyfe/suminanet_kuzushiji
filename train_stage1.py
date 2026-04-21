@@ -6,7 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from config import (
-    DATA_DIR, DEVICE, BATCH_SIZE, STAGE1_BBOX_WEIGHT, STAGE1_DROPOUT_RATE, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_HEATMAP_SIGMA, STAGE1_POS_WEIGHT, WEIGHT_DECAY,
+    DATA_DIR, DEVICE, BATCH_SIZE, STAGE1_BBOX_WEIGHT, STAGE1_DROPOUT_RATE, STAGE1_FOCAL_POS_THRESHOLD, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_HEATMAP_SIGMA, STAGE1_POS_WEIGHT, WEIGHT_DECAY,
     GRADIENT_ACCUMULATION_STEPS, CHECKPOINT_DIR, USE_MIXED_PRECISION
 )
 from model.kuronet import UNet, DetectorHead
@@ -95,7 +95,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     
     print(f"Stage 1: Training DetectorHead for {num_epochs} epochs (early stopping patience={patience})...")
     print(f"Training set: {len(train_dataset)} images | Validation set: {len(val_dataset)} images")
-    bbox_radius = 0
+    bbox_radius = 1
     best_val = None
     patience_ctr = 0
     for epoch in range(num_epochs):
@@ -134,7 +134,10 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                 )
                 # Compute losses with detailed tracking
                 loss_heatmap = focal_loss_heatmap(
-                    outputs["heatmap"], gt_heat, alpha=STAGE1_FOCAL_ALPHA, gamma=STAGE1_FOCAL_GAMMA, pos_weight=STAGE1_POS_WEIGHT
+                    outputs["heatmap"], gt_heat,
+                    alpha=STAGE1_FOCAL_ALPHA, gamma=STAGE1_FOCAL_GAMMA,
+                    pos_weight=STAGE1_POS_WEIGHT,
+                    pos_threshold=STAGE1_FOCAL_POS_THRESHOLD,
                 )
                 # Lower pos_thresh for bbox (include broader region around peak) and increase bbox weight
                 loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_bbox_mask)
@@ -203,9 +206,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                         pred_bbox_pos.min(dim=0).values.detach().cpu().tolist())
                     print("pred_bbox max  [dx,dy,bw,bh]:",
                         pred_bbox_pos.max(dim=0).values.detach().cpu().tolist())
-            # Clear cache periodically to prevent memory fragmentation
-            if step % 50 == 0:
-                torch.cuda.empty_cache()
+
         
         if n_batches > 0 and (n_batches % GRADIENT_ACCUMULATION_STEPS) != 0:
             if scaler is not None:
@@ -223,7 +224,6 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
 
             optimizer.zero_grad(set_to_none=True)
         scheduler.step()
-        torch.cuda.empty_cache()
         
         # Validation
         val_loss, val_heat, val_bbox = validate_detector(

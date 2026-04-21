@@ -36,20 +36,20 @@ SEED = 42
 IMAGE_SIZE = (256, 256)
 
 USE_MIXED_PRECISION = True
-NUM_WORKERS = 8
+NUM_WORKERS = 4
 
 BATCH_SIZE = 2
 GRADIENT_ACCUMULATION_STEPS = 4
 GRAD_CLIP = 1.0
 
-NUM_EPOCHS = 5
+NUM_EPOCHS = 15
 
 
 # ============================================================
 # Optimizer
 # ============================================================
 
-LR = 1.0841999197654953e-4
+LR =  0.0019040586163242641
 WEIGHT_DECAY = 9.431774935513243e-5
 
 
@@ -71,17 +71,29 @@ NUM_CLASSES = 3000
 
 STAGE1_CHECKPOINT_DIR = CHECKPOINT_DIR / "stage1_detection"
 
-STAGE1_DROPOUT_RATE = 0.33763617734186435
+STAGE1_DROPOUT_RATE = 0.4904013263270167
 
-STAGE1_FOCAL_ALPHA = 0.22380365509800024
-STAGE1_FOCAL_GAMMA = 1.6449122167800316
-STAGE1_POS_WEIGHT = 2.2202569170802624
+STAGE1_FOCAL_ALPHA = 0.3519203997395026
+STAGE1_FOCAL_GAMMA = 1.881061777549089
+STAGE1_POS_WEIGHT = 4.896873402520948
 
-STAGE1_BBOX_WEIGHT = 0.10087921713096845
-STAGE1_HEATMAP_SIGMA = 1.3143263749771124
+STAGE1_BBOX_WEIGHT = 0.5587297156424271             # raised from 0.10; bbox regression now gets meaningful gradient
+STAGE1_HEATMAP_SIGMA = 0.7249217915919892         # re-tune via train_f1 Optuna; formula now uses sqrt(area)*0.20
+STAGE1_FOCAL_POS_THRESHOLD = 0.3      # pixels with Gaussian target >= this treated as positives (was 0.5)
 
 STAGE1_EARLY_STOPPING_PATIENCE = 0   # 0 = disabled
 
+#  {'lr': 0.0019040586163242641, 
+#  'weight_decay': 7.610321317306418e-06, 
+#  'batch_size': 2, 
+#  'dropout_rate': 0.4904013263270167, 
+#  'focal_alpha': 0.3519203997395026, 
+#  'focal_gamma': 1.881061777549089, 
+#  'pos_weight': 4.896873402520948, 
+#  'bbox_weight': 0.5587297156424271, 
+#  'heatmap_sigma': 0.7249217915919892, 
+#  'bbox_radius': 0, 
+#  'pos_threshold': 0.29142092186467783}
 
 # ============================================================
 # Stage 2: Hybrid Recognition (Option C)
@@ -207,7 +219,7 @@ STAGE2_DEBUG_AUX_ALIGNMENT_LIMIT = 20
 # ============================================================
 
 
-STAGE2_PHASE = "B"   # "A" oder "B"
+STAGE2_PHASE = "A"   # "A" oder "B"
 
 # Phase A (context encoder enabled, decoder still frozen)
 STAGE2_PHASE_A_EPOCHS = 15

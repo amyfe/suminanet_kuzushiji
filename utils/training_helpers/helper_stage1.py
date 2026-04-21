@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from config import STAGE1_BBOX_WEIGHT, STAGE1_HEATMAP_SIGMA, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_POS_WEIGHT
+from config import STAGE1_BBOX_WEIGHT, STAGE1_FOCAL_POS_THRESHOLD, STAGE1_HEATMAP_SIGMA, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_POS_WEIGHT
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
 
@@ -169,6 +169,7 @@ def validate_detector(unet, detector, dataloader, device, use_mixed_precision, b
                 alpha=STAGE1_FOCAL_ALPHA,
                 gamma=STAGE1_FOCAL_GAMMA,
                 pos_weight=STAGE1_POS_WEIGHT,
+                pos_threshold=STAGE1_FOCAL_POS_THRESHOLD,
             )
             loss_bbox = masked_bbox_smoothl1_loss(bbox_reg, gt_bbox, gt_bbox_mask)
             loss = loss_heatmap + STAGE1_BBOX_WEIGHT * loss_bbox

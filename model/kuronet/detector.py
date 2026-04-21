@@ -9,17 +9,24 @@ from .utils import make_gn
 
 
 class DetectorHead(nn.Module):
-    def __init__(self, in_ch, num_classes, extra_channels=64, predict_boxes=True, dropout_rate=0.3, predict_classes=False):
+    def __init__(self, in_ch, num_classes, extra_channels=128, predict_boxes=True, dropout_rate=0.3, predict_classes=False):
         super().__init__()
         self.predict_boxes = predict_boxes
         self.predict_classes = predict_classes
-        
-        # shared conv with dropout to reduce overfitting
+
+        # 3-layer shared head: larger RF and richer features for thin/small characters
         self.shared = nn.Sequential(
             nn.Conv2d(in_ch, extra_channels, kernel_size=3, padding=1),
             make_gn(extra_channels),
             nn.ReLU(inplace=True),
             nn.Dropout2d(dropout_rate),
+            nn.Conv2d(extra_channels, extra_channels, kernel_size=3, padding=1),
+            make_gn(extra_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_rate),
+            nn.Conv2d(extra_channels, extra_channels, kernel_size=3, padding=1),
+            make_gn(extra_channels),
+            nn.ReLU(inplace=True),
         )
         
         if predict_boxes:

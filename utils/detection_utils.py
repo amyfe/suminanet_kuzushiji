@@ -1,4 +1,5 @@
 """Helper functions for detection training."""
+import math
 import torch
 import torch.nn.functional as F
 from torchvision.ops import roi_align
@@ -72,27 +73,31 @@ def build_detection_targets(
             dx = cx - float(ix)
             dy = cy - float(iy)
 
-            gaussian_sigma = min(2.0, max(0.5, sigma * min(bw, bh) * 0.25))
+            # Use sqrt(area) so thin chars like ー (15×3) get sigma≈1.7 instead of 0.98
+            gaussian_sigma = min(2.0, max(0.5, sigma * math.sqrt(bw * bh) * 0.20))
             yy = torch.arange(0, H_out, device=device).view(H_out, 1).float()
             xx = torch.arange(0, W_out, device=device).view(1, W_out).float()
             g = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * gaussian_sigma ** 2))
             gt_heatmap[i, 0] = torch.maximum(gt_heatmap[i, 0], g)
             
-            # Bbox targets (offset from grid cell + size)
+            # Bbox targets — supervise a (2*radius+1)² neighbourhood around center.
+            # Each cell gets the offset from *its own* position to the object center,
+            # so dx/dy are different per cell while bw/bh stay the same.
             x0 = max(0, ix - bbox_radius)
             x1i = min(W_out - 1, ix + bbox_radius)
             y0 = max(0, iy - bbox_radius)
             y1i = min(H_out - 1, iy + bbox_radius)
 
-            # bbox targets ONLY at center
-            gt_bbox[i,0,iy,ix] = dx
-            gt_bbox[i,1,iy,ix] = dy
-            gt_bbox[i,2,iy,ix] = bw
-            gt_bbox[i,3,iy,ix] = bh
+            for ny in range(y0, y1i + 1):
+                for nx in range(x0, x1i + 1):
+                    gt_bbox[i, 0, ny, nx] = cx - float(nx)
+                    gt_bbox[i, 1, ny, nx] = cy - float(ny)
+                    gt_bbox[i, 2, ny, nx] = bw
+                    gt_bbox[i, 3, ny, nx] = bh
+                    gt_bbox_mask[i, ny, nx] = True
 
-            # class label only at center cell (keeps it sparse; even if class head disabled)
+            # class label only at center cell
             gt_cls[i, iy, ix] = int(label.item())
-            gt_bbox_mask[i,iy,ix] = True
     gt_heatmap = gt_heatmap.clamp(min=heatmap_min, max=1.0)
     return gt_heatmap, gt_bbox, gt_bbox_mask, gt_cls
 

@@ -16,6 +16,8 @@ from typing import Tuple
 
 import numpy as np
 import optuna
+from optuna.importance import get_param_importances
+from optuna.visualization.matplotlib import plot_contour, plot_parallel_coordinate, plot_param_importances, plot_slice
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -98,6 +100,8 @@ def validate_detector(
     focal_gamma: float,
     pos_weight: float,
     bbox_weight: float,
+    bbox_radius: int = 1,
+    pos_threshold: float = 0.3,
 ) -> float:
     unet.eval()
     detector.eval()
@@ -118,7 +122,7 @@ def validate_detector(
             for l in batch.get("labels", [])
         ]
 
-        with torch.amp.autocast(device_type=AUTOCAST_DEVICE, enabled=AMP_ENABLED):
+        with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
             features = unet(images)
             _, _, hf, wf = features.shape
             gt_heat, gt_bbox, gt_bbox_mask, _ = build_detection_targets(
@@ -128,7 +132,7 @@ def validate_detector(
                 image_size=tuple(images.shape[-2:]),
                 device=DEVICE,
                 sigma=heatmap_sigma,
-                bbox_radius=0,
+                bbox_radius=bbox_radius,
             )
 
             outputs = detector(features)
@@ -138,6 +142,7 @@ def validate_detector(
                 alpha=focal_alpha,
                 gamma=focal_gamma,
                 pos_weight=pos_weight,
+                pos_threshold=pos_threshold,
             )
             loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_bbox_mask)
             loss = loss_heat + bbox_weight * loss_bbox
@@ -159,8 +164,10 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     focal_alpha = trial.suggest_float("focal_alpha", 0.15, 0.45)
     focal_gamma = trial.suggest_float("focal_gamma", 1.0, 3.0)
     pos_weight = trial.suggest_float("pos_weight", 2.0, 12.0)
-    bbox_weight = trial.suggest_float("bbox_weight", 0.1, 0.8)
-    heatmap_sigma = trial.suggest_float("heatmap_sigma", 0.6, 1.4)
+    bbox_weight = trial.suggest_float("bbox_weight", 0.1, 1.0)
+    heatmap_sigma = trial.suggest_float("heatmap_sigma", 0.5, 2.5)
+    bbox_radius = trial.suggest_int("bbox_radius", 0, 2)
+    pos_threshold = trial.suggest_float("pos_threshold", 0.1, 0.5)
 
     ann_files = sorted(list((Path(DATA_DIR) / "annotations").glob("*.json")))
     if not ann_files:
@@ -184,7 +191,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    scaler = torch.amp.GradScaler(device="cuda") if AMP_ENABLED else None
+    scaler = torch.cuda.amp.GradScaler(enabled=AMP_ENABLED)
 
     best_val = float("inf")
 
@@ -215,7 +222,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
                 for l in batch.get("labels", [])
             ]
 
-            with torch.amp.autocast(device_type=AUTOCAST_DEVICE, enabled=AMP_ENABLED):
+            with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
                 features = unet(images)
                 _, _, hf, wf = features.shape
                 gt_heat, gt_bbox, gt_bbox_mask, _ = build_detection_targets(
@@ -225,7 +232,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
                     image_size=tuple(images.shape[-2:]),
                     device=DEVICE,
                     sigma=heatmap_sigma,
-                    bbox_radius=0,
+                    bbox_radius=bbox_radius,
                 )
 
                 outputs = detector(features)
@@ -235,6 +242,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
                     alpha=focal_alpha,
                     gamma=focal_gamma,
                     pos_weight=pos_weight,
+                    pos_threshold=pos_threshold,
                 )
                 loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_bbox_mask)
                 loss = loss_heat + bbox_weight * loss_bbox
@@ -273,8 +281,6 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
             optimizer.zero_grad(set_to_none=True)
 
         scheduler.step()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         val_loss = validate_detector(
             unet=unet,
@@ -285,6 +291,8 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
             focal_gamma=focal_gamma,
             pos_weight=pos_weight,
             bbox_weight=bbox_weight,
+            bbox_radius=bbox_radius,
+            pos_threshold=pos_threshold,
         )
         best_val = min(best_val, val_loss)
 
@@ -415,8 +423,88 @@ def objective_validation(trial: optuna.Trial, args: argparse.Namespace) -> float
     return metric_value
 
 
+def _save_matplotlib_plot(plot_obj, output_path: Path) -> None:
+    figure = getattr(plot_obj, "figure", None)
+    if figure is None and hasattr(plot_obj, "get_figure"):
+        figure = plot_obj.get_figure()
+    if figure is None:
+        figure = plot_obj
+    figure.savefig(output_path, dpi=200, bbox_inches="tight")
+    try:
+        import matplotlib.pyplot as plt
+
+        plt.close(figure)
+    except Exception:
+        pass
+
+
+def generate_optuna_png_plots(
+    study: optuna.study.Study,
+    output_dir: str | Path,
+    top_n: int = 4,
+    max_contour_pairs: int = 3,
+) -> list[Path]:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: list[Path] = []
+
+    try:
+        importance_ax = plot_param_importances(study)
+        importance_path = output_dir / "param_importances.png"
+        _save_matplotlib_plot(importance_ax, importance_path)
+        saved_paths.append(importance_path)
+    except Exception as exc:
+        print(f"WARNING: could not create param importance plot: {exc}")
+
+    important_params = list(get_param_importances(study).keys())[:max(0, top_n)]
+    if important_params:
+        try:
+            slice_ax = plot_slice(study, params=important_params)
+            slice_path = output_dir / "param_slice_top.png"
+            _save_matplotlib_plot(slice_ax, slice_path)
+            saved_paths.append(slice_path)
+        except Exception as exc:
+            print(f"WARNING: could not create slice plot: {exc}")
+
+        try:
+            parallel_ax = plot_parallel_coordinate(study, params=important_params)
+            parallel_path = output_dir / "parallel_coordinate_top.png"
+            _save_matplotlib_plot(parallel_ax, parallel_path)
+            saved_paths.append(parallel_path)
+        except Exception as exc:
+            print(f"WARNING: could not create parallel coordinate plot: {exc}")
+
+    contour_params = important_params[:max(0, min(len(important_params), max_contour_pairs + 1))]
+    if len(contour_params) >= 2:
+        pair_count = 0
+        for i in range(len(contour_params)):
+            for j in range(i + 1, len(contour_params)):
+                if pair_count >= max_contour_pairs:
+                    break
+                param_x = contour_params[i]
+                param_y = contour_params[j]
+                try:
+                    contour_ax = plot_contour(study, params=[param_x, param_y])
+                    contour_path = output_dir / f"contour_{param_x}_vs_{param_y}.png"
+                    _save_matplotlib_plot(contour_ax, contour_path)
+                    saved_paths.append(contour_path)
+                    pair_count += 1
+                except Exception as exc:
+                    print(f"WARNING: could not create contour plot for {param_x} vs {param_y}: {exc}")
+            if pair_count >= max_contour_pairs:
+                break
+
+    return saved_paths
+
+
+def load_optuna_study(study_name: str, storage: str) -> optuna.study.Study:
+    return optuna.load_study(study_name=study_name, storage=storage)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Optuna search for Stage 1 detector training/validation")
+    parser.add_argument("--plot-only", action="store_true", help="Load an existing Optuna study and export PNG plots only")
     parser.add_argument("--mode", type=str, default="train", choices=["train", "val"], help="train: tune stage1 training hparams, val: tune stage1 decode/validation params")
     parser.add_argument("--epochs", type=int, default=6, help="Epochs per trial")
     parser.add_argument("--n-trials", type=int, default=30, help="Number of Optuna trials")
@@ -482,6 +570,30 @@ def parse_args() -> argparse.Namespace:
         choices=["f1", "precision", "recall"],
         help="Metric to maximize in --mode val",
     )
+    parser.add_argument(
+        "--plot-study-name",
+        type=str,
+        default="",
+        help="Study name to plot in --plot-only mode (defaults to --study-name)",
+    )
+    parser.add_argument(
+        "--plot-output-dir",
+        type=str,
+        default="",
+        help="Output directory for PNG plots in --plot-only mode (defaults to --output-dir/plots)",
+    )
+    parser.add_argument(
+        "--plot-top-n",
+        type=int,
+        default=4,
+        help="Number of top important parameters to include in slice/parallel/contour plots",
+    )
+    parser.add_argument(
+        "--plot-max-contour-pairs",
+        type=int,
+        default=3,
+        help="Maximum number of contour plot pairs to save",
+    )
     return parser.parse_args()
 
 
@@ -495,9 +607,28 @@ def main() -> None:
         args.storage = f"sqlite:///{(Path(args.output_dir) / db_name).as_posix()}"
     if not args.study_name:
         args.study_name = "stage1_detector_optuna_val" if args.mode == "val" else "stage1_detector_optuna_train"
+    if not args.plot_study_name:
+        args.plot_study_name = args.study_name
+    if not args.plot_output_dir:
+        args.plot_output_dir = str(Path(args.output_dir) / "plots")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.plot_only:
+        study = load_optuna_study(args.plot_study_name, args.storage)
+        saved_paths = generate_optuna_png_plots(
+            study=study,
+            output_dir=args.plot_output_dir,
+            top_n=args.plot_top_n,
+            max_contour_pairs=args.plot_max_contour_pairs,
+        )
+        print("=" * 70)
+        print(f"Optuna plot export complete (study={args.plot_study_name})")
+        for path in saved_paths:
+            print(f"Saved plot: {path}")
+        print("=" * 70)
+        return
 
     if args.sampler == "random":
         sampler = optuna.samplers.RandomSampler(seed=args.seed)
@@ -575,6 +706,15 @@ def main() -> None:
     print(f"Best params: {study.best_params}")
     print(f"Saved summary: {summary_path}")
     print("=" * 70)
+
+    plot_paths = generate_optuna_png_plots(
+        study=study,
+        output_dir=args.plot_output_dir,
+        top_n=args.plot_top_n,
+        max_contour_pairs=args.plot_max_contour_pairs,
+    )
+    for path in plot_paths:
+        print(f"Saved plot: {path}")
 
 
 if __name__ == "__main__":
