@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 import torchvision.transforms as T
 
 from config import IMAGE_SIZE
-from model.kuronet.roi.roi_ordering import infer_reading_orientation_from_boxes
+from model.kuronet.roi.roi_ordering import infer_reading_orientation_from_boxes, ROIReadingOrder
 
 
 class KuzushijiDataset(Dataset):
@@ -136,21 +136,11 @@ class KuzushijiDataset(Dataset):
         # OCR CRITICAL: Sort boxes in reading order
         # ---------------------------
         if len(boxes) > 0:
-            if orientation == "vertical":
-                # Traditional Japanese: right-to-left columns, top-to-bottom within columns
-                # Sort by -x (right to left), then by y (top to bottom)
-                sorted_indices = sorted(
-                    range(len(boxes)),
-                    key=lambda i: (-boxes[i][0], boxes[i][1])
-                )
-            else:  # horizontal
-                # Left-to-right, top-to-bottom
-                # Sort by y first (top to bottom), then x (left to right)
-                sorted_indices = sorted(
-                    range(len(boxes)),
-                    key=lambda i: (boxes[i][1], boxes[i][0])
-                )
-
+            boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+            mask = torch.ones((boxes_tensor.size(0),), dtype=torch.bool)
+            orderer = ROIReadingOrder()
+            _, _, sort_idx = orderer.sort_single(boxes_tensor, mask, orientation)
+            sorted_indices = sort_idx.detach().cpu().tolist()
             boxes = [boxes[i] for i in sorted_indices]
             labels = [labels[i] for i in sorted_indices]
 

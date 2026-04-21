@@ -406,6 +406,7 @@ def _update_action_pointer_epoch_stats(
 	valid_mask_batch: Optional[torch.Tensor],
 	action_targets_batch: Optional[torch.Tensor],
 	eos_id: int,
+	max_samples: Optional[int] = None,
 ) -> None:
 	if action_logits_batch is None:
 		return
@@ -415,6 +416,16 @@ def _update_action_pointer_epoch_stats(
 	valid_cpu = valid_mask_batch.detach().cpu().bool() if valid_mask_batch is not None else None
 	target_cpu = action_targets_batch.detach().cpu() if action_targets_batch is not None else None
 	pred_ids_cpu = pred_ids_batch.detach().cpu().tolist()
+
+	if max_samples is not None and max_samples > 0:
+		action_pred_batch = action_pred_batch[:max_samples]
+		if pointer_cpu is not None:
+			pointer_cpu = pointer_cpu[:max_samples]
+		if valid_cpu is not None:
+			valid_cpu = valid_cpu[:max_samples]
+		if target_cpu is not None:
+			target_cpu = target_cpu[:max_samples]
+		pred_ids_cpu = pred_ids_cpu[:max_samples]
 
 	if valid_cpu is not None:
 		valid_flat = valid_cpu.reshape(-1)
@@ -535,13 +546,17 @@ def _update_decoder_epoch_stats(
 	pointer_positions_batch: Optional[torch.Tensor] = None,
 	valid_mask_batch: Optional[torch.Tensor] = None,
 	action_targets_batch: Optional[torch.Tensor] = None,
+	max_samples: Optional[int] = None,
 ):
 	stats.setdefault("dominant_share_sum", 0.0)
 	stats.setdefault("max_repeat_run_sum", 0.0)
 	stats.setdefault("unique_ratio_sum", 0.0)
 	stats.setdefault("length_ratio_sum", 0.0)
 
-	for pred_ids, gt_ids in zip(pred_ids_batch.detach().cpu().tolist(), text_ids_batch.detach().cpu().tolist()):
+	max_samples = None if max_samples is None else max(0, int(max_samples))
+	for idx, (pred_ids, gt_ids) in enumerate(zip(pred_ids_batch.detach().cpu().tolist(), text_ids_batch.detach().cpu().tolist())):
+		if max_samples is not None and max_samples > 0 and idx >= max_samples:
+			break
 		pred_tokens = _strip_special_tokens(pred_ids, vocab.pad_id, vocab.sos_id, vocab.eos_id)
 		gt_tokens = _strip_special_tokens(gt_ids, vocab.pad_id, vocab.sos_id, vocab.eos_id)
 
@@ -592,6 +607,7 @@ def _update_decoder_epoch_stats(
 		valid_mask_batch=valid_mask_batch,
 		action_targets_batch=action_targets_batch,
 		eos_id=vocab.eos_id,
+		max_samples=max_samples,
 	)
 
 

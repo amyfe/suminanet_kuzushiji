@@ -13,7 +13,6 @@ from model.kuronet import UNet, DetectorHead
 from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
-from utils.text_normalization import render_tokens
 from utils.training_helpers.helper_stage1 import (
     collate_fn,
     masked_bbox_smoothl1_loss,
@@ -275,102 +274,11 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     
     return unet, detector
 
-
-
-
-
-def _decode_text_from_ids(ids, vocab):
-    chars = vocab.decode([int(x) for x in ids], remove_special=True)
-    return render_tokens(chars)
-
-def train_sequence_stage(detector_ckpt_path, num_epochs=10, lr=None, checkpoint_dir=None, use_ctc_warmup=False):
-    """Stage 2: Train Encoder + Decoder for sequence prediction with context.
-    
-    Uses detected boxes to guide attention and sequence prediction.
-    Combines spatial detection (Stage 1) with contextual understanding.
-    Architecture:
-        image -> UNet backbone -> 2D projected features
-             -> ROISequenceEncoder (ordered candidate boxes)
-             -> ROIContextEncoder
-             -> attention decoder
-
-    Args:
-        detector_ckpt_path: Path to detector checkpoint
-        num_epochs: Number of epochs for sequence training
-        lr: Learning rate (default from config)
-        checkpoint_dir: Where to save checkpoints
-        use_ctc_warmup: Whether to do CTC warmup before attention training
-    """
-    if lr is None:
-        lr = LR
-    if checkpoint_dir is None:
-        checkpoint_dir = CHECKPOINT_DIR / "stage2_sequence_test2"
-    checkpoint_dir.mkdir(exist_ok=True, parents=True)
-    
-    # Build or load vocab
-    ann_files = sorted(list((Path(DATA_DIR) / "annotations").glob("*.json")))
-    if len(ann_files) == 0:
-        raise FileNotFoundError(f"No annotation files found in {Path(DATA_DIR)/'annotations'}")
-    vocab = VocabManager.from_annotations(ann_files)
-    pad_id = vocab.pad_id
-    sos_id = vocab.sos_id
-    eos_id = vocab.eos_id
-    vocab_size = vocab.vocab_size
-
-    # Dataset + loader
-    train_dataset = KuzushijiDataset(
-        Path(DATA_DIR),
-        vocab=vocab,
-        use_sequences=True,
-        resize=IMAGE_SIZE,
-        split="train",
-    )
-    val_dataset = KuzushijiDataset(
-        Path(DATA_DIR),
-        vocab=vocab,
-        use_sequences=True,
-        resize=IMAGE_SIZE,
-        split="val",
-    )
-
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        collate_fn=lambda b: collate_fn(b, pad_id),
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=NUM_WORKERS > 0,
-    )
-
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        collate_fn=lambda b: collate_fn(b, pad_id),
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=NUM_WORKERS > 0,
-    )
-    
-    print(f"Stage 2 datasets -> train: {len(train_dataset)} | val: {len(val_dataset)}")
-    # Build and load detector (frozen for spatial guidance)
-    unet = UNet(in_channels=3, base_features=32).to(DEVICE)
-    detector = DetectorHead(in_ch=32, num_classes=vocab_size).to(DEVICE)
-    
-    checkpoint = torch.load(detector_ckpt_path, map_location=DEVICE)
-    unet.load_state_dict(checkpoint['unet_state_dict'])
-    detector.load_state_dict(checkpoint['detector_state_dict'])
-    
-    return unet, detector, None, None  # Placeholder for encoder and decoder (to be implemented)
-
 def train(args=None):  
     print("="*60)
     print("STAGE 1: TRAINING DETECTOR (Spatial Localization)")
     print("="*60)
-    unet, detector = train_detector_stage(num_epochs=NUM_EPOCHS, lr=None)
+    train_detector_stage(num_epochs=NUM_EPOCHS, lr=None)
         
 if __name__ == "__main__":
     train()  

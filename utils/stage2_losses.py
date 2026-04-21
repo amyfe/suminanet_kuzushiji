@@ -387,6 +387,7 @@ def build_free_prefix_weights(
     target_tokens: torch.Tensor,   # (B, T_use)
     target_mask: torch.Tensor,     # (B, T_use)
     eos_id: int,
+    min_prefix_len: int = 0,
     recovery_window: int = 0,
     recovery_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -412,6 +413,7 @@ def build_free_prefix_weights(
 
     bsz, t_use = target_tokens.shape
     eos_id = int(eos_id)
+    min_prefix_len = max(0, int(min_prefix_len))
     recovery_window = max(0, int(recovery_window))
     recovery_weight = max(0.0, float(recovery_weight))
 
@@ -438,6 +440,17 @@ def build_free_prefix_weights(
             break
 
         if mismatch_idx is None or recovery_window <= 0 or recovery_weight <= 0.0:
+            # Enforce a minimum supervised span even when mismatches happen early.
+            if min_prefix_len > 0:
+                valid_positions = []
+                for t in range(t_use):
+                    if not bool(target_mask[b, t].item()):
+                        break
+                    if int(target_tokens[b, t].item()) == eos_id:
+                        break
+                    valid_positions.append(t)
+                for t in valid_positions[:min_prefix_len]:
+                    decoder_weights[b, t] = max(float(decoder_weights[b, t].item()), 1.0)
             continue
 
         end_idx = min(t_use, mismatch_idx + recovery_window)
@@ -448,6 +461,21 @@ def build_free_prefix_weights(
             control_mask[b, t] = True
             if tgt_id != eos_id:
                 decoder_weights[b, t] = max(float(decoder_weights[b, t].item()), recovery_weight)
+
+        if min_prefix_len > 0:
+            valid_positions = []
+            for t in range(t_use):
+                if not bool(target_mask[b, t].item()):
+                    break
+                if int(target_tokens[b, t].item()) == eos_id:
+                    break
+                valid_positions.append(t)
+            for t in valid_positions[:min_prefix_len]:
+                decoder_weights[b, t] = max(float(decoder_weights[b, t].item()), 1.0)
+
+    # Never apply token loss on EOS targets.
+    eos_mask = target_tokens.eq(int(eos_id)) & target_mask.bool()
+    decoder_weights = decoder_weights.masked_fill(eos_mask, 0.0)
 
     return decoder_weights, control_mask, prefix_mask
 
@@ -595,6 +623,62 @@ def build_decoder_roi_targets_from_alignment(
 
     return monotonic_idx
 
+
+def build_decoder_roi_targets_from_bias(
+    *,
+    target_tokens: torch.Tensor,          # (B, T_dec)
+    target_mask: torch.Tensor,            # (B, T_dec)
+    enc_mask: Optional[torch.Tensor],     # (B, T_enc)
+    eos_id: int,
+    encoder_token_bias: torch.Tensor,     # (B, T_enc, V)
+    aux_weight: float = 0.35,
+) -> torch.Tensor:
+    """
+    Build pseudo ROI assignments using encoder token bias only.
+    This provides a softer oracle pointer heuristic than strict monotonic spacing.
+    """
+    if encoder_token_bias.dim() != 3:
+        raise ValueError(
+            f"encoder_token_bias must have shape (B, T_enc, V), got {tuple(encoder_token_bias.shape)}"
+        )
+
+    bsz, t_dec = target_tokens.shape
+    t_enc = encoder_token_bias.size(1)
+    if target_mask.shape != (bsz, t_dec):
+        raise ValueError(
+            f"target_mask shape {tuple(target_mask.shape)} must match (B, T_dec)=({bsz}, {t_dec})"
+        )
+
+    vocab_size = encoder_token_bias.size(-1)
+    tgt = target_tokens.clamp(min=0, max=vocab_size - 1)
+
+    bias_exp = encoder_token_bias.unsqueeze(1).expand(-1, t_dec, -1, -1)
+    tgt_idx = tgt.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, t_enc, 1)
+    score = bias_exp.gather(dim=-1, index=tgt_idx).squeeze(-1)
+    score = score * float(aux_weight)
+
+    pseudo_roi_idx = _masked_argmax(score, enc_mask)
+
+    monotonic_idx = pseudo_roi_idx.clone()
+    for t in range(1, t_dec):
+        monotonic_idx[:, t] = torch.maximum(monotonic_idx[:, t], monotonic_idx[:, t - 1])
+
+    # Propagate EOS positions with last valid ROI.
+    valid = target_mask.bool()
+    for b in range(bsz):
+        valid_steps = torch.nonzero(valid[b], as_tuple=False).squeeze(1)
+        if valid_steps.numel() == 0:
+            continue
+        last_roi = monotonic_idx[b, valid_steps[-1]].clone()
+        eos_steps = torch.nonzero(
+            valid[b] & target_tokens[b].eq(int(eos_id)),
+            as_tuple=False,
+        ).squeeze(1)
+        if eos_steps.numel() > 0:
+            monotonic_idx[b, eos_steps] = last_roi
+
+    return monotonic_idx
+
 def build_decoder_action_targets_from_alignment(
     *,
     target_tokens: torch.Tensor,          # (B, T_dec)
@@ -695,6 +779,7 @@ def compute_free_decoder_prefix_losses(
     label_smoothing: float = 0.0,
     eos_weight: float = 1.0,
     stop_pos_weight: float = 1.0,
+    min_prefix_len: int = 0,
     lambda_stop: float = 0.0,
     lambda_action: float = 0.0,
     action_aux_weight: float = 0.35,
@@ -710,7 +795,9 @@ def compute_free_decoder_prefix_losses(
 ) -> dict:
     """
     Compute prefix-aligned losses for a free-decoding rollout.
-    We align by truncating targets to the produced free length.
+    We align by truncating targets to the produced free length and
+    only supervising a matched prefix (optionally enforcing a minimum
+    supervised span).
     """
     bsz, t_free, _ = free_decoder_logits.shape
     t_tgt = target_tokens.size(1)
@@ -747,6 +834,7 @@ def compute_free_decoder_prefix_losses(
         target_tokens=tgt_tokens_cut,
         target_mask=tgt_mask_cut,
         eos_id=int(eos_id),
+        min_prefix_len=int(min_prefix_len),
         recovery_window=int(recovery_window),
         recovery_weight=float(recovery_weight),
     )
@@ -773,10 +861,10 @@ def compute_free_decoder_prefix_losses(
         loss_stop_free = decoder_stop_bce_loss(
             stop_logits=stop_cut,
             target_tokens=tgt_tokens_cut,
-            target_mask=tgt_mask_cut,
+            target_mask=tgt_mask_cut,     # ← use full valid mask so EOS position is included
             eos_id=int(eos_id),
             pos_weight=float(stop_pos_weight),
-            loss_mask=control_mask_free,
+            loss_mask=None,               # no additional mask
         )
 
     loss_action_free = dec_logits_cut.new_tensor(0.0)
@@ -811,15 +899,38 @@ def compute_free_decoder_prefix_losses(
             alignment_mix=float(action_alignment_mix),
             degenerate_same_fraction_threshold=float(action_degenerate_same_fraction_threshold),
             degenerate_zero_fraction_threshold=float(action_degenerate_zero_fraction_threshold),
-            loss_mask=control_mask_free,
+            loss_mask=tgt_mask_cut,
         )
 
+    # Continuation supervision: when free decoding diverges early, still train
+    # non-prefix target positions to provide a direct signal against early stop.
+    post_prefix_mask = (
+        tgt_mask_cut.bool()
+        & ~prefix_mask_free
+        & ~tgt_tokens_cut.eq(int(eos_id))
+    )
+    if post_prefix_mask.any():
+        continuation_weight = 0.3
+        continuation_alpha = 0.5
+        continuation_weights = torch.where(
+            post_prefix_mask,
+            torch.full_like(decoder_weights_free, float(continuation_weight)),
+            torch.zeros_like(decoder_weights_free),
+        )
+        loss_continuation = decoder_cross_entropy_loss_weighted(
+            decoder_logits=dec_logits_cut,
+            target_tokens=tgt_tokens_cut,
+            target_weights=continuation_weights.to(dtype=dec_logits_cut.dtype),
+            label_smoothing=label_smoothing,
+            eos_id=None,
+            eos_weight=1.0,
+        )
+        loss_decoder_free = loss_decoder_free + float(continuation_alpha) * loss_continuation
     total_free = (
         loss_decoder_free
         + float(lambda_stop) * loss_stop_free
         + float(lambda_action) * loss_action_free
     )
-
     return {
         "loss_decoder_free": loss_decoder_free,
         "loss_stop_free": loss_stop_free,

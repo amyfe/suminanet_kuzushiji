@@ -5,8 +5,9 @@ from typing import Optional
 
 import torch
 
-from config import STAGE2_USE_CHUNKED_FREE_DECODE
+from config import STAGE2_USE_CHUNKED_FREE_DECODE, STAGE2_USE_CHUNKED_FREE_TRAINING
 from model.kuronet.hybrid_recognizer import HybridKuroNetRecognizer
+from utils.stage2_losses import build_decoder_roi_targets_monotonic, build_decoder_roi_targets_from_bias
 from utils.vocab import VocabManager
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "_get_action_class_weights",
     "_load_compatible_state_dict",
     "_normalize_orientation_label",
+    "_prepare_chunked_free_training_batch",
     "_select_pred_ids",
     "_valid_proposal_mask",
     "compute_simple_token_accuracy",
@@ -293,12 +295,11 @@ def _decode_free_by_reading_units(
     page_pointer_lists: list[list[torch.Tensor]] = [[] for _ in range(bsz)]
     page_valid_lens = [0 for _ in range(bsz)]
     page_has_eos = [False for _ in range(bsz)]
-    page_terminated = [False for _ in range(bsz)]
+    last_chunk_idx: dict[int, int] = {}
+    for idx, (sample_idx, _start, _end) in enumerate(chunk_meta):
+        last_chunk_idx[sample_idx] = idx
 
     for idx, (sample_idx, start, _end) in enumerate(chunk_meta):
-        if page_terminated[sample_idx]:
-            continue
-
         pred_row = [int(x) for x in chunk_pred_ids[idx].detach().cpu().tolist()]
         eos_pos = pred_row.index(int(eos_id)) if int(eos_id) in pred_row else -1
         raw_len = (eos_pos + 1) if eos_pos >= 0 else len(pred_row)
@@ -309,9 +310,8 @@ def _decode_free_by_reading_units(
         ]
         page_pred_lists[sample_idx].extend(pred_core)
 
-        if eos_pos >= 0:
+        if eos_pos >= 0 and last_chunk_idx.get(sample_idx, idx) == idx:
             page_has_eos[sample_idx] = True
-            page_terminated[sample_idx] = True
 
         if chunk_action_logits is not None and chunk_pointer_positions is not None:
             act_slice = chunk_action_logits[idx, :raw_len].detach()
@@ -359,6 +359,156 @@ def _decode_free_by_reading_units(
     }
 
 
+def _prepare_chunked_free_training_batch(
+    encoded: dict,
+    dec_targets: dict,
+    orientations: list[str],
+    *,
+    eos_id: int,
+    pad_id: int,
+    roi_targets: Optional[torch.Tensor] = None,
+) -> Optional[dict]:
+    if not bool(STAGE2_USE_CHUNKED_FREE_TRAINING):
+        return None
+
+    context_feats = encoded.get("context_feats", None)
+    context_mask = encoded.get("context_mask", None)
+    ordered_boxes = encoded.get("ordered_boxes", None)
+    decoder_token_bias = encoded.get("decoder_token_bias", None)
+    decoder_inputs = dec_targets.get("decoder_inputs", None)
+    target_tokens = dec_targets.get("target_tokens", None)
+    target_mask = dec_targets.get("target_mask", None)
+
+    if (
+        context_feats is None
+        or context_mask is None
+        or ordered_boxes is None
+        or decoder_inputs is None
+        or target_tokens is None
+        or target_mask is None
+        or len(orientations) != int(context_feats.size(0))
+    ):
+        return None
+
+    bsz, _, feat_dim = context_feats.shape
+    device = context_feats.device
+    if roi_targets is None:
+        if decoder_token_bias is not None:
+            roi_targets = build_decoder_roi_targets_from_bias(
+                target_tokens=target_tokens,
+                target_mask=target_mask,
+                enc_mask=context_mask,
+                eos_id=int(eos_id),
+                encoder_token_bias=decoder_token_bias,
+                aux_weight=0.35,
+            )
+        else:
+            roi_targets = build_decoder_roi_targets_monotonic(
+                target_tokens=target_tokens,
+                target_mask=target_mask,
+                enc_mask=context_mask,
+                eos_id=int(eos_id),
+            )
+
+    chunk_feats: list[torch.Tensor] = []
+    chunk_masks: list[torch.Tensor] = []
+    chunk_biases: list[torch.Tensor] = []
+    chunk_decoder_inputs: list[torch.Tensor] = []
+    chunk_target_tokens: list[torch.Tensor] = []
+    chunk_target_masks: list[torch.Tensor] = []
+
+    for b in range(bsz):
+        valid_t = int(context_mask[b].sum().item())
+        if valid_t <= 0:
+            continue
+
+        spans = _reading_unit_spans_from_sorted_boxes(
+            ordered_boxes[b, :valid_t],
+            orientations[b],
+        )
+        if not spans:
+            spans = [(0, valid_t)]
+
+        for start, end in spans:
+            if end <= start:
+                continue
+
+            span_token_mask = (
+                target_mask[b].bool()
+                & roi_targets[b].ge(int(start))
+                & roi_targets[b].lt(int(end))
+            )
+            token_positions = torch.nonzero(span_token_mask, as_tuple=False).squeeze(1)
+            if token_positions.numel() <= 0:
+                continue
+
+            local_target_tokens = target_tokens[b, token_positions]
+            local_target_mask = torch.ones_like(local_target_tokens, dtype=torch.bool)
+            first_input_tok = decoder_inputs[b, token_positions[0]].view(1)
+            if local_target_tokens.numel() > 1:
+                local_decoder_inputs = torch.cat([first_input_tok, local_target_tokens[:-1]], dim=0)
+            else:
+                local_decoder_inputs = first_input_tok
+
+            chunk_feats.append(context_feats[b, start:end])
+            chunk_masks.append(context_mask[b, start:end])
+            if decoder_token_bias is not None:
+                chunk_biases.append(decoder_token_bias[b, start:end])
+            chunk_decoder_inputs.append(local_decoder_inputs)
+            chunk_target_tokens.append(local_target_tokens)
+            chunk_target_masks.append(local_target_mask)
+
+    if not chunk_feats:
+        return None
+
+    max_chunk_tokens = max(int(x.size(0)) for x in chunk_feats)
+    max_chunk_decode_len = max(int(x.size(0)) for x in chunk_target_tokens)
+    chunk_bsz = len(chunk_feats)
+
+    chunk_feat_batch = context_feats.new_zeros((chunk_bsz, max_chunk_tokens, feat_dim))
+    chunk_mask_batch = torch.zeros((chunk_bsz, max_chunk_tokens), device=device, dtype=torch.bool)
+    chunk_bias_batch = None
+    if decoder_token_bias is not None:
+        vocab_dim = int(decoder_token_bias.size(-1))
+        chunk_bias_batch = decoder_token_bias.new_zeros((chunk_bsz, max_chunk_tokens, vocab_dim))
+
+    decoder_input_batch = torch.full(
+        (chunk_bsz, max_chunk_decode_len),
+        int(pad_id),
+        device=device,
+        dtype=torch.long,
+    )
+    target_token_batch = torch.full(
+        (chunk_bsz, max_chunk_decode_len),
+        int(pad_id),
+        device=device,
+        dtype=torch.long,
+    )
+    target_mask_batch = torch.zeros((chunk_bsz, max_chunk_decode_len), device=device, dtype=torch.bool)
+
+    for idx, feats in enumerate(chunk_feats):
+        t_enc = int(feats.size(0))
+        t_dec = int(chunk_target_tokens[idx].size(0))
+        chunk_feat_batch[idx, :t_enc] = feats
+        chunk_mask_batch[idx, :t_enc] = chunk_masks[idx]
+        decoder_input_batch[idx, :t_dec] = chunk_decoder_inputs[idx]
+        target_token_batch[idx, :t_dec] = chunk_target_tokens[idx]
+        target_mask_batch[idx, :t_dec] = chunk_target_masks[idx]
+        if chunk_bias_batch is not None:
+            chunk_bias_batch[idx, :t_enc] = chunk_biases[idx]
+
+    return {
+        "encoded": {
+            "context_feats": chunk_feat_batch,
+            "context_mask": chunk_mask_batch,
+            "decoder_token_bias": chunk_bias_batch,
+        },
+        "decoder_inputs": decoder_input_batch,
+        "target_tokens": target_token_batch,
+        "target_mask": target_mask_batch,
+    }
+
+
 def compute_simple_token_accuracy(
     pred_ids: torch.Tensor,
     tgt_ids: torch.Tensor,
@@ -372,4 +522,3 @@ def compute_simple_token_accuracy(
         return 0.0
     correct = (pred_ids[valid] == tgt_ids[valid]).float().mean()
     return float(correct.item())
-

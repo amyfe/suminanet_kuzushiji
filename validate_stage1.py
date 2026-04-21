@@ -17,7 +17,7 @@ import os
 from datetime import datetime
 import torch.nn.functional as F
 
-from config import DATA_DIR, DEVICE, IMAGE_SIZE, CHECKPOINT_DIR
+from config import DATA_DIR, DEVICE, IMAGE_SIZE, CHECKPOINT_DIR, DET_SCORE_THRESH, DET_TOP_K, DET_NMS_IOU, DET_MIN_BOX_SIZE
 from model.kuronet import UNet, DetectorHead
 from utils import KuzushijiDataset
 from utils.vocab import VocabManager
@@ -274,13 +274,13 @@ def visualize_centers_only(image_tensor, gt_boxes, pred_boxes, out_path):
 
 def validate_stage1(
     checkpoint_path,
-    confidence_thresh=0.5,      
+    confidence_thresh=DET_SCORE_THRESH,
     split="val",
-    num_samples=None,          # None => full split
-    top_k=300,
-    nms_iou=0.5,
+    num_samples=None,
+    top_k=DET_TOP_K,
+    nms_iou=DET_NMS_IOU,
     iou_threshold=0.5,
-    min_box_size = 4.0,
+    min_box_size=DET_MIN_BOX_SIZE,
     job_id=None,
 ):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -423,11 +423,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--split", type=str, default="val", choices=["train", "val"])
-    p.add_argument("--confidence", type=float, default=0.5)
-    p.add_argument("--top_k", type=int, default=300)
-    p.add_argument("--nms_iou", type=float, default=0.5)
+    p.add_argument("--confidence", type=float, default=DET_SCORE_THRESH)
+    p.add_argument("--top_k", type=int, default=DET_TOP_K)
+    p.add_argument("--nms_iou", type=float, default=DET_NMS_IOU)
     p.add_argument("--iou_thr", type=float, default=0.5)
-    p.add_argument("--min_box_size", type=float, default=4.0)
+    p.add_argument("--min_box_size", type=float, default=DET_MIN_BOX_SIZE)
     p.add_argument("--job_id", type=str, default=None, help="Optional job id suffix for output folder (default: SLURM_JOB_ID env)")
     p.add_argument("--num_samples", type=int, default=0, help="0 => full split")
     args = p.parse_args()

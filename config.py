@@ -96,10 +96,10 @@ STAGE2_DROPOUT_RATE = 0.15
 # Detector -> Proposal stage
 # -------------------------
 
-STAGE2_DET_SCORE_THRESH = 0.2629582153082592
-STAGE2_DET_TOP_K = 896
-STAGE2_DET_NMS_IOU = 0.5029688485303105
-STAGE2_DET_MIN_BOX_SIZE = 1.6597800597711687
+DET_SCORE_THRESH = 0.051290347220558016
+DET_TOP_K = 1200
+DET_NMS_IOU = 0.5920639234211412
+DET_MIN_BOX_SIZE = 1.8012387816266866
 
 # -------------------------
 # Shared feature projection
@@ -190,7 +190,7 @@ STAGE2_LAMBDA_DECODER = 0
 
 RUN_VALIDATION = True
 VALIDATION_FREQ = 1
-VALIDATION_BATCHES = 20
+VALIDATION_BATCHES = 10
 
 # For later free-decoding evaluation
 STAGE2_VAL_MAX_DECODE_LEN = 352
@@ -236,23 +236,87 @@ STAGE2_ACTION_ALIGNMENT_FULL_EPOCH = 4
 # Free-decoding stabilization (Phase B)
 STAGE2_PHASE_B_FREE_REPETITION_PENALTY = 0.1
 STAGE2_PHASE_B_FREE_BLOCK_IMMEDIATE_REPEAT = True
-STAGE2_PHASE_B_FREE_MIN_STEPS = 48
+STAGE2_PHASE_B_FREE_MIN_STEPS = 36
+STAGE2_PHASE_B_FREE_MAX_STALL_STEPS = 8
+STAGE2_PHASE_B_FREE_FORCE_STOP_ON_STALL = False
+STAGE2_PHASE_B_FREE_STOP_THRESHOLD = 0.0
+STAGE2_PHASE_B_FREE_MIN_PROGRESS_FOR_EOS = 0.0
+STAGE2_PHASE_B_FREE_MIN_COVERAGE_FOR_EOS = 0.0
 STAGE2_PHASE_B_TRAIN_FREE_REPETITION_PENALTY = 0.0
 STAGE2_PHASE_B_TRAIN_FREE_BLOCK_IMMEDIATE_REPEAT = False
-STAGE2_PHASE_B_TRAIN_FREE_MIN_STEPS = 32
-STAGE2_FREE_PREFIX_EVERY_N_STEPS = 64
-STAGE2_TRAIN_FREE_DECODE_BATCHES = 0
-STAGE2_VAL_FREE_DECODE_BATCHES = 0
+STAGE2_PHASE_B_TRAIN_FREE_MIN_STEPS = 10
+STAGE2_PHASE_B_TRAIN_FREE_MAX_STALL_STEPS = 4
+STAGE2_PHASE_B_TRAIN_FREE_FORCE_STOP_ON_STALL = False
+STAGE2_PHASE_B_TRAIN_FREE_STOP_THRESHOLD = 0.0
+STAGE2_PHASE_B_TRAIN_FREE_MIN_PROGRESS_FOR_EOS = 0.0
+STAGE2_PHASE_B_TRAIN_FREE_MIN_COVERAGE_FOR_EOS = 0.0
+STAGE2_FREE_PREFIX_EVERY_N_STEPS = 256
+STAGE2_TRAIN_FREE_DECODE_BATCHES = 2
+STAGE2_VAL_FREE_DECODE_BATCHES = 4
 STAGE2_TRAIN_DECODER_STATS_EVERY_N_STEPS = 64
+STAGE2_TRAIN_DECODER_STATS_MAX_SAMPLES = 4
+STAGE2_TRAIN_PROP_STATS_EVERY_N_STEPS = 8
 STAGE2_TRAIN_FREE_DIAG_MAX_LEN = 128
 STAGE2_FREE_RECOVERY_WINDOW = 5
 STAGE2_FREE_RECOVERY_WEIGHT = 0.35
+STAGE2_FREE_PREFIX_MIN_TOKENS = 4
 STAGE2_USE_CHUNKED_FREE_DECODE = True
+STAGE2_USE_CHUNKED_FREE_TRAINING = True
+STAGE2_FREE_TEACHER_PREFIX_STEPS = 6
+STAGE2_LOG_PREDICTIONS = True
+STAGE2_PREDICTION_SAMPLES = 2
 STAGE2_LAMBDA_STOP = 0.2
-STAGE2_LAMBDA_STOP_FREE_SCALE = 0.5
+STAGE2_LAMBDA_STOP_FREE_SCALE = 0.3
+STAGE2_LAMBDA_ACTION_FREE_SCALE = 1.5
 STAGE2_DECODER_STOP_POS_WEIGHT = 3.0
 STAGE2_PHASE_B_STOP_THRESHOLD = 0.1
 
 # Runtime logging controls (recommended for cluster runs)
 STAGE2_ENABLE_TQDM = True
 STAGE2_PROGRESS_POSTFIX_EVERY_N_STEPS = 70
+
+
+# ============================================================
+# KuroNet Recognizer (simplified per-ROI classifier)
+# ============================================================
+# Replaces the seq2seq decoder with a direct per-ROI character
+# classifier: detect → refine → sort by reading order → classify.
+# All ROI pipeline components (pool, refine, ordering, tokens)
+# are reused unchanged from Stage 2 hybrid.
+# ============================================================
+
+KURONET_CHECKPOINT_DIR       = CHECKPOINT_DIR / "kuronet_recognizer"
+KURONET_CHECKPOINT_DIR.mkdir(exist_ok=True)
+
+KURONET_USE_CONTEXT          = True        # Keep BiGRU context encoder
+KURONET_CLASSIFIER_HIDDEN    = 512         # MLP hidden dim for char classifier
+
+# ROI pooling — larger crop to preserve dakuten (voiced-mark) strokes
+KURONET_ROI_SIZE             = (12, 12)    # was (8, 8); (12,12) gives 2.25× more pixels per ROI
+
+# Detection params (DET_*) are shared — defined once above, used by Stage 2 and KuroNet.
+# Once Optuna (jobs 9182-9184) finishes, update DET_* in the Stage 2 section above.
+
+# Assembled CER: filter out false-positive proposals before transcription
+# (ordered_mask includes all 159 props/img; ~18 are FPs that add insertion errors)
+KURONET_CER_SCORE_THRESH     = 0.5
+
+# Loss weights (single-phase training, no scheduling)
+KURONET_LAMBDA_CHAR          = 1.0         # Primary: per-ROI character classification
+KURONET_LAMBDA_BOX           = 0.35        # Box regression on positive ROIs
+KURONET_LAMBDA_DELTA         = 0.75        # Delta regression on positive ROIs
+KURONET_LAMBDA_SCORE         = 0.20        # ROI quality BCE
+
+# Optimizer
+KURONET_LR                   = 1.0841999197654953e-4
+KURONET_LR_ETA_MIN           = 1e-6       # Cosine annealing floor
+KURONET_WEIGHT_DECAY         = 5e-4       # was 9.4e-5; raised to fight overfitting
+
+# Training
+KURONET_EPOCHS               = 50
+KURONET_GRAD_ACCUM_STEPS     = 4
+KURONET_ENABLE_TQDM          = True
+KURONET_PROGRESS_POSTFIX_N   = 70
+KURONET_LOG_PREDICTIONS      = True
+KURONET_PREDICTION_SAMPLES   = 2
+KURONET_VALIDATION_BATCHES   = 10

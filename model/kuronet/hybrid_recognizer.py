@@ -402,12 +402,14 @@ class HybridKuroNetRecognizer(nn.Module):
         encoded: dict,
         targets: Optional[torch.Tensor] = None,
         teacher_forcing_ratio: float = 0.0,
+        teacher_prefix_steps: int = 0,
         input_seq: Optional[torch.Tensor] = None,
         sos_id: Optional[int] = None,
         eos_id: Optional[int] = None,
         max_len: Optional[int] = None,
         oracle_pointer_positions: Optional[torch.Tensor] = None,
         decode_constraints: Optional[dict] = None,
+        force_full_rollout: bool = False,
     ) -> dict:
         decoder_logits, decoder_hidden, attn_weights, stop_logits, action_logis, pointer_positions, emitted_token_ids = self.decoder(
             enc_outputs=encoded["context_feats"],
@@ -415,12 +417,14 @@ class HybridKuroNetRecognizer(nn.Module):
             input_seq=input_seq,
             targets=targets,
             teacher_forcing_ratio=teacher_forcing_ratio,
+            teacher_prefix_steps=teacher_prefix_steps,
             sos_id=sos_id,
             eos_id=eos_id,
             max_len=max_len,
             encoder_token_bias=encoded.get("decoder_token_bias", None),
             oracle_pointer_positions=oracle_pointer_positions,
             decode_constraints=decode_constraints,
+            force_full_rollout=force_full_rollout,
         )
 
         outputs = dict(encoded)
@@ -451,8 +455,10 @@ class HybridKuroNetRecognizer(nn.Module):
         sos_id: Optional[int] = None,
         eos_id: Optional[int] = None,
         max_len: Optional[int] = None,
+        teacher_prefix_steps: int = 0,
         oracle_pointer_positions: Optional[torch.Tensor] = None,
         decode_constraints: Optional[dict] = None,
+        force_full_rollout: bool = False,
     ) -> dict:
         encoded = self.encode_images(
             images=images,
@@ -464,10 +470,12 @@ class HybridKuroNetRecognizer(nn.Module):
             encoded,
             targets=targets,
             teacher_forcing_ratio=teacher_forcing_ratio,
+            teacher_prefix_steps=teacher_prefix_steps,
             input_seq=input_seq,
             sos_id=sos_id,
             eos_id=eos_id,
             max_len=max_len,
             oracle_pointer_positions=oracle_pointer_positions,
             decode_constraints=decode_constraints,
+            force_full_rollout=force_full_rollout,
         )

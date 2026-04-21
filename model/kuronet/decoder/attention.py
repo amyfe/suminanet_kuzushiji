@@ -389,6 +389,7 @@ class SeqDecoderAttention(nn.Module):
         targets: Optional[torch.Tensor] = None,      # (B, T_tgt), optional
         hidden: Optional[torch.Tensor] = None,       # (num_layers, B, hidden_dim)
         teacher_forcing_ratio: float = 0.0,
+        teacher_prefix_steps: int = 0,
         sos_id: Optional[int] = None,
         eos_id: Optional[int] = None,
         max_len: Optional[int] = None,
@@ -396,6 +397,7 @@ class SeqDecoderAttention(nn.Module):
         encoder_token_bias: Optional[torch.Tensor] = None,  # optional, (B, T_enc, V)
         oracle_pointer_positions: Optional[torch.Tensor] = None,  # optional, (B, T_dec)
         decode_constraints: Optional[dict] = None,
+        force_full_rollout: bool = False,
     )   -> Tuple[
         torch.Tensor,  # logits_cat
         torch.Tensor,  # hidden_state
@@ -514,9 +516,11 @@ class SeqDecoderAttention(nn.Module):
 
         coverage = torch.zeros((bsz, t_enc), device=device, dtype=enc_outputs.dtype)
         pointer_idx = torch.zeros((bsz,), dtype=torch.long, device=device)
+        stall_steps = torch.zeros((bsz,), dtype=torch.long, device=device)
         pointer_history = []
         action_logits_all = []
         emitted_tokens = []
+        teacher_prefix_steps = max(0, int(teacher_prefix_steps))
 
         for t in range(t_dec):
             if oracle_pointer_positions is not None and targets is not None:
@@ -653,7 +657,9 @@ class SeqDecoderAttention(nn.Module):
 
             if (input_seq is not None) and ((t + 1) < input_seq.size(1)):
                 teacher_next_tok = input_seq[:, t + 1]
-                if teacher_forcing_ratio >= 1.0:
+                if t < teacher_prefix_steps:
+                    next_tok = teacher_next_tok
+                elif teacher_forcing_ratio >= 1.0:
                     next_tok = teacher_next_tok
                 elif teacher_forcing_ratio <= 0.0:
                     next_tok = sampled_next_tok
@@ -679,8 +685,34 @@ class SeqDecoderAttention(nn.Module):
                     decode_constraints=decode_constraints,
                 )
 
+                if decode_constraints:
+                    max_stall_steps = int(decode_constraints.get("max_stall_steps", 0))
+                    force_stop_at_last_pointer = bool(decode_constraints.get("force_stop_at_last_pointer", False))
+                    force_stop_on_stall = bool(decode_constraints.get("force_stop_on_stall", False))
+                    min_steps = int(decode_constraints.get("min_steps", 0))
+                    if (
+                        force_stop_at_last_pointer
+                        and max_stall_steps > 0
+                        and t >= min_steps
+                    ):
+                        saturated_mask = pointer_idx.ge(max_valid_idx_global)
+                        stop_mask = stop_mask | (saturated_mask & stall_steps.ge(max_stall_steps))
+                    if (
+                        force_stop_on_stall
+                        and max_stall_steps > 0
+                        and t >= min_steps
+                    ):
+                        stop_mask = stop_mask | stall_steps.ge(max_stall_steps)
+
+                prev_pointer_idx = pointer_idx
                 new_pointer = pointer_idx + advance_mask.long()
                 pointer_idx = torch.minimum(new_pointer, max_valid_idx_global)
+                advanced_now = pointer_idx.gt(prev_pointer_idx)
+                stall_steps = torch.where(
+                    advanced_now,
+                    torch.zeros_like(stall_steps),
+                    stall_steps + 1,
+                )
 
                 if eos_id is not None:
                     eos_tensor_local = torch.full_like(next_tok, int(eos_id))
@@ -719,7 +751,7 @@ class SeqDecoderAttention(nn.Module):
             # Only stop early during free decoding, not during supervised training.
             if targets is None and eos_id is not None:
                 finished = finished | (input_tok == eos_id)
-                if finished.all():
+                if finished.all() and not bool(force_full_rollout):
                     break
 
         logits_cat = torch.cat(outputs, dim=1)                  # (B, T_dec, V)

@@ -27,21 +27,26 @@ from config import (
     STAGE2_DECODER_EMBED_DIM,
     STAGE2_DECODER_HIDDEN_DIM,
     STAGE2_DECODER_STOP_POS_WEIGHT,
-    STAGE2_DET_MIN_BOX_SIZE,
-    STAGE2_DET_NMS_IOU,
-    STAGE2_DET_SCORE_THRESH,
-    STAGE2_DET_TOP_K,
+    DET_MIN_BOX_SIZE,
+    DET_NMS_IOU,
+    DET_SCORE_THRESH,
+    DET_TOP_K,
     STAGE2_LAMBDA_ACTION,
     STAGE2_LAMBDA_FREE_PREFIX,
     STAGE2_LAMBDA_STOP,
     STAGE2_FREE_PREFIX_EVERY_N_STEPS,
     STAGE2_TRAIN_FREE_DECODE_BATCHES,
     STAGE2_TRAIN_DECODER_STATS_EVERY_N_STEPS,
+    STAGE2_TRAIN_DECODER_STATS_MAX_SAMPLES,
+    STAGE2_TRAIN_PROP_STATS_EVERY_N_STEPS,
     STAGE2_TRAIN_FREE_DIAG_MAX_LEN,
     STAGE2_VAL_FREE_DECODE_BATCHES,
     STAGE2_FREE_RECOVERY_WINDOW,
     STAGE2_FREE_RECOVERY_WEIGHT,
+    STAGE2_FREE_PREFIX_MIN_TOKENS,
     STAGE2_USE_CHUNKED_FREE_DECODE,
+    STAGE2_LOG_PREDICTIONS,
+    STAGE2_PREDICTION_SAMPLES,
     STAGE2_ENABLE_TQDM,
     STAGE2_PROGRESS_POSTFIX_EVERY_N_STEPS,
     STAGE2_PROJ_DIM,
@@ -90,10 +95,23 @@ from config import (
     STAGE2_PHASE_B_FREE_REPETITION_PENALTY,
     STAGE2_PHASE_B_FREE_BLOCK_IMMEDIATE_REPEAT,
     STAGE2_PHASE_B_FREE_MIN_STEPS,
+    STAGE2_PHASE_B_FREE_MAX_STALL_STEPS,
+    STAGE2_PHASE_B_FREE_FORCE_STOP_ON_STALL,
+    STAGE2_PHASE_B_FREE_STOP_THRESHOLD,
+    STAGE2_PHASE_B_FREE_MIN_PROGRESS_FOR_EOS,
+    STAGE2_PHASE_B_FREE_MIN_COVERAGE_FOR_EOS,
     STAGE2_PHASE_B_TRAIN_FREE_REPETITION_PENALTY,
     STAGE2_PHASE_B_TRAIN_FREE_BLOCK_IMMEDIATE_REPEAT,
     STAGE2_PHASE_B_TRAIN_FREE_MIN_STEPS,
+    STAGE2_PHASE_B_TRAIN_FREE_MAX_STALL_STEPS,
+    STAGE2_PHASE_B_TRAIN_FREE_FORCE_STOP_ON_STALL,
+    STAGE2_PHASE_B_TRAIN_FREE_STOP_THRESHOLD,
+    STAGE2_PHASE_B_TRAIN_FREE_MIN_PROGRESS_FOR_EOS,
+    STAGE2_PHASE_B_TRAIN_FREE_MIN_COVERAGE_FOR_EOS,
+    STAGE2_USE_CHUNKED_FREE_TRAINING,
+    STAGE2_FREE_TEACHER_PREFIX_STEPS,
     STAGE2_LAMBDA_STOP_FREE_SCALE,
+    STAGE2_LAMBDA_ACTION_FREE_SCALE,
     
 )
 
@@ -112,8 +130,11 @@ from utils.stage2_targets import (
     build_refinement_targets,
     build_decoder_targets,
 )
-from utils.stage2_losses import compute_stage2_total_loss, compute_free_decoder_prefix_losses
-from utils.stage2_losses import build_decoder_roi_targets_monotonic
+from utils.stage2_losses import build_decoder_roi_targets_from_bias, compute_stage2_total_loss, compute_free_decoder_prefix_losses
+from utils.stage2_losses import (
+    build_decoder_roi_targets_monotonic,
+    build_decoder_roi_targets_from_alignment,
+)
 from utils.stage2_losses import aux_classification_loss
 
 from utils.training_helpers.helper_stage2 import (
@@ -122,6 +143,7 @@ from utils.training_helpers.helper_stage2 import (
     _get_action_class_weights,
     _load_compatible_state_dict,
     _normalize_orientation_label,
+    _prepare_chunked_free_training_batch,
     compute_simple_token_accuracy,
     greedy_decode_from_logits,
     reorder_by_sort_indices,
@@ -136,6 +158,7 @@ from utils.training_helpers.logging_stage2 import (
     _update_refinement_epoch_stats,
     log_stage2_batch_debug,
 )
+from utils.text_normalization import render_tokens
 
 def get_phase_settings(phase: str, overrides: Optional[dict] = None) -> dict:
     overrides = overrides or {}
@@ -162,7 +185,6 @@ def get_phase_settings(phase: str, overrides: Optional[dict] = None) -> dict:
             "train_free_decode_batches": 0,
             "val_free_decode_batches": 0,
         }
-        return settings
     elif phase == "B":
         settings = {
             "name": "B",
@@ -185,22 +207,28 @@ def get_phase_settings(phase: str, overrides: Optional[dict] = None) -> dict:
                 "repetition_penalty": float(STAGE2_PHASE_B_FREE_REPETITION_PENALTY),
                 "block_immediate_repeat": bool(STAGE2_PHASE_B_FREE_BLOCK_IMMEDIATE_REPEAT),
                 "min_steps": int(STAGE2_PHASE_B_FREE_MIN_STEPS),
+                "max_stall_steps": int(STAGE2_PHASE_B_FREE_MAX_STALL_STEPS),
+                "force_stop_at_last_pointer": True,
+                "force_stop_on_stall": bool(STAGE2_PHASE_B_FREE_FORCE_STOP_ON_STALL),
                 "require_stop_for_eos": False,
-                "stop_threshold": 0.0,
+                "stop_threshold": float(STAGE2_PHASE_B_FREE_STOP_THRESHOLD),
                 "eos_bonus_scale": 0.0,
-                "min_progress_for_eos": 0.0,
-                "min_coverage_for_eos": 0.0,
+                "min_progress_for_eos": float(STAGE2_PHASE_B_FREE_MIN_PROGRESS_FOR_EOS),
+                "min_coverage_for_eos": float(STAGE2_PHASE_B_FREE_MIN_COVERAGE_FOR_EOS),
                 "aux_bias_topk": 0,
             },
             "train_decode_constraints": {
                 "repetition_penalty": float(STAGE2_PHASE_B_TRAIN_FREE_REPETITION_PENALTY),
                 "block_immediate_repeat": bool(STAGE2_PHASE_B_TRAIN_FREE_BLOCK_IMMEDIATE_REPEAT),
                 "min_steps": int(STAGE2_PHASE_B_TRAIN_FREE_MIN_STEPS),
+                "max_stall_steps": int(STAGE2_PHASE_B_TRAIN_FREE_MAX_STALL_STEPS),
+                "force_stop_at_last_pointer": True,
+                "force_stop_on_stall": bool(STAGE2_PHASE_B_TRAIN_FREE_FORCE_STOP_ON_STALL),
                 "require_stop_for_eos": False,
-                "stop_threshold": 0.0,
+                "stop_threshold": float(STAGE2_PHASE_B_TRAIN_FREE_STOP_THRESHOLD),
                 "eos_bonus_scale": 0.0,
-                "min_progress_for_eos": 0.0,
-                "min_coverage_for_eos": 0.0,
+                "min_progress_for_eos": float(STAGE2_PHASE_B_TRAIN_FREE_MIN_PROGRESS_FOR_EOS),
+                "min_coverage_for_eos": float(STAGE2_PHASE_B_TRAIN_FREE_MIN_COVERAGE_FOR_EOS),
                 "aux_bias_topk": 0,
             },
             "free_prefix_every_n_steps": int(overrides.get("free_prefix_every_n_steps", STAGE2_FREE_PREFIX_EVERY_N_STEPS)),
@@ -227,6 +255,24 @@ def get_phase_settings(phase: str, overrides: Optional[dict] = None) -> dict:
         return settings
     else:
         raise ValueError(f"Unsupported phase '{phase}'. Use 'A' or 'B'.")
+    return settings
+
+
+def _strip_special_tokens(ids: list[int], pad_id: int, sos_id: int, eos_id: int) -> list[int]:
+    out: list[int] = []
+    for token_id in ids:
+        token_id = int(token_id)
+        if token_id in (pad_id, sos_id):
+            continue
+        if token_id == eos_id:
+            break
+        out.append(token_id)
+    return out
+    
+
+
+def _ids_to_text(ids: list[int], vocab: VocabManager) -> str:
+    return render_tokens(vocab.decode(ids, remove_special=True))
 
 def _select_active_aux_summary(
     aux_without_ctx: dict,
@@ -449,10 +495,10 @@ def build_stage2_model(
     overrides = overrides or {}
     vocab_size = vocab.vocab_size
 
-    det_score_thresh = float(overrides.get("det_score_thresh", STAGE2_DET_SCORE_THRESH))
-    det_top_k = int(overrides.get("det_top_k", STAGE2_DET_TOP_K))
-    det_nms_iou = float(overrides.get("det_nms_iou", STAGE2_DET_NMS_IOU))
-    det_min_box_size = float(overrides.get("det_min_box_size", STAGE2_DET_MIN_BOX_SIZE))
+    det_score_thresh = float(overrides.get("det_score_thresh", DET_SCORE_THRESH))
+    det_top_k = int(overrides.get("det_top_k", DET_TOP_K))
+    det_nms_iou = float(overrides.get("det_nms_iou", DET_NMS_IOU))
+    det_min_box_size = float(overrides.get("det_min_box_size", DET_MIN_BOX_SIZE))
 
     token_dim = int(overrides.get("token_dim", STAGE2_TOKEN_DIM))
     token_hidden_dim = int(overrides.get("token_hidden_dim", STAGE2_TOKEN_HIDDEN_DIM))
@@ -639,12 +685,23 @@ def validate_stage2(
             images=images,
             orientations=orientations,
         )
-        oracle_pointer_positions = build_decoder_roi_targets_monotonic(
-            target_tokens=dec_targets["target_tokens"],
-            target_mask=dec_targets["target_mask"],
-            enc_mask=encoded.get("context_mask", None),
-            eos_id=int(eos_id),
-        )
+        decoder_token_bias = encoded.get("decoder_token_bias", None)
+        if decoder_token_bias is not None:
+            oracle_pointer_positions = build_decoder_roi_targets_from_bias(
+                target_tokens=dec_targets["target_tokens"],
+                target_mask=dec_targets["target_mask"],
+                enc_mask=encoded.get("context_mask", None),
+                eos_id=int(eos_id),
+                encoder_token_bias=decoder_token_bias,
+                aux_weight=0.35,
+            )
+        else:
+            oracle_pointer_positions = build_decoder_roi_targets_monotonic(
+                target_tokens=dec_targets["target_tokens"],
+                target_mask=dec_targets["target_mask"],
+                enc_mask=encoded.get("context_mask", None),
+                eos_id=int(eos_id),
+            )
 
         outputs = model.decode_from_encoded(
             encoded,
@@ -802,6 +859,22 @@ def validate_stage2(
                 valid_mask_batch=free_decoded.get("valid_mask", None),
                 action_targets_batch=None,
             )
+            if bool(STAGE2_LOG_PREDICTIONS) and batch_idx == 0:
+                sample_limit = max(1, int(STAGE2_PREDICTION_SAMPLES))
+                pred_free = free_decoded["pred_ids"].detach().cpu()
+                pred_tf = pred_ids.detach().cpu() if pred_ids is not None else None
+                gt_ids = text_ids.detach().cpu()
+                for s in range(min(sample_limit, pred_free.size(0))):
+                    gt_list = _strip_special_tokens(gt_ids[s].tolist(), pad_id, sos_id, eos_id)
+                    free_list = _strip_special_tokens(pred_free[s].tolist(), pad_id, sos_id, eos_id)
+                    free_text = _ids_to_text(free_list, vocab)
+                    gt_text = _ids_to_text(gt_list, vocab)
+                    msg = f"[VAL PRED] sample={s} | FREE: {free_text} | GT: {gt_text}"
+                    if pred_tf is not None:
+                        tf_list = _strip_special_tokens(pred_tf[s].tolist(), pad_id, sos_id, eos_id)
+                        tf_text = _ids_to_text(tf_list, vocab)
+                        msg = f"[VAL PRED] sample={s} | TF: {tf_text} | FREE: {free_text} | GT: {gt_text}"
+                    print(msg)
         
     denom = max(1, n_batches)
     proposal_denom_images = max(1, proposal_stats["images"])
@@ -1001,6 +1074,8 @@ def train_stage2_hybrid(
         total_free_target_tokens = 0.0
         total_free_prefix_sequences = 0.0
         total_free_recovery_tokens = 0.0
+        total_free_align_ratio = 0.0
+        total_free_align_samples = 0.0
 
         train_proposal_stats = {
             "images": 0,
@@ -1031,6 +1106,8 @@ def train_stage2_hybrid(
         train_free_eval_batches = int(phase_settings.get("train_free_decode_batches", STAGE2_TRAIN_FREE_DECODE_BATCHES))
         free_prefix_every_n_steps = max(1, int(phase_settings.get("free_prefix_every_n_steps", STAGE2_FREE_PREFIX_EVERY_N_STEPS)))
         train_decoder_stats_every_n_steps = max(1, int(model_overrides.get("train_decoder_stats_every_n_steps", STAGE2_TRAIN_DECODER_STATS_EVERY_N_STEPS)))
+        train_decoder_stats_max_samples = int(model_overrides.get("train_decoder_stats_max_samples", STAGE2_TRAIN_DECODER_STATS_MAX_SAMPLES))
+        train_prop_stats_every_n_steps = max(1, int(model_overrides.get("train_prop_stats_every_n_steps", STAGE2_TRAIN_PROP_STATS_EVERY_N_STEPS)))
         train_free_diag_max_len = max(16, int(model_overrides.get("train_free_diag_max_len", STAGE2_TRAIN_FREE_DIAG_MAX_LEN)))
 
         pbar = tqdm(
@@ -1062,12 +1139,23 @@ def train_stage2_hybrid(
                     images=images,
                     orientations=orientations,
                 )
-                oracle_pointer_positions = build_decoder_roi_targets_monotonic(
-                    target_tokens=dec_targets["target_tokens"],
-                    target_mask=dec_targets["target_mask"],
-                    enc_mask=encoded.get("context_mask", None),
-                    eos_id=int(eos_id),
-                )
+                decoder_token_bias = encoded.get("decoder_token_bias", None)
+                if decoder_token_bias is not None:
+                    oracle_pointer_positions = build_decoder_roi_targets_from_bias(
+                        target_tokens=dec_targets["target_tokens"],
+                        target_mask=dec_targets["target_mask"],
+                        enc_mask=encoded.get("context_mask", None),
+                        eos_id=int(eos_id),
+                        encoder_token_bias=decoder_token_bias,
+                        aux_weight=0.35,
+                    )
+                else:
+                    oracle_pointer_positions = build_decoder_roi_targets_monotonic(
+                        target_tokens=dec_targets["target_tokens"],
+                        target_mask=dec_targets["target_mask"],
+                        enc_mask=encoded.get("context_mask", None),
+                        eos_id=int(eos_id),
+                    )
 
                 outputs = model.decode_from_encoded(
                     encoded,
@@ -1166,15 +1254,69 @@ def train_stage2_hybrid(
                     and (step % free_prefix_every_n_steps == 0)
                 ):
                     encoded_free = _detach_encoded_for_free_decode(encoded)
+                    free_targets = dec_targets
+                    free_encoded_for_decode = encoded_free
+                    free_input_seq = None
+                    free_teacher_prefix_steps = 0
+                    if bool(STAGE2_USE_CHUNKED_FREE_TRAINING):
+                        roi_targets_align = None
+                        align_ratio = None
+                        attn_for_alignment = outputs.get("attn_weights", None)
+                        if attn_for_alignment is not None:
+                            roi_targets_mono = build_decoder_roi_targets_monotonic(
+                                target_tokens=dec_targets["target_tokens"],
+                                target_mask=dec_targets["target_mask"],
+                                enc_mask=encoded_free.get("context_mask", None),
+                                eos_id=int(eos_id),
+                            )
+                            roi_targets_align = build_decoder_roi_targets_from_alignment(
+                                target_tokens=dec_targets["target_tokens"],
+                                target_mask=dec_targets["target_mask"],
+                                attn_weights=attn_for_alignment,
+                                enc_mask=encoded_free.get("context_mask", None),
+                                eos_id=int(eos_id),
+                                encoder_token_bias=encoded_free.get("decoder_token_bias", None),
+                                aux_weight=0.35,
+                            )
+                            valid_align = dec_targets["target_mask"].bool()
+                            if valid_align.any():
+                                align_ratio = (
+                                    roi_targets_align.ne(roi_targets_mono)[valid_align]
+                                    .float()
+                                    .mean()
+                                    .item()
+                                )
+                        chunk_free_batch = _prepare_chunked_free_training_batch(
+                            encoded_free,
+                            dec_targets,
+                            orientations,
+                            eos_id=int(eos_id),
+                            pad_id=int(vocab.pad_id),
+                            roi_targets=roi_targets_align,
+                        )
+                        if align_ratio is not None:
+                            total_free_align_ratio += float(align_ratio)
+                            total_free_align_samples += 1.0
+                        if chunk_free_batch is not None:
+                            free_encoded_for_decode = chunk_free_batch["encoded"]
+                            free_targets = {
+                                "target_tokens": chunk_free_batch["target_tokens"],
+                                "target_mask": chunk_free_batch["target_mask"],
+                            }
+                            free_input_seq = chunk_free_batch["decoder_inputs"]
+                            free_teacher_prefix_steps = int(STAGE2_FREE_TEACHER_PREFIX_STEPS)
+
                     free_outputs = model.decode_from_encoded(
-                        encoded_free,
+                        free_encoded_for_decode,
                         targets=None,
                         teacher_forcing_ratio=0.0,
-                        input_seq=None,
+                        teacher_prefix_steps=free_teacher_prefix_steps,
+                        input_seq=free_input_seq,
                         sos_id=sos_id,
                         eos_id=eos_id,
-                        max_len=int(dec_targets["target_tokens"].size(1)),
+                        max_len=int(free_targets["target_tokens"].size(1)),
                         decode_constraints=phase_settings.get("train_decode_constraints", phase_settings.get("decode_constraints")),
+                        force_full_rollout=True,
                     )
 
                     free_loss_dict = compute_free_decoder_prefix_losses(
@@ -1183,14 +1325,15 @@ def train_stage2_hybrid(
                         free_stop_logits=free_outputs.get("stop_logits", None),
                         free_action_logits=free_outputs.get("action_logits", None),
                         free_attn_weights=free_outputs.get("attn_weights", None),
-                        target_tokens=dec_targets["target_tokens"],
-                        target_mask=dec_targets["target_mask"],
+                        target_tokens=free_targets["target_tokens"],
+                        target_mask=free_targets["target_mask"],
                         enc_mask=free_outputs.get("context_mask", None),
                         encoder_token_bias=free_outputs.get("decoder_token_bias", None),
                         eos_id=int(eos_id),
                         label_smoothing=STAGE2_DECODER_LABEL_SMOOTHING,
                         eos_weight=decoder_eos_weight,
                         stop_pos_weight=STAGE2_DECODER_STOP_POS_WEIGHT,
+                        min_prefix_len=int(model_overrides.get("free_prefix_min_tokens", STAGE2_FREE_PREFIX_MIN_TOKENS)),
                         lambda_stop=lambda_stop,
                         lambda_action=float(model_overrides.get("lambda_action", STAGE2_LAMBDA_ACTION)),
                         action_aux_weight=0.35,
@@ -1210,7 +1353,13 @@ def train_stage2_hybrid(
                 free_stop_scale = float(phase_settings.get("free_stop_loss_scale", 1.0))
                 losses["loss_decoder_free"] = free_prefix_weight * free_loss_dict["loss_decoder_free"]
                 losses["loss_stop_free"] = free_prefix_weight * free_stop_scale * float(lambda_stop) * free_loss_dict["loss_stop_free"]
-                losses["loss_action_free"] = free_prefix_weight * float(model_overrides.get("lambda_action", STAGE2_LAMBDA_ACTION)) * free_loss_dict["loss_action_free"]
+                free_action_scale = float(model_overrides.get("lambda_action_free_scale", STAGE2_LAMBDA_ACTION_FREE_SCALE))
+                losses["loss_action_free"] = (
+                    free_prefix_weight
+                    * free_action_scale
+                    * float(model_overrides.get("lambda_action", STAGE2_LAMBDA_ACTION))
+                    * free_loss_dict["loss_action_free"]
+                )
                 losses["loss_total_free"] = (
                     losses["loss_decoder_free"]
                     + losses["loss_stop_free"]
@@ -1222,7 +1371,8 @@ def train_stage2_hybrid(
                 losses["loss_total"] = base_losses["loss_total"] + losses["loss_aux"] + losses["loss_total_free"]
                 train_action_alignment_mix = float(losses.get("action_alignment_mix", 0.0))
 
-                _update_refinement_epoch_stats(train_proposal_stats, outputs, refine_targets, gt_labels_list)
+                if (step % train_prop_stats_every_n_steps) == 0:
+                    _update_refinement_epoch_stats(train_proposal_stats, outputs, refine_targets, gt_labels_list)
 
                 loss = losses["loss_total"] / GRADIENT_ACCUMULATION_STEPS
 
@@ -1269,6 +1419,7 @@ def train_stage2_hybrid(
                     pointer_positions_batch=outputs.get("pointer_positions", None),
                     valid_mask_batch=dec_targets["target_mask"],
                     action_targets_batch=losses.get("action_targets", None),
+                    max_samples=train_decoder_stats_max_samples,
                 )
 
             should_log_train_free = (
@@ -1297,6 +1448,7 @@ def train_stage2_hybrid(
                         pointer_positions_batch=free_decoded.get("pointer_positions", None),
                         valid_mask_batch=free_decoded.get("valid_mask", None),
                         action_targets_batch=None,
+                        max_samples=train_decoder_stats_max_samples,
                     )
 
             total_loss += float(losses["loss_total"].item())
@@ -1385,6 +1537,7 @@ def train_stage2_hybrid(
             "train_free_prefix_ratio": total_free_prefix_tokens / max(1.0, total_free_target_tokens),
             "train_free_control_ratio": total_free_control_tokens / max(1.0, total_free_target_tokens),
             "train_free_recovery_ratio": total_free_recovery_tokens / max(1.0, total_free_target_tokens),
+            "train_free_align_ratio": total_free_align_ratio / max(1.0, total_free_align_samples),
             "decoder_summary": {
                 "teacher_forcing": _finalize_decoder_epoch_stats(decoder_stats_tf, vocab),
                 "free_decoding": _finalize_decoder_epoch_stats(decoder_stats_free, vocab),
@@ -1569,6 +1722,7 @@ def train_stage2_hybrid(
             f"prefix_len={train_metrics['train_free_prefix_len']:.2f}, "
             f"prefix_ratio={train_metrics['train_free_prefix_ratio']:.3f}, "
             f"rec_ratio={train_metrics['train_free_recovery_ratio']:.3f}, "
+            f"align_ratio={train_metrics['train_free_align_ratio']:.3f}, "
             f"action stay/adv/stop="
             f"{train_dec_free['action_pred_distribution']['fractions']['stay']:.2f}/"
             f"{train_dec_free['action_pred_distribution']['fractions']['advance']:.2f}/"
@@ -1717,7 +1871,7 @@ def main():
             f"  - {last_ckpt}"
         )
 
-    checkpoint_dir = CHECKPOINT_DIR / f"stage2_hybrid_phase_{selected_phase}"
+    checkpoint_dir = CHECKPOINT_DIR / f"stage2_hybrid_phase_changed_3_{selected_phase}"
     resume_model_ckpt = None
     if selected_phase == "B":
         print("Phase B selected: will attempt to resume from Phase A best checkpoint.")

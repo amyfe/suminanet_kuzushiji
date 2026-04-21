@@ -26,6 +26,10 @@ from config import (
     CHECKPOINT_DIR,
     DATA_DIR,
     DEVICE,
+    DET_MIN_BOX_SIZE,
+    DET_NMS_IOU,
+    DET_SCORE_THRESH,
+    DET_TOP_K,
     GRADIENT_ACCUMULATION_STEPS,
     IMAGE_SIZE,
     NUM_WORKERS,
@@ -288,6 +292,36 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
 
+    # Compute detection F1 on val set for recall-focused training mode.
+    # Uses fixed inference params so trials are comparable on the same metric.
+    if getattr(args, "optimize_f1", False):
+        unet.eval()
+        detector.eval()
+        all_gt_boxes: list = []
+        all_pred_boxes: list = []
+        with torch.no_grad():
+            for batch in val_loader:
+                images = batch["image"].to(DEVICE)
+                gt_boxes = batch["boxes"][0].cpu().numpy().tolist()
+                features = unet(images)
+                outputs = detector(features)
+                _, _, hf, wf = features.shape
+                pred_boxes, _, _ = extract_boxes_from_heatmap(
+                    heatmap_probs=torch.sigmoid(outputs["heatmap"]),
+                    bbox_reg=outputs["bbox"],
+                    confidence_thresh=DET_SCORE_THRESH,
+                    output_size=(hf, wf),
+                    image_size=IMAGE_SIZE,
+                    top_k=DET_TOP_K,
+                    nms_iou=DET_NMS_IOU,
+                    min_box_size=DET_MIN_BOX_SIZE,
+                    debug=False,
+                )
+                all_gt_boxes.append(gt_boxes)
+                all_pred_boxes.append(pred_boxes)
+        det_metrics = compute_detection_metrics(all_gt_boxes, all_pred_boxes, iou_threshold=0.5)
+        return float(det_metrics["f1"])
+
     if args.save_checkpoints:
         out_dir = Path(args.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -308,10 +342,12 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
 
 @torch.no_grad()
 def objective_validation(trial: optuna.Trial, args: argparse.Namespace) -> float:
-    confidence = trial.suggest_float("confidence", 0.2, 0.7)
-    top_k = trial.suggest_int("top_k", 200, 700, step=50)
-    nms_iou = trial.suggest_float("nms_iou", 0.2, 0.7)
-    min_box_size = trial.suggest_float("min_box_size", 2.0, 8.0)
+    # Extended ranges vs original: confidence down to 0.05 (was 0.2) to allow
+    # high-recall operation; top_k up to 1500 (was 700) to match det_top_k=896+.
+    confidence = trial.suggest_float("confidence", 0.05, 0.50)
+    top_k = trial.suggest_int("top_k", 300, 1500, step=100)
+    nms_iou = trial.suggest_float("nms_iou", 0.30, 0.70)
+    min_box_size = trial.suggest_float("min_box_size", 1.0, 6.0)
 
     ann_files = sorted(list((Path(DATA_DIR) / "annotations").glob("*.json")))
     if not ann_files:
@@ -434,6 +470,8 @@ def parse_args() -> argparse.Namespace:
         default=str(CHECKPOINT_DIR / "stage1_detection" / "detector_best.pt"),
         help="Detector checkpoint path (used in --mode val)",
     )
+    parser.add_argument("--optimize-f1", action="store_true",
+                        help="train mode: maximize detection F1 instead of minimizing val_loss (recall-focused)")
     parser.add_argument("--val-split", type=str, default="val", choices=["train", "val"], help="Validation split for --mode val")
     parser.add_argument("--val-num-samples", type=int, default=0, help="0 => full split in --mode val")
     parser.add_argument("--val-iou-thr", type=float, default=0.5, help="IoU threshold for TP/FP/FN in --mode val")
@@ -474,7 +512,7 @@ def main() -> None:
                 study_name=args.study_name,
                 storage=args.storage,
                 load_if_exists=True,
-                direction="maximize" if args.mode == "val" else "minimize",
+                direction="maximize" if (args.mode == "val" or getattr(args, "optimize_f1", False)) else "minimize",
                 sampler=sampler,
                 pruner=pruner,
             )

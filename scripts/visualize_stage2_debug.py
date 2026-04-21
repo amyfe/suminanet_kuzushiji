@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 import torch
 
-from config import CHECKPOINT_DIR, DATA_DIR, DEVICE, IMAGE_SIZE, STAGE2_CONTEXT_HIDDEN_DIM, STAGE2_DECODER_EMBED_DIM, STAGE2_DECODER_HIDDEN_DIM, STAGE2_DET_NMS_IOU, STAGE2_DET_SCORE_THRESH, STAGE2_DET_TOP_K, STAGE2_DROPOUT_RATE, STAGE2_PROJ_DIM, STAGE2_REFINE_HIDDEN_DIM, STAGE2_ROI_FEAT_DIM, STAGE2_ROI_SIZE, STAGE2_TOKEN_DIM, STAGE2_USE_AUX_HEAD
+from config import CHECKPOINT_DIR, DATA_DIR, DEVICE, IMAGE_SIZE, STAGE2_CONTEXT_HIDDEN_DIM, STAGE2_DECODER_EMBED_DIM, STAGE2_DECODER_HIDDEN_DIM, DET_NMS_IOU, DET_SCORE_THRESH, DET_TOP_K, STAGE2_DROPOUT_RATE, STAGE2_PROJ_DIM, STAGE2_REFINE_HIDDEN_DIM, STAGE2_ROI_FEAT_DIM, STAGE2_ROI_SIZE, STAGE2_TOKEN_DIM, STAGE2_USE_AUX_HEAD
 from model.kuronet import UNet, DetectorHead
 from model.kuronet.hybrid_recognizer import HybridKuroNetRecognizer
 from utils import KuzushijiDataset
@@ -107,9 +107,9 @@ def build_stage2_model(detector_ckpt_path: Path, vocab: VocabManager) -> HybridK
         context_hidden_dim=STAGE2_CONTEXT_HIDDEN_DIM,
         decoder_embed_dim=STAGE2_DECODER_EMBED_DIM,
         decoder_hidden_dim=STAGE2_DECODER_HIDDEN_DIM,
-        det_score_thresh=STAGE2_DET_SCORE_THRESH,
-        det_top_k=STAGE2_DET_TOP_K,
-        det_nms_iou=STAGE2_DET_NMS_IOU,
+        det_score_thresh=DET_SCORE_THRESH,
+        det_top_k=DET_TOP_K,
+        det_nms_iou=DET_NMS_IOU,
         use_aux_head=STAGE2_USE_AUX_HEAD,
         dropout=STAGE2_DROPOUT_RATE,
     ).to(DEVICE)
