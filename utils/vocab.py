@@ -11,6 +11,7 @@ class VocabManager:
     SOS_TOKEN = '<SOS>'
     EOS_TOKEN = '<EOS>'
     UNK_TOKEN = '<UNK>'
+    BG_TOKEN  = '<BG>'     # background: FP proposals trained to predict this
     
     def __init__(self, char2id: Optional[Dict[str, int]] = None):
         """Initialize vocab. If char2id not provided, starts with just special tokens."""
@@ -42,6 +43,10 @@ class VocabManager:
     @property
     def unk_id(self) -> int:
         return self.char2id[self.UNK_TOKEN]
+
+    @property
+    def bg_id(self) -> int:
+        return self.char2id[self.BG_TOKEN]
     
     @property
     def vocab_size(self) -> int:
@@ -68,6 +73,8 @@ class VocabManager:
     def decode(self, ids: List[int], remove_special: bool = True) -> List[str]:
         """Decode IDs to characters, optionally removing special tokens."""
         special_ids = {self.pad_id, self.sos_id, self.eos_id}
+        if remove_special and self.BG_TOKEN in self.char2id:
+            special_ids.add(self.bg_id)
         chars = []
         for id_ in ids:
             if remove_special and id_ in special_ids:
@@ -90,7 +97,10 @@ class VocabManager:
         # Add all characters in sorted order for reproducibility
         for char in sorted(unique_chars):
             vocab.add_char(char)
-        
+
+        # BG token is always appended last so regular char IDs are stable
+        vocab.add_char(cls.BG_TOKEN)
+
         return vocab
     
     def save(self, path: Path):

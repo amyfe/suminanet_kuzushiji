@@ -93,10 +93,10 @@ class ROITokenProjector(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout),
             )
-            fuse_in_dim = roi_feat_dim + roi_feat_dim + hidden_dim + hidden_dim
+            fuse_in_dim = roi_feat_dim + hidden_dim + hidden_dim
         else:
             self.score_proj = None
-            fuse_in_dim = roi_feat_dim + roi_feat_dim + hidden_dim
+            fuse_in_dim = roi_feat_dim + hidden_dim
 
         self.fuse = nn.Sequential(
             nn.Linear(fuse_in_dim, hidden_dim),
@@ -113,8 +113,12 @@ class ROITokenProjector(nn.Module):
     @staticmethod
     def _boxes_to_geom(boxes: torch.Tensor, image_size: tuple[int, int]) -> torch.Tensor:
         """
-        Convert xyxy boxes into normalized geometry features:
-            [cx, cy, bw, bh]
+        Convert xyxy boxes into geometry features: [cx, cy, log(bw), log(bh)].
+
+        Log-space for width/height: at 256×256 a typical 10px character gives
+        bw≈0.04 in linear space vs log(0.04)≈-3.2 in log space.  The larger
+        magnitude gives geom_proj a clearer gradient signal to distinguish
+        small (furigana/dakuten) from large characters.
         """
         h_img, w_img = image_size
 
@@ -128,29 +132,20 @@ class ROITokenProjector(nn.Module):
         bw = (x2 - x1).clamp_min(1e-6) / max(float(w_img), 1.0)
         bh = (y2 - y1).clamp_min(1e-6) / max(float(h_img), 1.0)
 
-        return torch.stack([cx, cy, bw, bh], dim=-1)
+        return torch.stack([cx, cy, bw.log(), bh.log()], dim=-1)
 
     def forward(
         self,
-        roi_feats: torch.Tensor,       # (B, T, D_feat)
-        refined_feats: torch.Tensor,   # (B, T, D_feat)
+        refined_feats: torch.Tensor,   # (B, T, D_feat)  residual-enhanced ROI features
         refined_boxes: torch.Tensor,   # (B, T, 4)
         refine_scores: torch.Tensor,   # (B, T)
         roi_mask: torch.Tensor,        # (B, T)
         image_size: tuple[int, int],
+        roi_feats: torch.Tensor | None = None,  # unused, kept for API compatibility
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if roi_feats.dim() != 3:
-            raise ValueError(
-                f"roi_feats must have shape (B, T, D), got {tuple(roi_feats.shape)}"
-            )
         if refined_feats.dim() != 3:
             raise ValueError(
                 f"refined_feats must have shape (B, T, D), got {tuple(refined_feats.shape)}"
-            )
-        if roi_feats.shape[:2] != refined_feats.shape[:2]:
-            raise ValueError(
-                f"roi_feats and refined_feats must agree on batch/time dimensions, got "
-                f"{tuple(roi_feats.shape[:2])} vs {tuple(refined_feats.shape[:2])}"
             )
         if refined_boxes.dim() != 3 or refined_boxes.size(-1) != 4:
             raise ValueError(
@@ -174,9 +169,9 @@ class ROITokenProjector(nn.Module):
             if score_proj is None:
                 raise RuntimeError("score_proj is unavailable although use_score_branch=True.")
             score_feat = score_proj(score_prob)
-            fused_in = torch.cat([roi_feats, refined_feats, geom_feat, score_feat], dim=-1)
+            fused_in = torch.cat([refined_feats, geom_feat, score_feat], dim=-1)
         else:
-            fused_in = torch.cat([roi_feats, refined_feats, geom_feat], dim=-1)
+            fused_in = torch.cat([refined_feats, geom_feat], dim=-1)
 
         token_feats = self.fuse(fused_in)
         token_feats = token_feats * roi_mask.unsqueeze(-1).to(token_feats.dtype)

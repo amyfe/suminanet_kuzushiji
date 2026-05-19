@@ -52,6 +52,8 @@ import torch
 import torch.nn.functional as F
 from torchvision.ops import nms
 
+from utils.detection_utils import spatial_density_filter_torch
+
 
 def clip_boxes_to_image(
     boxes: torch.Tensor,  # (N, 4)
@@ -168,14 +170,26 @@ def _topk_candidates_per_image(
     """
     Select raw top-k detector candidates for one image.
 
+    Only local maxima (3×3 neighbourhood) are considered so that each character
+    centre contributes at most one proposal before NMS.  Without this filter,
+    every cell above the threshold fires → many duplicates per character →
+    aggressive NMS suppresses neighbouring characters → lower recall.
+
     Returns:
         cand_boxes:  (N, 4)
         cand_scores: (N,)
     """
-    flat_scores = scores_i.reshape(-1)
-    flat_boxes = boxes_i.reshape(-1, 4)
+    # local-maxima mask: keep only cells that are the max in their 3×3 patch
+    pooled = F.max_pool2d(
+        scores_i[None, None], kernel_size=3, stride=1, padding=1
+    ).squeeze(0).squeeze(0)  # (Hf, Wf)
+    peak_mask = (scores_i == pooled) & (scores_i >= float(score_thresh))
 
-    keep = flat_scores >= float(score_thresh)
+    flat_scores = scores_i.reshape(-1)
+    flat_boxes  = boxes_i.reshape(-1, 4)
+    flat_peaks  = peak_mask.reshape(-1)
+
+    keep = flat_peaks
     if keep.sum() == 0:
         return (
             flat_boxes.new_zeros((0, 4)),
@@ -183,11 +197,11 @@ def _topk_candidates_per_image(
         )
 
     sel_scores = flat_scores[keep]
-    sel_boxes = flat_boxes[keep]
+    sel_boxes  = flat_boxes[keep]
 
     if sel_scores.numel() > top_k:
         topk_scores, topk_idx = torch.topk(sel_scores, k=top_k, largest=True, sorted=True)
-        sel_boxes = sel_boxes[topk_idx]
+        sel_boxes  = sel_boxes[topk_idx]
         sel_scores = topk_scores
 
     return sel_boxes, sel_scores
@@ -201,6 +215,9 @@ def extract_coarse_proposals(
     top_k: int = 256,
     nms_iou: float = 0.5,
     min_size: float = 1.0,
+    density_grid: int = 8,
+    density_factor: float = 3.0,
+    avg_gt_per_image: int = 236,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """
     Convert detector outputs into coarse ROI proposals.
@@ -239,6 +256,14 @@ def extract_coarse_proposals(
         keep = nms(cand_boxes, cand_scores, iou_threshold=nms_iou)
         cand_boxes = cand_boxes[keep]
         cand_scores = cand_scores[keep]
+
+        # Suppress illustration FPs: cap proposals per spatial grid cell
+        cand_boxes, cand_scores = spatial_density_filter_torch(
+            cand_boxes, cand_scores, image_size,
+            grid_size=density_grid,
+            density_factor=density_factor,
+            avg_gt_per_image=avg_gt_per_image,
+        )
 
         proposal_boxes_list.append(cand_boxes)
         proposal_scores_list.append(cand_scores)

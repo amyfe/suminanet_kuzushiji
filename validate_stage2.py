@@ -26,7 +26,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from config import CHECKPOINT_DIR, DATA_DIR, DEVICE, IMAGE_SIZE
-from train_stage2 import (
+from train_stage2_warmup import (
     build_stage2_dataloaders,
     build_stage2_model,
     load_vocab,

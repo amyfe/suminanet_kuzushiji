@@ -1,5 +1,6 @@
 """Helper functions for detection training."""
 import math
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision.ops import roi_align
@@ -12,8 +13,10 @@ def build_detection_targets(
     output_size,
     image_size,
     device,
-    sigma=1.0,          
-    bbox_radius=0,          # 0 = only center cell (most stable)
+    sigma=1.0,
+    sigma_floor=1.5,    # raised from 0.5 — ensures small chars get learnable targets
+    sigma_ceil=3.0,     # raised from 2.0 — gives large chars proportional coverage
+    bbox_radius=0,      # 0 = only center cell (most stable)
     heatmap_min=1e-6):
     """
     Build detection targets (heatmap, bbox regression, class) from ground truth boxes.
@@ -73,8 +76,7 @@ def build_detection_targets(
             dx = cx - float(ix)
             dy = cy - float(iy)
 
-            # Use sqrt(area) so thin chars like ー (15×3) get sigma≈1.7 instead of 0.98
-            gaussian_sigma = min(2.0, max(0.5, sigma * math.sqrt(bw * bh) * 0.20))
+            gaussian_sigma = min(sigma_ceil, max(sigma_floor, sigma * math.sqrt(bw * bh) * 0.20))
             yy = torch.arange(0, H_out, device=device).view(H_out, 1).float()
             xx = torch.arange(0, W_out, device=device).view(1, W_out).float()
             g = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * gaussian_sigma ** 2))
@@ -100,6 +102,90 @@ def build_detection_targets(
             gt_cls[i, iy, ix] = int(label.item())
     gt_heatmap = gt_heatmap.clamp(min=heatmap_min, max=1.0)
     return gt_heatmap, gt_bbox, gt_bbox_mask, gt_cls
+
+
+def spatial_density_filter(boxes, scores, image_size,
+                           grid_size=8, density_factor=3.0,
+                           avg_gt_per_image=236):
+    """Suppress proposals from over-dense grid cells to remove illustration FPs.
+
+    Divides the image into grid_size×grid_size cells and caps each cell at
+    floor(density_factor × expected_chars_per_cell) proposals (keeping the
+    highest-scoring ones).  Cells with brushstroke / illustration activations
+    routinely exceed this cap; genuine text columns do not.
+
+    Works on numpy arrays or plain Python lists; returns the same types.
+    """
+    if len(boxes) == 0:
+        return boxes, scores
+
+    boxes_arr  = np.asarray(boxes,  dtype=np.float32)
+    scores_arr = np.asarray(scores, dtype=np.float32)
+
+    H, W = image_size
+    cell_h = H / grid_size
+    cell_w = W / grid_size
+
+    expected_per_cell = avg_gt_per_image / (grid_size * grid_size)
+    max_per_cell = max(5, int(expected_per_cell * density_factor))
+
+    cx = 0.5 * (boxes_arr[:, 0] + boxes_arr[:, 2])
+    cy = 0.5 * (boxes_arr[:, 1] + boxes_arr[:, 3])
+    ci = np.clip((cy / cell_h).astype(int), 0, grid_size - 1)
+    cj = np.clip((cx / cell_w).astype(int), 0, grid_size - 1)
+    cell_keys = ci * grid_size + cj
+
+    # Process in score-descending order so we keep the most confident predictions
+    order = np.argsort(scores_arr)[::-1]
+    cell_counts: dict[int, int] = {}
+    keep = []
+    for i in order:
+        c = int(cell_keys[i])
+        cnt = cell_counts.get(c, 0)
+        if cnt < max_per_cell:
+            keep.append(int(i))
+            cell_counts[c] = cnt + 1
+
+    keep = np.array(keep, dtype=np.int64)
+    filtered_boxes  = boxes_arr[keep].tolist()
+    filtered_scores = scores_arr[keep].tolist()
+    return filtered_boxes, filtered_scores
+
+
+def spatial_density_filter_torch(boxes, scores, image_size,
+                                  grid_size=8, density_factor=3.0,
+                                  avg_gt_per_image=236):
+    """Torch-tensor version of spatial_density_filter for use inside model forward passes."""
+    if boxes.numel() == 0:
+        return boxes, scores
+
+    H, W = image_size
+    cell_h = H / grid_size
+    cell_w = W / grid_size
+
+    expected_per_cell = avg_gt_per_image / (grid_size * grid_size)
+    max_per_cell = max(5, int(expected_per_cell * density_factor))
+
+    cx = 0.5 * (boxes[:, 0] + boxes[:, 2])
+    cy = 0.5 * (boxes[:, 1] + boxes[:, 3])
+    ci = (cy / cell_h).long().clamp(0, grid_size - 1)
+    cj = (cx / cell_w).long().clamp(0, grid_size - 1)
+    cell_keys = ci * grid_size + cj
+
+    order = torch.argsort(scores, descending=True)
+    cell_counts: dict[int, int] = {}
+    keep = []
+    for idx in order.tolist():
+        c = int(cell_keys[idx].item())
+        cnt = cell_counts.get(c, 0)
+        if cnt < max_per_cell:
+            keep.append(idx)
+            cell_counts[c] = cnt + 1
+
+    if not keep:
+        return boxes[:0], scores[:0]
+    keep_t = torch.tensor(keep, device=boxes.device, dtype=torch.long)
+    return boxes[keep_t], scores[keep_t]
 
 
 def compute_detection_losses(pred, gt_heatmap, gt_bbox, gt_bbox_mask,gt_cls, weights=(1.0, 1.0, 1.0), use_focal_loss=True):

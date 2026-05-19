@@ -23,7 +23,7 @@ später optional Transformer testen
 
 from __future__ import annotations
 
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -81,6 +81,13 @@ class ROIContextEncoder(nn.Module):
 
         self.input_proj = None
 
+        # Explicit spatial bias: projects normalized (cx, cy) into token space
+        # and adds it to the sequence before the GRU. This gives the recurrent
+        # model a stable positional signal independent of reading-order index,
+        # which helps disambiguate characters with similar visual appearance
+        # that occur at different page positions (e.g. top vs. bottom of column).
+        self.pos_proj = nn.Linear(2, in_dim)
+
         self.rnn = nn.GRU(
             input_size=in_dim,
             hidden_size=hidden_dim,
@@ -113,8 +120,10 @@ class ROIContextEncoder(nn.Module):
 
     def forward(
         self,
-        seq: torch.Tensor,   # (B, T, D_in)
-        mask: torch.Tensor,  # (B, T) bool
+        seq: torch.Tensor,                             # (B, T, D_in)
+        mask: torch.Tensor,                            # (B, T) bool
+        spatial_coords: Optional[torch.Tensor] = None, # (B, T, 2) normalized (cx, cy)
+        refine_scores: Optional[torch.Tensor] = None,  # (B, T) logits from ROIRefinementHead
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if seq.dim() != 3:
             raise ValueError(f"seq must have shape (B, T, D), got {tuple(seq.shape)}")
@@ -129,6 +138,16 @@ class ROIContextEncoder(nn.Module):
             seq_in = self.input_proj(seq)
         else:
             seq_in = seq
+
+        if spatial_coords is not None:
+            seq_in = seq_in + self.pos_proj(spatial_coords)
+
+        # Soft-gate token embeddings by detection confidence before the GRU.
+        # FP proposals get near-zero weight so they don't corrupt the recurrent state.
+        # The gate is differentiable: gradients flow back to improve refine_scores.
+        if refine_scores is not None:
+            gate = torch.sigmoid(refine_scores).unsqueeze(-1)  # (B, T, 1)
+            seq_in = seq_in * gate
 
         lengths = self._safe_lengths_from_mask(mask)
 

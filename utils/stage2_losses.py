@@ -166,6 +166,60 @@ def aux_classification_loss(
     return F.cross_entropy(logits_valid, labels_valid, reduction="mean")
 
 
+def focal_classification_loss(
+    aux_logits: Optional[torch.Tensor],  # (B, T, V) or None
+    target_labels: torch.Tensor,         # (B, T), -1 for invalid/ignore
+    pos_mask: torch.Tensor,              # (B, T)
+    gamma: float = 2.0,
+    ignore_index: int = -1,
+) -> torch.Tensor:
+    """
+    Focal-loss variant of aux_classification_loss.
+
+    Down-weights easy/common examples so rare Kuzushiji characters receive
+    proportionally larger gradient signal.  The focal weight (1-p_t)^gamma is
+    detached so gradients flow only through the cross-entropy term.
+
+    gamma=0 recovers plain cross-entropy; gamma=2 is the standard choice.
+    """
+    if aux_logits is None:
+        return torch.tensor(0.0, device=target_labels.device)
+
+    valid_mask = pos_mask & target_labels.ne(ignore_index)
+    if valid_mask.sum() == 0:
+        return aux_logits.new_tensor(0.0)
+
+    logits_valid = aux_logits[valid_mask]     # (N_pos, V)
+    labels_valid = target_labels[valid_mask]  # (N_pos,)
+
+    ce = F.cross_entropy(logits_valid, labels_valid, reduction="none")  # (N_pos,)
+    p_t = torch.exp(-ce.detach())                                        # (N_pos,)
+    focal_weight = (1.0 - p_t) ** gamma
+    return (focal_weight * ce).mean()
+
+
+def background_classification_loss(
+    char_logits: torch.Tensor,  # (B, T, V)  — V includes BG as last class
+    neg_mask: torch.Tensor,     # (B, T) bool — negative (FP) ROIs
+    bg_id: int,
+) -> torch.Tensor:
+    """Train FP proposals to predict the background class.
+
+    Negative ROIs have no GT character match.  Training the classifier to output
+    the <BG> class for them (rather than a spurious high-frequency character) reduces
+    insertion errors in the assembled transcription and gives the BiGRU context
+    encoder a meaningful supervised signal on every ROI, not just positives.
+    """
+    if not neg_mask.any():
+        return char_logits.new_tensor(0.0)
+    logits_neg = char_logits[neg_mask]           # (N_neg, V)
+    targets = torch.full(
+        (logits_neg.size(0),), bg_id,
+        dtype=torch.long, device=char_logits.device,
+    )
+    return F.cross_entropy(logits_neg, targets, reduction="mean")
+
+
 def decoder_cross_entropy_loss(
     decoder_logits: torch.Tensor,   # (B, T_dec, V)
     target_tokens: torch.Tensor,    # (B, T_dec)

@@ -1,6 +1,10 @@
 import json
+import random
+from collections import defaultdict
 from pathlib import Path
+from typing import Dict, FrozenSet, List, Optional
 from PIL import Image
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
@@ -12,9 +16,9 @@ from model.kuronet.roi.roi_ordering import infer_reading_orientation_from_boxes,
 class KuzushijiDataset(Dataset):
     """
     Kuzushiji OCR Dataset.
-    
+
     Erwartete Struktur:
-    
+
     root/
         100241706/
             images/*.jpg
@@ -22,7 +26,8 @@ class KuzushijiDataset(Dataset):
         splits/train.txt  (optional)
             splits/val.txt    (optional)
     """
-    def __init__(self, root_dir, vocab=None, use_sequences=True, transform=None, resize=None, split=None):
+    def __init__(self, root_dir, vocab=None, use_sequences=True, transform=None, resize=None,
+                 split=None, rare_chars: Optional[FrozenSet[str]] = None):
         """
         Args:
             root_dir: Path to data directory
@@ -31,6 +36,9 @@ class KuzushijiDataset(Dataset):
             transform: Image transforms (None for default based on split)
             resize: Target image size (height, width). Defaults to config.IMAGE_SIZE when None.
             split: 'train', 'val', or None (use all data)
+            rare_chars: Optional frozenset of character labels considered rare.
+                        When set and the image contains ≥1 rare character, a stronger
+                        augmentation transform is applied (Option A).
         """
         self.root_dir = Path(root_dir)
         self.annotations_dir = self.root_dir / "annotations"
@@ -38,25 +46,35 @@ class KuzushijiDataset(Dataset):
         self.use_sequences = use_sequences
         self.vocab = vocab
         self.split = split
+        self.rare_chars = rare_chars  # frozenset[str] or None
 
         if transform is None:
             # Separate transforms for train vs val: validation should NOT have augmentation
             if split == 'train':
-                # Training: use augmentation
                 self.transform = T.Compose([
                     T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-                    # T.RandomAffine(degrees=2, translate=(0.05, 0.05), scale=(0.95, 1.05)), boxes not tranformed yet
                     T.ToTensor(),
                     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
                 ])
             else:
-                # Validation/test: no augmentation, only normalize
                 self.transform = T.Compose([
                     T.ToTensor(),
                     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
                 ])
         else:
             self.transform = transform
+
+        # Stronger pixel-level augmentation for images containing rare characters (Option A).
+        # Only active when rare_chars is provided and split == 'train'.
+        if rare_chars and split == 'train':
+            from utils.char_augmentation import build_rare_char_transform
+            self.rare_transform: Optional[T.Compose] = build_rare_char_transform()
+        else:
+            self.rare_transform = None
+
+        # Copy-paste crop database — built after self.items is populated below.
+        # Set to None here; assigned in _build_copy_paste_db() called at the end of __init__.
+        self.copy_paste_db: Optional[Dict[str, List[np.ndarray]]] = None
 
         # ---------------------------
         # Sammle alle Annotationen
@@ -101,6 +119,79 @@ class KuzushijiDataset(Dataset):
                 "img_path": self.root_dir / img_path
             })
 
+        # Option C: build copy-paste crop database (train only, requires cv2).
+        if rare_chars and split == 'train':
+            self.copy_paste_db = self._build_copy_paste_db(rare_chars, max_per_char=100)
+
+    def _build_copy_paste_db(
+        self,
+        rare_chars: FrozenSet[str],
+        max_per_char: int = 100,
+    ) -> Optional[Dict[str, List[np.ndarray]]]:
+        """
+        Build a per-character crop database at target resolution for copy-paste augmentation.
+
+        Crops are extracted at the same scale as the resized training images so they
+        can be pasted directly without further scaling. Only images containing at least
+        one rare character are loaded, keeping init time low.
+
+        Returns None if cv2 is not available.
+        """
+        try:
+            import cv2
+        except ImportError:
+            return None
+
+        db: Dict[str, List[np.ndarray]] = defaultdict(list)
+        new_w, new_h = self.resize_to
+
+        for item in self.items:
+            ann = item["ann"]
+            labels = ann.get("labels", [])
+            boxes = ann.get("boxes", [])
+
+            if not any(lbl in rare_chars for lbl in labels):
+                continue
+
+            try:
+                img_pil = Image.open(item["img_path"]).convert("RGB")
+            except Exception:
+                continue
+
+            orig_w, orig_h = img_pil.size
+            if (orig_w, orig_h) != (new_w, new_h):
+                img_pil = img_pil.resize((new_w, new_h), Image.Resampling.BILINEAR)
+                sx = new_w / orig_w
+                sy = new_h / orig_h
+                boxes_sc = [[x1 * sx, y1 * sy, x2 * sx, y2 * sy] for (x1, y1, x2, y2) in boxes]
+            else:
+                boxes_sc = list(boxes)
+
+            # PIL RGB → numpy BGR (cv2 convention used by copy_paste_rare_chars)
+            img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+            for lbl, box in zip(labels, boxes_sc):
+                if lbl not in rare_chars:
+                    continue
+                if len(db[lbl]) >= max_per_char:
+                    continue
+                x1, y1, x2, y2 = (int(round(v)) for v in box)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(new_w, x2), min(new_h, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                db[lbl].append(img_bgr[y1:y2, x1:x2].copy())
+
+        if not db:
+            return None
+
+        result = dict(db)
+        print(
+            f"[augmentation] copy-paste db: {len(result)} rare chars, "
+            f"{sum(len(v) for v in result.values())} total crops"
+        )
+        return result
+
     def __len__(self):
         return len(self.items)
 
@@ -144,13 +235,40 @@ class KuzushijiDataset(Dataset):
             boxes = [boxes[i] for i in sorted_indices]
             labels = [labels[i] for i in sorted_indices]
 
+        # Option C: copy-paste rare character crops (40% of training steps).
+        # Applied on the resized PIL image before the tensor transform so that
+        # crops are at the correct 512×512 scale. New boxes are appended in-place;
+        # IoU-based GT matching in the loss is order-independent so no re-sort needed.
+        if self.copy_paste_db is not None and random.random() < 0.4:
+            try:
+                import cv2
+                from utils.char_augmentation import copy_paste_rare_chars
+                img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                img_bgr, boxes, labels = copy_paste_rare_chars(
+                    image=img_bgr,
+                    boxes=boxes,
+                    labels=labels,
+                    crop_db=self.copy_paste_db,
+                    rare_chars=self.rare_chars,
+                    n_paste=2,
+                )
+                image = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            except Exception:
+                pass  # never break training due to augmentation failure
+
         # Convert to tensors
         boxes = torch.tensor(boxes, dtype=torch.float32)
         label_ids = None
         if self.vocab is not None:
             label_ids = [self.vocab.char2id.get(l, self.vocab.unk_id) for l in labels]
 
-        image = self.transform(image)
+        # Option A: apply stronger augmentation if image contains a rare character
+        if self.rare_transform is not None and self.rare_chars and any(
+            lbl in self.rare_chars for lbl in labels
+        ):
+            image = self.rare_transform(image)
+        else:
+            image = self.transform(image)
 
         sample = {
             "image": image,

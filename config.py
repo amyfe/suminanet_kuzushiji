@@ -33,7 +33,7 @@ EXCLUDE_BOOKS = {
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
 
-IMAGE_SIZE = (256, 256)
+IMAGE_SIZE = (512, 512)
 
 USE_MIXED_PRECISION = True
 NUM_WORKERS = 4
@@ -42,7 +42,7 @@ BATCH_SIZE = 2
 GRADIENT_ACCUMULATION_STEPS = 4
 GRAD_CLIP = 1.0
 
-NUM_EPOCHS = 15
+NUM_EPOCHS = 20
 
 
 # ============================================================
@@ -59,6 +59,16 @@ WEIGHT_DECAY = 9.431774935513243e-5
 
 IN_CHANNELS = 3
 BASE_FEATURES = 32
+
+# Backbone selection.
+# 'unet'            -- UNet from scratch (no pretrained weights)
+# 'efficientnet_b2' -- EfficientNet-B2 + FPN decoder, ImageNet pretrained,
+#                      outputs at stride=2 (H//2, W//2). Requires timm.
+BACKBONE_TYPE = "unet"
+
+# Output channel count for both backbone types.
+# Changing this requires Stage 1 retraining.
+BACKBONE_BASE_FEATURES = 64
 
 # Upper bound / placeholder only.
 # Real vocabulary size is created dynamically from annotations.
@@ -82,6 +92,20 @@ STAGE1_HEATMAP_SIGMA = 0.7249217915919892         # re-tune via train_f1 Optuna;
 STAGE1_FOCAL_POS_THRESHOLD = 0.3      # pixels with Gaussian target >= this treated as positives (was 0.5)
 
 STAGE1_EARLY_STOPPING_PATIENCE = 0   # 0 = disabled
+
+# Gaussian sigma bounds for heatmap targets.
+# Floor raised from 0.5 → 1.5 so small chars (area < ~100px²) get a learnable
+# positive region rather than a near-single-pixel spike.
+# Ceil raised from 2.0 → 3.0 to give large chars proportionally wider coverage.
+STAGE1_SIGMA_FLOOR = 1.5
+STAGE1_SIGMA_CEIL  = 3.0
+
+# Spatial density filter — suppresses illustration FPs in the proposal set.
+# The image is divided into GRID×GRID cells; any cell with more than
+# DENSITY_FACTOR × (AVG_GT / GRID²) predictions is trimmed to that cap.
+STAGE1_DENSITY_GRID          = 8     # cells per side (32×32 px per cell at 256×256)
+STAGE1_DENSITY_FACTOR        = 3.0   # allowed = factor × expected chars/cell
+STAGE1_AVG_GT_PER_IMAGE      = 236   # from training stats (used to set expected density)
 
 #  {'lr': 0.0019040586163242641, 
 #  'weight_decay': 7.610321317306418e-06, 
@@ -108,10 +132,10 @@ STAGE2_DROPOUT_RATE = 0.15
 # Detector -> Proposal stage
 # -------------------------
 
-DET_SCORE_THRESH = 0.051290347220558016
-DET_TOP_K = 1200
-DET_NMS_IOU = 0.5920639234211412
-DET_MIN_BOX_SIZE = 1.8012387816266866
+DET_SCORE_THRESH = 0.65
+DET_TOP_K = 500
+DET_NMS_IOU = 0.6
+DET_MIN_BOX_SIZE = 2.0
 
 # -------------------------
 # Shared feature projection
@@ -124,7 +148,7 @@ STAGE2_PROJ_DROPOUT = 0.10
 # ROI pooling
 # -------------------------
 
-STAGE2_ROI_SIZE = (8, 8)
+STAGE2_ROI_SIZE = (12, 12)   # matched to KURONET_ROI_SIZE for warmup weight transfer
 STAGE2_ROI_FEAT_DIM = 384
 STAGE2_ROI_POOL_DROPOUT = 0.10
 
@@ -168,32 +192,14 @@ STAGE2_DECODER_EMBED_DIM = 128
 STAGE2_DECODER_HIDDEN_DIM = 256
 STAGE2_DECODER_NUM_LAYERS = 1
 STAGE2_DECODER_DROPOUT = 0.10
-STAGE2_DECODER_LABEL_SMOOTHING = 0.03
-STAGE2_DECODER_EOS_WEIGHT = 2.5
-STAGE2_ACTION_AUX_WEIGHT = 0.35
-
-# Teacher forcing schedule
-STAGE2_TF_START = 1.0
-STAGE2_TF_END = 1.0
-STAGE2_TF_SCHEDULE = "linear"
 
 # -------------------------
 # Refinement target matching
 # -------------------------
 
-STAGE2_REFINE_POS_IOU = 0.50
+STAGE2_REFINE_POS_IOU = 0.45
 STAGE2_REFINE_NEG_IOU = 0.20
 STAGE2_REFINE_POS_WEIGHT = 1.0
-
-# -------------------------
-# Stage-2 loss weights
-# -------------------------
-
-STAGE2_LAMBDA_BOX = 0.50
-STAGE2_LAMBDA_DELTA = 1.00
-STAGE2_LAMBDA_SCORE = 0.30
-STAGE2_LAMBDA_AUX = 1.0
-STAGE2_LAMBDA_DECODER = 0
 
 
 # ============================================================
@@ -202,10 +208,7 @@ STAGE2_LAMBDA_DECODER = 0
 
 RUN_VALIDATION = True
 VALIDATION_FREQ = 1
-VALIDATION_BATCHES = 10
-
-# For later free-decoding evaluation
-STAGE2_VAL_MAX_DECODE_LEN = 352
+VALIDATION_BATCHES = None  # None = full validation set each epoch
 
 FREEZE_BACKBONE = True
 FREEZE_DETECTOR = True
@@ -213,79 +216,21 @@ STAGE2_DEBUG_BATCH_STATS = False
 STAGE2_DEBUG_AUX_ALIGNMENT = False
 STAGE2_DEBUG_AUX_ALIGNMENT_LIMIT = 20
 
-
-# ============================================================
-# Phase-based training (e.g. for Option-C Stage 2)
-# ============================================================
-
-
-STAGE2_PHASE = "A"   # "A" oder "B"
-
-# Phase A (context encoder enabled, decoder still frozen)
-STAGE2_PHASE_A_EPOCHS = 15
-STAGE2_PHASE_A_LAMBDA_BOX = 0.5
-STAGE2_PHASE_A_LAMBDA_DELTA = 1.0
-STAGE2_PHASE_A_LAMBDA_SCORE = 0.3
-STAGE2_PHASE_A_LAMBDA_AUX = 1.0
-STAGE2_PHASE_A_LAMBDA_DECODER = 0.0
-STAGE2_PHASE_A_TF_START = 1.0
-STAGE2_PHASE_A_TF_END = 0.974432737452076
-
-# Phase B
-STAGE2_PHASE_B_EPOCHS = 10
-STAGE2_PHASE_B_LAMBDA_BOX = 0.35
-STAGE2_PHASE_B_LAMBDA_DELTA = 0.75
-STAGE2_PHASE_B_LAMBDA_SCORE = 0.2
-STAGE2_PHASE_B_LAMBDA_AUX = 0.6
-STAGE2_PHASE_B_LAMBDA_DECODER = 1.0
-STAGE2_LAMBDA_FREE_PREFIX = 0.35
-STAGE2_LAMBDA_ACTION = 0.15
-STAGE2_PHASE_B_TF_START = 0.9
-STAGE2_PHASE_B_TF_END = 0.4
-STAGE2_ACTION_ALIGNMENT_START_EPOCH = 1
-STAGE2_ACTION_ALIGNMENT_FULL_EPOCH = 4
-
-# Free-decoding stabilization (Phase B)
-STAGE2_PHASE_B_FREE_REPETITION_PENALTY = 0.1
-STAGE2_PHASE_B_FREE_BLOCK_IMMEDIATE_REPEAT = True
-STAGE2_PHASE_B_FREE_MIN_STEPS = 36
-STAGE2_PHASE_B_FREE_MAX_STALL_STEPS = 8
-STAGE2_PHASE_B_FREE_FORCE_STOP_ON_STALL = False
-STAGE2_PHASE_B_FREE_STOP_THRESHOLD = 0.0
-STAGE2_PHASE_B_FREE_MIN_PROGRESS_FOR_EOS = 0.0
-STAGE2_PHASE_B_FREE_MIN_COVERAGE_FOR_EOS = 0.0
-STAGE2_PHASE_B_TRAIN_FREE_REPETITION_PENALTY = 0.0
-STAGE2_PHASE_B_TRAIN_FREE_BLOCK_IMMEDIATE_REPEAT = False
-STAGE2_PHASE_B_TRAIN_FREE_MIN_STEPS = 10
-STAGE2_PHASE_B_TRAIN_FREE_MAX_STALL_STEPS = 4
-STAGE2_PHASE_B_TRAIN_FREE_FORCE_STOP_ON_STALL = False
-STAGE2_PHASE_B_TRAIN_FREE_STOP_THRESHOLD = 0.0
-STAGE2_PHASE_B_TRAIN_FREE_MIN_PROGRESS_FOR_EOS = 0.0
-STAGE2_PHASE_B_TRAIN_FREE_MIN_COVERAGE_FOR_EOS = 0.0
-STAGE2_FREE_PREFIX_EVERY_N_STEPS = 256
-STAGE2_TRAIN_FREE_DECODE_BATCHES = 2
-STAGE2_VAL_FREE_DECODE_BATCHES = 4
-STAGE2_TRAIN_DECODER_STATS_EVERY_N_STEPS = 64
-STAGE2_TRAIN_DECODER_STATS_MAX_SAMPLES = 4
-STAGE2_TRAIN_PROP_STATS_EVERY_N_STEPS = 8
-STAGE2_TRAIN_FREE_DIAG_MAX_LEN = 128
-STAGE2_FREE_RECOVERY_WINDOW = 5
-STAGE2_FREE_RECOVERY_WEIGHT = 0.35
-STAGE2_FREE_PREFIX_MIN_TOKENS = 4
-STAGE2_USE_CHUNKED_FREE_DECODE = True
-STAGE2_USE_CHUNKED_FREE_TRAINING = True
-STAGE2_FREE_TEACHER_PREFIX_STEPS = 6
-STAGE2_LOG_PREDICTIONS = True
-STAGE2_PREDICTION_SAMPLES = 2
-STAGE2_LAMBDA_STOP = 0.2
-STAGE2_LAMBDA_STOP_FREE_SCALE = 0.3
-STAGE2_LAMBDA_ACTION_FREE_SCALE = 1.5
-STAGE2_DECODER_STOP_POS_WEIGHT = 3.0
-STAGE2_PHASE_B_STOP_THRESHOLD = 0.1
-
-# Runtime logging controls (recommended for cluster runs)
+# Runtime logging controls
 STAGE2_ENABLE_TQDM = True
 STAGE2_PROGRESS_POSTFIX_EVERY_N_STEPS = 70
+STAGE2_TRAIN_PROP_STATS_EVERY_N_STEPS = 8
+
+
+# ============================================================
+# Warmup training (ROI pipeline pre-training for KuroNet)
+# ============================================================
+
+WARMUP_EPOCHS = 15
+WARMUP_LAMBDA_BOX = 0.5
+WARMUP_LAMBDA_DELTA = 1.0
+WARMUP_LAMBDA_SCORE = 0.3
+WARMUP_LAMBDA_AUX = 1.0
 
 
 # ============================================================
@@ -301,23 +246,43 @@ KURONET_CHECKPOINT_DIR       = CHECKPOINT_DIR / "kuronet_recognizer"
 KURONET_CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 KURONET_USE_CONTEXT          = True        # Keep BiGRU context encoder
-KURONET_CLASSIFIER_HIDDEN    = 512         # MLP hidden dim for char classifier
+KURONET_CLASSIFIER_HIDDEN    = 256         # matches STAGE2_REFINE_HIDDEN_DIM → enables warm-start from aux_head_context
+
+# Pretrained EfficientNet-B0 applied to raw image crops (Clanuwat VGG-16 equivalent).
+# Adds ImageNet pretrained features on top of UNet ROI features before refinement.
+# Enable after warmup retraining; freeze keeps GPU cost low (only projection trains).
+KURONET_USE_CROP_ENCODER     = True
+KURONET_CROP_ENCODER_SIZE    = (96, 96)
+KURONET_FREEZE_CROP_ENCODER  = False
 
 # ROI pooling — larger crop to preserve dakuten (voiced-mark) strokes
-KURONET_ROI_SIZE             = (12, 12)    # was (8, 8); (12,12) gives 2.25× more pixels per ROI
+KURONET_ROI_SIZE             = STAGE2_ROI_SIZE  # must stay equal to STAGE2_ROI_SIZE for warmup weight transfer
 
 # Detection params (DET_*) are shared — defined once above, used by Stage 2 and KuroNet.
 # Once Optuna (jobs 9182-9184) finishes, update DET_* in the Stage 2 section above.
 
 # Assembled CER: filter out false-positive proposals before transcription
 # (ordered_mask includes all 159 props/img; ~18 are FPs that add insertion errors)
-KURONET_CER_SCORE_THRESH     = 0.5
+KURONET_CER_SCORE_THRESH     = 0.35
 
 # Loss weights (single-phase training, no scheduling)
 KURONET_LAMBDA_CHAR          = 1.0         # Primary: per-ROI character classification
-KURONET_LAMBDA_BOX           = 0.35        # Box regression on positive ROIs
+KURONET_LAMBDA_BOX           = 0.0         # Box regression disabled — delta is the correct parameterization
 KURONET_LAMBDA_DELTA         = 0.75        # Delta regression on positive ROIs
 KURONET_LAMBDA_SCORE         = 0.20        # ROI quality BCE
+KURONET_BG_WEIGHT            = 0.1         # Weight for in-column negative ROIs (normal text-region FPs)
+KURONET_STRONG_BG_WEIGHT     = 0.45        # Weight for isolated/oversized negatives (likely illustrations)
+KURONET_BG_SCORE_GATE        = 0.55        # Min sigmoid(refine_score) to suppress a BG prediction at inference
+
+# Focal loss for character classification (gamma=0 → plain cross-entropy)
+# Reduced from 2.0 to 1.0: focal loss downweights easy examples, which hurts learning
+# when classifier is pre-trained (not random). Gentler focal loss with warmup initialization.
+KURONET_FOCAL_GAMMA          = 1.0
+
+# Character augmentation: threshold below which a character is considered rare.
+# Rare-char images get stronger augmentation (Option A) and are oversampled (Option B).
+# Training stats: freq < 20 covers ~60% of classes but only ~1.3% of tokens.
+KURONET_RARE_CHAR_THRESH     = 20
 
 # Optimizer
 KURONET_LR                   = 1.0841999197654953e-4
@@ -331,4 +296,4 @@ KURONET_ENABLE_TQDM          = True
 KURONET_PROGRESS_POSTFIX_N   = 70
 KURONET_LOG_PREDICTIONS      = True
 KURONET_PREDICTION_SAMPLES   = 2
-KURONET_VALIDATION_BATCHES   = 10
+KURONET_VALIDATION_BATCHES   = None   # None = full validation set each epoch

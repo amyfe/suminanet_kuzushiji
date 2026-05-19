@@ -113,7 +113,6 @@ import torch.nn as nn
 
 from model.kuronet.backbone.feature_projector import FeatureProjector
 from model.kuronet.context.roi_context import ROIContextEncoder
-from model.kuronet.decoder.attention import SeqDecoderAttention
 from model.kuronet.detection.proposal_utils import extract_coarse_proposals
 from model.kuronet.roi.roi_ordering import ROIReadingOrder
 from model.kuronet.roi.roi_pool import ROIPoolEncoder
@@ -158,8 +157,6 @@ class HybridKuroNetRecognizer(nn.Module):
         token_use_score_branch: bool = True,
         context_hidden_dim: int = 256,
         context_num_layers: int = 1,
-        decoder_embed_dim: int = 128,
-        decoder_hidden_dim: int = 256,
 
         det_score_thresh: float = 0.40,
         det_top_k: int = 256,
@@ -232,20 +229,9 @@ class HybridKuroNetRecognizer(nn.Module):
                 nn.Linear(refine_hidden_dim, vocab_size),
             )
 
-        self.decoder = SeqDecoderAttention(
-            embed_dim=decoder_embed_dim,
-            hidden_dim=decoder_hidden_dim,
-            vocab_size=vocab_size,
-            enc_dim=context_hidden_dim,
-            num_layers=1,
-            init_from_encoder=True,
-            sampling_method="argmax",
-            dropout=dropout,
-            pointer_window_radius=2,
-        )
-
         self.vocab_size = vocab_size
         self.use_aux_head = bool(use_aux_head)
+        self._context_hidden_dim = context_hidden_dim
 
     def _extract_detector_proposals(
         self,
@@ -344,7 +330,6 @@ class HybridKuroNetRecognizer(nn.Module):
         ordered_aux_logits = ordered["aux_logits"] if self.use_aux_head else None
 
         token_feats, token_mask = self.roi_tokens(
-            roi_feats=ordered["roi_feats"],
             refined_feats=ordered["refined_feats"],
             refined_boxes=ordered["boxes"],
             refine_scores=ordered["refine_scores"],
@@ -352,21 +337,23 @@ class HybridKuroNetRecognizer(nn.Module):
             image_size=image_size,
         )
 
+        # Normalized (cx, cy) from refined boxes in sorted order — trains pos_proj
+        # during warmup so KuroNet inherits a useful spatial initialization.
+        sorted_boxes = ordered["boxes"]
+        cx = (sorted_boxes[..., 0] + sorted_boxes[..., 2]) * 0.5 / float(w_img)
+        cy = (sorted_boxes[..., 1] + sorted_boxes[..., 3]) * 0.5 / float(h_img)
+        spatial_coords = torch.stack([cx, cy], dim=-1)  # (B, T, 2)
+
         context_feats, context_mask = self.context_encoder(
             seq=token_feats,
             mask=token_mask,
+            spatial_coords=spatial_coords,
+            refine_scores=ordered["refine_scores"],
         )
 
         aux_logits_with_context = None
         if self.aux_head_context is not None:
             aux_logits_with_context = self.aux_head_context(context_feats)
-
-        decoder_token_bias = None
-        if self.use_aux_head:
-            if aux_logits_with_context is not None:
-                decoder_token_bias = aux_logits_with_context
-            elif ordered_aux_logits is not None:
-                decoder_token_bias = ordered_aux_logits
 
         return {
             "shared_feats": shared_feats,
@@ -394,88 +381,4 @@ class HybridKuroNetRecognizer(nn.Module):
             "token_mask": token_mask,
             "context_feats": context_feats,
             "context_mask": context_mask,
-            "decoder_token_bias": decoder_token_bias,
         }
-
-    def decode_from_encoded(
-        self,
-        encoded: dict,
-        targets: Optional[torch.Tensor] = None,
-        teacher_forcing_ratio: float = 0.0,
-        teacher_prefix_steps: int = 0,
-        input_seq: Optional[torch.Tensor] = None,
-        sos_id: Optional[int] = None,
-        eos_id: Optional[int] = None,
-        max_len: Optional[int] = None,
-        oracle_pointer_positions: Optional[torch.Tensor] = None,
-        decode_constraints: Optional[dict] = None,
-        force_full_rollout: bool = False,
-    ) -> dict:
-        decoder_logits, decoder_hidden, attn_weights, stop_logits, action_logis, pointer_positions, emitted_token_ids = self.decoder(
-            enc_outputs=encoded["context_feats"],
-            enc_mask=encoded["context_mask"],
-            input_seq=input_seq,
-            targets=targets,
-            teacher_forcing_ratio=teacher_forcing_ratio,
-            teacher_prefix_steps=teacher_prefix_steps,
-            sos_id=sos_id,
-            eos_id=eos_id,
-            max_len=max_len,
-            encoder_token_bias=encoded.get("decoder_token_bias", None),
-            oracle_pointer_positions=oracle_pointer_positions,
-            decode_constraints=decode_constraints,
-            force_full_rollout=force_full_rollout,
-        )
-
-        outputs = dict(encoded)
-        outputs.update({
-            "decoder_logits": decoder_logits,
-            "decoder_hidden": decoder_hidden,
-            "attn_weights": attn_weights,
-            "stop_logits": stop_logits,
-            "action_logits": action_logis,
-            "pointer_positions": pointer_positions,
-            "emitted_token_ids": emitted_token_ids,
-        })
-        return outputs
-
-    def forward(
-        self,
-        images: torch.Tensor,                     # (B, 3, H, W)
-        orientations: List[str],
-        targets: Optional[torch.Tensor] = None,  # (B, T_tgt)
-        teacher_forcing_ratio: float = 0.0,
-
-        # optional override for training/eval experiments:
-        coarse_boxes_list: Optional[List[torch.Tensor]] = None,
-        coarse_scores_list: Optional[List[torch.Tensor]] = None,
-
-        # decoder control:
-        input_seq: Optional[torch.Tensor] = None,
-        sos_id: Optional[int] = None,
-        eos_id: Optional[int] = None,
-        max_len: Optional[int] = None,
-        teacher_prefix_steps: int = 0,
-        oracle_pointer_positions: Optional[torch.Tensor] = None,
-        decode_constraints: Optional[dict] = None,
-        force_full_rollout: bool = False,
-    ) -> dict:
-        encoded = self.encode_images(
-            images=images,
-            orientations=orientations,
-            coarse_boxes_list=coarse_boxes_list,
-            coarse_scores_list=coarse_scores_list,
-        )
-        return self.decode_from_encoded(
-            encoded,
-            targets=targets,
-            teacher_forcing_ratio=teacher_forcing_ratio,
-            teacher_prefix_steps=teacher_prefix_steps,
-            input_seq=input_seq,
-            sos_id=sos_id,
-            eos_id=eos_id,
-            max_len=max_len,
-            oracle_pointer_positions=oracle_pointer_positions,
-            decode_constraints=decode_constraints,
-            force_full_rollout=force_full_rollout,
-        )

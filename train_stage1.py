@@ -6,10 +6,10 @@ from pathlib import Path
 from tqdm import tqdm
 
 from config import (
-    DATA_DIR, DEVICE, BATCH_SIZE, STAGE1_BBOX_WEIGHT, STAGE1_DROPOUT_RATE, STAGE1_FOCAL_POS_THRESHOLD, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_HEATMAP_SIGMA, STAGE1_POS_WEIGHT, WEIGHT_DECAY,
-    GRADIENT_ACCUMULATION_STEPS, CHECKPOINT_DIR, USE_MIXED_PRECISION
+    DATA_DIR, DEVICE, BATCH_SIZE, STAGE1_BBOX_WEIGHT, STAGE1_DROPOUT_RATE, STAGE1_FOCAL_POS_THRESHOLD, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_HEATMAP_SIGMA, STAGE1_SIGMA_FLOOR, STAGE1_SIGMA_CEIL, STAGE1_POS_WEIGHT, WEIGHT_DECAY,
+    GRADIENT_ACCUMULATION_STEPS, CHECKPOINT_DIR, USE_MIXED_PRECISION, BACKBONE_BASE_FEATURES, BACKBONE_TYPE,
 )
-from model.kuronet import UNet, DetectorHead
+from model.kuronet import DetectorHead, build_backbone
 from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
@@ -77,13 +77,12 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                             prefetch_factor=2, persistent_workers=NUM_WORKERS > 0)
     
     # Build model
-    unet = UNet(in_channels=3, base_features=32).to(DEVICE)
-    detector = DetectorHead(in_ch=32, num_classes=vocab.vocab_size, dropout_rate=STAGE1_DROPOUT_RATE, predict_classes=False).to(DEVICE)  # Disable class head to save memory
-    print(f"✅ Model initialized with {vocab.vocab_size} classes (from vocab)")
-    print(f"⚠️  Class prediction disabled to prevent OOM (Stage 1 focuses on spatial detection only)")
+    backbone = build_backbone(BACKBONE_TYPE, BACKBONE_BASE_FEATURES).to(DEVICE)
+    detector = DetectorHead(in_ch=BACKBONE_BASE_FEATURES, num_classes=vocab.vocab_size, dropout_rate=STAGE1_DROPOUT_RATE, predict_classes=False).to(DEVICE)  # Disable class head to save memory
+    print(f"✅ Model initialized: backbone={BACKBONE_TYPE}, features={BACKBONE_BASE_FEATURES}, vocab={vocab.vocab_size} classes")
     # Optimizer
     optimizer = optim.Adam(
-        list(unet.parameters()) + list(detector.parameters()),
+        list(backbone.parameters()) + list(detector.parameters()),
         lr=lr, weight_decay=WEIGHT_DECAY
     )
     
@@ -100,7 +99,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     patience_ctr = 0
     for epoch in range(num_epochs):
         # Training
-        unet.train()
+        backbone.train()
         detector.train()
         optimizer.zero_grad(set_to_none=True)
         
@@ -119,7 +118,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
             
             with torch.amp.autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
                 # Single forward pass
-                features = unet(images)  # (B, 32, H/8, W/8)
+                features = backbone(images)  # (B, 32, H/8, W/8)
                 outputs = detector(features)  # Returns dict with 'heatmap' (raw logits), 'bbox', etc.
                 
                 B, _, Hf, Wf = features.shape
@@ -130,6 +129,8 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                     image_size=tuple(images.shape[-2:]),
                     device=DEVICE,
                     sigma=STAGE1_HEATMAP_SIGMA,
+                    sigma_floor=STAGE1_SIGMA_FLOOR,
+                    sigma_ceil=STAGE1_SIGMA_CEIL,
                     bbox_radius=bbox_radius,
                 )
                 # Compute losses with detailed tracking
@@ -155,7 +156,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
             if (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                 if scaler is not None:
                     scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(list(unet.parameters()) + list(detector.parameters()), 1.0)
+                torch.nn.utils.clip_grad_norm_(list(backbone.parameters()) + list(detector.parameters()), 1.0)
 
                 if scaler is not None:
                     scaler.step(optimizer)
@@ -213,7 +214,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                 scaler.unscale_(optimizer)
 
             torch.nn.utils.clip_grad_norm_(
-                list(unet.parameters()) + list(detector.parameters()), 1.0
+                list(backbone.parameters()) + list(detector.parameters()), 1.0
             )
 
             if scaler is not None:
@@ -227,7 +228,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         
         # Validation
         val_loss, val_heat, val_bbox = validate_detector(
-            unet, detector, val_dataloader, DEVICE, USE_MIXED_PRECISION, bbox_radius=bbox_radius
+            backbone, detector, val_dataloader, DEVICE, USE_MIXED_PRECISION, bbox_radius=bbox_radius
         )
         train_loss = total_loss / max(1, n_batches)
         print(
@@ -246,7 +247,9 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         
         ckpt = {
             "epoch": epoch + 1,
-            "unet_state_dict": unet.state_dict(),
+            "backbone_state_dict": backbone.state_dict(),
+            "backbone_type": BACKBONE_TYPE,
+            "unet_state_dict": backbone.state_dict(),  # backward-compat alias
             "detector_state_dict": detector.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "train_loss": train_loss,
@@ -272,7 +275,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     print(f"Best checkpoint: {checkpoint_dir / 'detector_best.pt'}")
     print(f"{'='*60}\n")
     
-    return unet, detector
+    return backbone, detector
 
 def train(args=None):  
     print("="*60)

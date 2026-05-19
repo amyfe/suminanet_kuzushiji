@@ -5,7 +5,10 @@ from typing import Optional
 
 import torch
 
-from config import STAGE2_USE_CHUNKED_FREE_DECODE, STAGE2_USE_CHUNKED_FREE_TRAINING
+# Phase B free-decoding was removed; these flags are kept as inline constants
+# for the deprecated helper functions below that are no longer called.
+_CHUNKED_FREE_DECODE = True
+_CHUNKED_FREE_TRAINING = True
 from model.kuronet.hybrid_recognizer import HybridKuroNetRecognizer
 from utils.stage2_losses import build_decoder_roi_targets_monotonic, build_decoder_roi_targets_from_bias
 from utils.vocab import VocabManager
@@ -169,7 +172,7 @@ def _decode_free_by_reading_units(
     decode_constraints: Optional[dict],
     prefer_emitted: bool = True,
 ) -> dict:
-    if not bool(STAGE2_USE_CHUNKED_FREE_DECODE):
+    if not bool(_CHUNKED_FREE_DECODE):
         outputs = model.decode_from_encoded(
             encoded,
             targets=None,
@@ -368,7 +371,7 @@ def _prepare_chunked_free_training_batch(
     pad_id: int,
     roi_targets: Optional[torch.Tensor] = None,
 ) -> Optional[dict]:
-    if not bool(STAGE2_USE_CHUNKED_FREE_TRAINING):
+    if not bool(_CHUNKED_FREE_TRAINING):
         return None
 
     context_feats = encoded.get("context_feats", None)

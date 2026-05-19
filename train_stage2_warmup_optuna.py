@@ -10,7 +10,7 @@ from pathlib import Path
 import optuna
 from optuna.trial import TrialState
 
-import train_stage2
+import train_stage2_warmup
 from config import CHECKPOINT_DIR, NUM_EPOCHS
 
 
@@ -52,12 +52,12 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     }
 
     # Make A TF-end searchable without changing config.py.
-    train_stage2.STAGE2_PHASE_A_TF_END = float(phase_a_tf_end)
+    train_stage2_warmup.STAGE2_PHASE_A_TF_END = float(phase_a_tf_end)
 
     trial_ckpt_dir = Path(args.output_dir) / f"trial_{trial.number}"
     trial_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    run = train_stage2.train_stage2_hybrid(
+    run = train_stage2_warmup.train_stage2_hybrid(
         detector_ckpt_path=detector_ckpt,
         num_epochs=args.epochs,
         lr=args.lr,

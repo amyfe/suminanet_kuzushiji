@@ -158,105 +158,159 @@ class ROIReadingOrder:
         mono = float(ok.float().mean().item()) if ok.numel() > 0 else 1.0
         return mono, 1.0 - mono
 
+    @staticmethod
+    def _percentile_size(sizes: torch.Tensor, p: float = 0.75) -> float:
+        """Return the p-th percentile of a 1D size tensor (robust to FP outliers)."""
+        n = sizes.numel()
+        k = max(1, min(n, int(p * n + 0.5)))
+        return float(sizes.kthvalue(k).values.item())
+
     def _horizontal_sort_indices(self, boxes: torch.Tensor) -> torch.Tensor:
         """
-        Horizontal reading order:
-            1. group into rows by y-center proximity
-            2. sort rows top-to-bottom
-            3. sort within each row left-to-right
+        Horizontal reading order using gap-based row detection.
+
+        1. Sort boxes by y-center (top to bottom).
+        2. Detect natural row breaks: gaps > 1.5 × 75th-percentile height.
+           Using the 75th percentile rather than the median makes this robust
+           to many small FP boxes (illustrations) that would pull the median down.
+        3. Sort rows top-to-bottom; sort within each row left-to-right.
         """
         if boxes.numel() == 0:
             return torch.zeros((0,), dtype=torch.long, device=boxes.device)
 
         y_center = (boxes[:, 1] + boxes[:, 3]) * 0.5
-        x_left = boxes[:, 0]
         heights = (boxes[:, 3] - boxes[:, 1]).clamp_min(1.0)
 
-        median_h = heights.median()
-        row_thresh = self.line_merge_thresh_ratio * median_h
+        h75 = self._percentile_size(heights, 0.75)
+        gap_thresh = 1.5 * h75
 
-        order_y = torch.argsort(y_center, descending=False)
-        rows: List[List[int]] = []
+        sorted_yc, sorted_idx = y_center.sort(descending=False)
 
-        current_row: List[int] = []
-        current_row_y = None
+        if sorted_yc.numel() > 1:
+            gaps = sorted_yc[1:] - sorted_yc[:-1]
+            is_break = torch.cat([
+                torch.ones(1, dtype=torch.bool, device=boxes.device),
+                gaps > gap_thresh,
+            ])
+        else:
+            is_break = torch.ones(1, dtype=torch.bool, device=boxes.device)
 
-        for idx_t in order_y.tolist():
-            y = float(y_center[idx_t].item())
-            if current_row_y is None:
-                current_row = [idx_t]
-                current_row_y = y
-                continue
-
-            if abs(y - current_row_y) <= float(row_thresh.item()):
-                current_row.append(idx_t)
-                current_row_y = (current_row_y * (len(current_row) - 1) + y) / len(current_row)
-            else:
-                rows.append(current_row)
-                current_row = [idx_t]
-                current_row_y = y
-
-        if current_row:
-            rows.append(current_row)
+        row_ids = is_break.long().cumsum(0) - 1
+        num_rows = int(row_ids.max().item()) + 1
 
         sorted_indices: List[int] = []
-        for row in rows:
-            row_tensor = torch.tensor(row, device=boxes.device, dtype=torch.long)
-            row_x = x_left[row_tensor]
-            row_order = row_tensor[torch.argsort(row_x, descending=False)]
-            sorted_indices.extend(row_order.tolist())
+        for row_id in range(num_rows):
+            in_row = (row_ids == row_id)
+            orig_indices = sorted_idx[in_row]
+            x_left = boxes[orig_indices, 0]
+            within_row = orig_indices[x_left.argsort(descending=False)]
+            sorted_indices.extend(within_row.tolist())
 
         return torch.tensor(sorted_indices, device=boxes.device, dtype=torch.long)
 
     def _vertical_sort_indices(self, boxes: torch.Tensor) -> torch.Tensor:
         """
-        Vertical reading order:
-            1. group into columns by x-center proximity
-            2. sort columns right-to-left
-            3. sort within each column top-to-bottom
+        Vertical reading order using gap-based column detection.
+
+        1. Sort boxes by x-center (left to right).
+        2. Detect natural column breaks: gaps > 1.5 × 75th-percentile width.
+           The 75th-percentile threshold is more robust to small FP boxes that
+           would pull the median width down and merge distinct columns.
+        3. Sort columns right-to-left (Edo reading direction).
+        4. Sort within each column top-to-bottom.
         """
         if boxes.numel() == 0:
             return torch.zeros((0,), dtype=torch.long, device=boxes.device)
 
         x_center = (boxes[:, 0] + boxes[:, 2]) * 0.5
-        y_top = boxes[:, 1]
         widths = (boxes[:, 2] - boxes[:, 0]).clamp_min(1.0)
 
-        median_w = widths.median()
-        col_thresh = self.line_merge_thresh_ratio * median_w
+        w75 = self._percentile_size(widths, 0.75)
+        gap_thresh = 1.5 * w75
 
-        order_x = torch.argsort(x_center, descending=True)  # right-to-left
-        cols: List[List[int]] = []
+        sorted_xc, sorted_idx = x_center.sort(descending=False)  # left → right
 
-        current_col: List[int] = []
-        current_col_x = None
+        if sorted_xc.numel() > 1:
+            gaps = sorted_xc[1:] - sorted_xc[:-1]
+            is_break = torch.cat([
+                torch.ones(1, dtype=torch.bool, device=boxes.device),
+                gaps > gap_thresh,
+            ])
+        else:
+            is_break = torch.ones(1, dtype=torch.bool, device=boxes.device)
 
-        for idx_t in order_x.tolist():
-            x = float(x_center[idx_t].item())
-            if current_col_x is None:
-                current_col = [idx_t]
-                current_col_x = x
-                continue
-
-            if abs(x - current_col_x) <= float(col_thresh.item()):
-                current_col.append(idx_t)
-                current_col_x = (current_col_x * (len(current_col) - 1) + x) / len(current_col)
-            else:
-                cols.append(current_col)
-                current_col = [idx_t]
-                current_col_x = x
-
-        if current_col:
-            cols.append(current_col)
+        col_ids = is_break.long().cumsum(0) - 1
+        num_cols = int(col_ids.max().item()) + 1
 
         sorted_indices: List[int] = []
-        for col in cols:
-            col_tensor = torch.tensor(col, device=boxes.device, dtype=torch.long)
-            col_y = y_top[col_tensor]
-            col_order = col_tensor[torch.argsort(col_y, descending=False)]
-            sorted_indices.extend(col_order.tolist())
+        for col_id in range(num_cols - 1, -1, -1):  # right → left
+            in_col = (col_ids == col_id)
+            orig_indices = sorted_idx[in_col]
+            y_top = boxes[orig_indices, 1]
+            within_col = orig_indices[y_top.argsort(descending=False)]
+            sorted_indices.extend(within_col.tolist())
 
         return torch.tensor(sorted_indices, device=boxes.device, dtype=torch.long)
+
+    def _compute_isolation_mask(
+        self,
+        boxes: torch.Tensor,    # (N, 4)  valid sorted boxes
+        orientation: str,
+        min_col_size: int = 3,
+        size_ratio: float = 3.0,
+    ) -> torch.Tensor:
+        """
+        Mark boxes that are likely illustration false-positives.
+
+        A box is isolated (True) when its column/row has fewer than
+        min_col_size members OR its area exceeds size_ratio × the column
+        median area.  Uses the same gap-based grouping as the sort methods.
+        """
+        n = boxes.size(0)
+        if n == 0:
+            return torch.zeros((0,), dtype=torch.bool, device=boxes.device)
+
+        areas = ((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])).clamp_min(1.0)
+
+        if orientation == "vertical":
+            center = (boxes[:, 0] + boxes[:, 2]) * 0.5
+            sizes  = (boxes[:, 2] - boxes[:, 0]).clamp_min(1.0)
+        else:
+            center = (boxes[:, 1] + boxes[:, 3]) * 0.5
+            sizes  = (boxes[:, 3] - boxes[:, 1]).clamp_min(1.0)
+
+        p75        = self._percentile_size(sizes, 0.75)
+        gap_thresh = 1.5 * p75
+
+        sorted_c, sorted_idx = center.sort()
+
+        if n > 1:
+            gaps     = sorted_c[1:] - sorted_c[:-1]
+            is_break = torch.cat([
+                torch.ones(1, dtype=torch.bool, device=boxes.device),
+                gaps > gap_thresh,
+            ])
+        else:
+            is_break = torch.ones(1, dtype=torch.bool, device=boxes.device)
+
+        group_ids_sorted = is_break.long().cumsum(0) - 1
+        num_groups       = int(group_ids_sorted.max().item()) + 1
+
+        # Map sorted positions back to original reading-order positions
+        group_ids = torch.zeros(n, dtype=torch.long, device=boxes.device)
+        group_ids.scatter_(0, sorted_idx, group_ids_sorted)
+
+        isolated = torch.zeros(n, dtype=torch.bool, device=boxes.device)
+        for g in range(num_groups):
+            in_group = group_ids == g
+            count    = int(in_group.sum().item())
+            if count < min_col_size:
+                isolated[in_group] = True
+            else:
+                med_area = float(areas[in_group].median().item())
+                isolated[in_group] = isolated[in_group] | (areas[in_group] > size_ratio * med_area)
+
+        return isolated
 
     def sort_single(
         self,
@@ -341,6 +395,7 @@ class ROIReadingOrder:
         sorted_boxes = torch.zeros_like(boxes)
         sorted_mask = torch.zeros_like(mask)
         sort_indices = torch.zeros((bsz, t_max), device=boxes.device, dtype=torch.long)
+        isolation_masks = torch.zeros((bsz, t_max), dtype=torch.bool, device=boxes.device)
         ordering_primary_mono = torch.ones((bsz,), device=boxes.device, dtype=boxes.dtype)
         ordering_primary_viol = torch.zeros((bsz,), device=boxes.device, dtype=boxes.dtype)
         ordering_valid_counts = mask.to(dtype=torch.long).sum(dim=1)
@@ -371,6 +426,9 @@ class ROIReadingOrder:
                 ordering_primary_mono[b] = mono
                 ordering_primary_viol[b] = viol
 
+                iso = self._compute_isolation_mask(sorted_boxes[b, :valid_t], orientations[b])
+                isolation_masks[b, :valid_t] = iso
+
             offset = 2
             for i, name in enumerate(named_tensors.keys()):
                 sorted_named[name][b] = result[offset + i]
@@ -381,6 +439,7 @@ class ROIReadingOrder:
             "boxes": sorted_boxes,
             "mask": sorted_mask,
             "sort_indices": sort_indices,
+            "isolation_mask": isolation_masks,
             "ordering_diagnostics": {
                 "primary_monotonic_fraction": ordering_primary_mono,
                 "primary_violation_fraction": ordering_primary_viol,

@@ -101,9 +101,14 @@ class ROIPoolEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+        # 4×4 spatial pooling gives 16 cells (vs 9 with 3×3), preserving finer
+        # stroke layout for dakuten discrimination while keeping params fixed at
+        # conv_channels*16*out_dim regardless of roi_size — enabling Phase A
+        # weight transfer between Stage 2 and KuroNet.
         self.proj = nn.Sequential(
+            nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
-            nn.Linear(conv_channels * roi_size[0] * roi_size[1], out_dim),
+            nn.Linear(conv_channels * 16, out_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
         )

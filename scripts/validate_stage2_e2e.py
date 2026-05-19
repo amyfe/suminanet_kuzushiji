@@ -28,7 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import CHECKPOINT_DIR, DATA_DIR, DEVICE, IMAGE_SIZE
-from train_stage2 import build_stage2_model, load_vocab, validate_stage2
+from train_stage2_warmup import build_stage2_model, load_vocab, validate_stage2
 from utils import KuzushijiDataset
 from utils.text_normalization import render_tokens
 from utils.training_helpers.helper_stage1 import collate_fn

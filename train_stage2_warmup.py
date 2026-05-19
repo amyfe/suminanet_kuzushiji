@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import (
+    BACKBONE_BASE_FEATURES,
     DATA_DIR,
     DEVICE,
     BATCH_SIZE,
@@ -22,8 +23,6 @@ from config import (
     LR,
     STAGE2_CONTEXT_HIDDEN_DIM,
     STAGE2_CONTEXT_NUM_LAYERS,
-    STAGE2_DECODER_EMBED_DIM,
-    STAGE2_DECODER_HIDDEN_DIM,
     DET_MIN_BOX_SIZE,
     DET_NMS_IOU,
     DET_SCORE_THRESH,
@@ -52,14 +51,15 @@ from config import (
     STAGE2_DEBUG_BATCH_STATS,
     STAGE2_DEBUG_AUX_ALIGNMENT,
     STAGE2_DEBUG_AUX_ALIGNMENT_LIMIT,
-    STAGE2_PHASE_A_EPOCHS,
-    STAGE2_PHASE_A_LAMBDA_BOX,
-    STAGE2_PHASE_A_LAMBDA_DELTA,
-    STAGE2_PHASE_A_LAMBDA_SCORE,
-    STAGE2_PHASE_A_LAMBDA_AUX,
+    WARMUP_EPOCHS,
+    WARMUP_LAMBDA_BOX,
+    WARMUP_LAMBDA_DELTA,
+    WARMUP_LAMBDA_SCORE,
+    WARMUP_LAMBDA_AUX,
+    BACKBONE_TYPE,
 )
 
-from model.kuronet import UNet, DetectorHead
+from model.kuronet import DetectorHead, build_backbone
 from model.kuronet.hybrid_recognizer import HybridKuroNetRecognizer
 
 from utils import KuzushijiDataset
@@ -91,15 +91,14 @@ from utils.training_helpers.logging_stage2 import (
 )
 
 
-def get_phase_settings(overrides: Optional[dict] = None) -> dict:
+def get_warmup_settings(overrides: Optional[dict] = None) -> dict:
     overrides = overrides or {}
     return {
-        "name": "A",
-        "epochs": int(STAGE2_PHASE_A_EPOCHS),
-        "lambda_box": float(STAGE2_PHASE_A_LAMBDA_BOX),
-        "lambda_delta": float(STAGE2_PHASE_A_LAMBDA_DELTA),
-        "lambda_score": float(STAGE2_PHASE_A_LAMBDA_SCORE),
-        "lambda_aux": float(STAGE2_PHASE_A_LAMBDA_AUX),
+        "epochs": int(WARMUP_EPOCHS),
+        "lambda_box": float(WARMUP_LAMBDA_BOX),
+        "lambda_delta": float(WARMUP_LAMBDA_DELTA),
+        "lambda_score": float(WARMUP_LAMBDA_SCORE),
+        "lambda_aux": float(WARMUP_LAMBDA_AUX),
         "train_context_encoder": True,
         "use_context_aux_for_loss": True,
         "raw_aux_weight": 0.0,
@@ -149,8 +148,6 @@ def set_trainable_modules_for_phase(model: HybridKuroNetRecognizer) -> None:
     for p in model.context_encoder.parameters():
         p.requires_grad = True
 
-    for p in model.decoder.parameters():
-        p.requires_grad = False
 
 
 def _compute_phase_aux_loss(
@@ -270,23 +267,25 @@ def build_stage2_model(
     context_hidden_dim = int(overrides.get("context_hidden_dim", STAGE2_CONTEXT_HIDDEN_DIM))
     context_num_layers = int(overrides.get("context_num_layers", STAGE2_CONTEXT_NUM_LAYERS))
 
-    backbone = UNet(in_channels=3, base_features=32).to(DEVICE)
+    checkpoint = torch.load(detector_ckpt_path, map_location=DEVICE)
+    backbone_type = checkpoint.get("backbone_type", BACKBONE_TYPE)
+    backbone = build_backbone(backbone_type, BACKBONE_BASE_FEATURES, pretrained=False).to(DEVICE)
     detector = DetectorHead(
-        in_ch=32,
+        in_ch=BACKBONE_BASE_FEATURES,
         num_classes=vocab_size,
         dropout_rate=STAGE2_DROPOUT_RATE,
         predict_boxes=True,
         predict_classes=False,
     ).to(DEVICE)
 
-    checkpoint = torch.load(detector_ckpt_path, map_location=DEVICE)
-    backbone.load_state_dict(checkpoint["unet_state_dict"])
+    state_key = "backbone_state_dict" if "backbone_state_dict" in checkpoint else "unet_state_dict"
+    backbone.load_state_dict(checkpoint[state_key])
     detector.load_state_dict(checkpoint["detector_state_dict"])
 
     model = HybridKuroNetRecognizer(
         backbone=backbone,
         detector=detector,
-        backbone_out_channels=32,
+        backbone_out_channels=BACKBONE_BASE_FEATURES,
         vocab_size=vocab_size,
 
         proj_dim=STAGE2_PROJ_DIM,
@@ -298,8 +297,6 @@ def build_stage2_model(
         token_use_score_branch=token_use_score_branch,
         context_hidden_dim=context_hidden_dim,
         context_num_layers=context_num_layers,
-        decoder_embed_dim=STAGE2_DECODER_EMBED_DIM,
-        decoder_hidden_dim=STAGE2_DECODER_HIDDEN_DIM,
 
         det_score_thresh=det_score_thresh,
         det_top_k=det_top_k,
@@ -487,7 +484,7 @@ def validate_stage2(
     if FREEZE_DETECTOR:
         model.detector.eval()
     if phase_settings is None:
-        phase_settings = get_phase_settings()
+        phase_settings = get_warmup_settings()
 
     total_loss = 0.0
     total_box = 0.0
@@ -595,7 +592,7 @@ def train_stage2_hybrid(
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
 
     model_overrides = model_overrides or {}
-    phase_settings = get_phase_settings(overrides=model_overrides)
+    phase_settings = get_warmup_settings(overrides=model_overrides)
     prune_existing_checkpoints(checkpoint_dir)
 
     vocab = load_vocab()
@@ -629,13 +626,13 @@ def train_stage2_hybrid(
         eta_min=1e-6,
     )
 
-    scaler = torch.cuda.amp.GradScaler() if USE_MIXED_PRECISION and str(DEVICE).startswith("cuda") else None
+    scaler = torch.amp.GradScaler("cuda") if USE_MIXED_PRECISION and str(DEVICE).startswith("cuda") else None
 
     best_val = None
     best_val_metrics = None
 
     print("=" * 70)
-    print("STAGE 2 HYBRID TRAINING — PHASE A")
+    print("WARMUP TRAINING (ROI pipeline pre-training for KuroNet)")
     print("=" * 70)
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
     print(f"Trainable params: {sum(p.numel() for p in trainable_params):,}")
@@ -680,7 +677,7 @@ def train_stage2_hybrid(
             gt_boxes_list = move_gt_lists_to_device(batch["boxes"], dtype=torch.float32)
             gt_labels_list = move_gt_lists_to_device(batch["labels"], dtype=torch.long)
 
-            with torch.cuda.amp.autocast(enabled=USE_MIXED_PRECISION and str(DEVICE).startswith("cuda")):
+            with torch.amp.autocast("cuda", enabled=USE_MIXED_PRECISION and str(DEVICE).startswith("cuda")):
                 outputs = model.encode_images(images=images, orientations=orientations)
 
                 refine_targets = build_refinement_targets(
@@ -825,8 +822,6 @@ def train_stage2_hybrid(
                 "token_use_score_branch": STAGE2_TOKEN_USE_SCORE_BRANCH,
                 "context_hidden_dim": STAGE2_CONTEXT_HIDDEN_DIM,
                 "context_num_layers": STAGE2_CONTEXT_NUM_LAYERS,
-                "decoder_embed_dim": STAGE2_DECODER_EMBED_DIM,
-                "decoder_hidden_dim": STAGE2_DECODER_HIDDEN_DIM,
                 "det_score_thresh": float(model.det_score_thresh),
                 "det_top_k": int(model.det_top_k),
                 "det_nms_iou": float(model.det_nms_iou),
@@ -837,18 +832,18 @@ def train_stage2_hybrid(
             "model_overrides": model_overrides or {},
         }
 
-        epoch_path = checkpoint_dir / f"stage2_hybrid_epoch{epoch+1}.pt"
+        epoch_path = checkpoint_dir / f"warmup_epoch{epoch+1}.pt"
         torch.save(ckpt, epoch_path)
 
         if is_best:
-            torch.save(ckpt, checkpoint_dir / "stage2_hybrid_best.pt")
-            print(f"Saved best: stage2_hybrid_best.pt (score={current_score:.4f})")
+            torch.save(ckpt, checkpoint_dir / "warmup_best.pt")
+            print(f"Saved best: warmup_best.pt (score={current_score:.4f})")
 
         prune_to_keep_last_n(checkpoint_dir, keep=2, exclude="checkpoint_old.pt")
 
     print("\n" + "=" * 70)
-    print("STAGE 2 HYBRID TRAINING COMPLETE")
-    print(f"Best checkpoint: {checkpoint_dir / 'stage2_hybrid_best.pt'}")
+    print("WARMUP TRAINING COMPLETE")
+    print(f"Best checkpoint: {checkpoint_dir / 'warmup_best.pt'}")
     print("=" * 70 + "\n")
 
     return {
@@ -870,8 +865,8 @@ def main():
             f"  - {last_ckpt}"
         )
 
-    phase_settings = get_phase_settings()
-    checkpoint_dir = CHECKPOINT_DIR / "stage2_hybrid_phaseA"
+    phase_settings = get_warmup_settings()
+    checkpoint_dir = CHECKPOINT_DIR / "kuronet_warmup"
 
     train_stage2_hybrid(
         detector_ckpt_path=detector_ckpt,

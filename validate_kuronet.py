@@ -5,7 +5,8 @@ Runs the full validation pipeline on a saved checkpoint and prints:
   - Proposal quality (IoU+, coverage, proposals/img, GT/img)
   - Per-ROI classification accuracy (top-1, top-5)
   - Assembled transcription CER (argmax predictions in reading order)
-  - Top predicted characters and most common confusion pairs
+  - Confusion matrix (top confused classes, row-normalized, saved as PNG)
+  - Per-class error rate table (worst-recalled symbols)
   - Prediction examples (pred vs GT)
 
 Usage:
@@ -17,9 +18,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 from collections import Counter
 from pathlib import Path
+from datetime import datetime
+import os
 
+import numpy as np
+import matplotlib.pyplot as plt
 import torch
 
 from config import (
@@ -32,7 +39,7 @@ from config import (
     STAGE2_REFINE_NEG_IOU,
     STAGE2_REFINE_POS_IOU,
 )
-from train_kuronet import (
+from train_stage2_kuronet import (
     _compute_assembled_cer,
     _edit_distance,
     _ids_to_text,
@@ -44,6 +51,7 @@ from train_kuronet import (
 )
 from utils.stage2_targets import build_refinement_targets
 from utils.training_helpers.helper_stage2 import (
+    _load_compatible_state_dict,
     _normalize_orientation_label,
     reorder_by_sort_indices,
 )
@@ -57,15 +65,258 @@ def _load_kuronet_weights(model: torch.nn.Module, ckpt_path: Path) -> int:
     else:
         state = ckpt
         epoch = -1
-    model.load_state_dict(state, strict=True)
+    _load_compatible_state_dict(model, state)
     return epoch
 
+
+# -------------------------
+# Confusion matrix plot
+# -------------------------
+
+_CJK_FONT_PATH = "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"
+
+
+def _char_script_type(ch: str) -> str:
+    """Categorize a character by script: hiragana, katakana, kanji, digit, latin, or other."""
+    if not ch:
+        return "other"
+    cp = ord(ch[0])
+    if 0x3041 <= cp <= 0x3096:
+        return "hiragana"
+    if 0x30A0 <= cp <= 0x30FF:
+        return "katakana"
+    if (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or (0x20000 <= cp <= 0x2A6DF):
+        return "kanji"
+    if (0x0041 <= cp <= 0x005A) or (0x0061 <= cp <= 0x007A):
+        return "latin"
+    if 0x0030 <= cp <= 0x0039:
+        return "digit"
+    return "other"
+
+
+def _cjk_font_prop(size: float):
+    """Return a FontProperties for CJK tick labels, or None if font unavailable."""
+    try:
+        import matplotlib.font_manager as fm
+        from pathlib import Path as _P
+        if _P(_CJK_FONT_PATH).exists():
+            return fm.FontProperties(fname=_CJK_FONT_PATH, size=size)
+    except Exception:
+        pass
+    return None
+
+
+def plot_confusion_matrix(
+    error_counter: Counter,
+    gt_total_counter: Counter,
+    vocab,
+    out_path: Path,
+    top_n: int = 25,
+) -> None:
+    """Save a row-normalised confusion matrix for the top-N most error-prone classes."""
+    if not error_counter:
+        print("No confusion data to plot.")
+        return
+
+    # Select the top_n GT classes with the most cumulative errors
+    gt_error_totals: Counter = Counter()
+    for (gt, pr), cnt in error_counter.items():
+        gt_error_totals[gt] += cnt
+
+    top_gt = [c for c, _ in gt_error_totals.most_common(top_n)]
+
+    # Include their most-confused predicted classes too
+    confused_classes: set = set(top_gt)
+    for gt in top_gt:
+        for (g, p), _ in error_counter.most_common():
+            if g == gt and p not in confused_classes:
+                confused_classes.add(p)
+                break
+
+    class_list = sorted(confused_classes)
+    n = len(class_list)
+    if n == 0:
+        return
+
+    idx_map = {c: i for i, c in enumerate(class_list)}
+
+    mat = np.zeros((n, n), dtype=np.int64)
+    for (gt, pr), cnt in error_counter.items():
+        if gt in idx_map and pr in idx_map:
+            mat[idx_map[gt], idx_map[pr]] += cnt
+    for c in class_list:
+        i = idx_map[c]
+        total_gt = gt_total_counter.get(c, 0)
+        total_errors = gt_error_totals.get(c, 0)
+        mat[i, i] = max(0, total_gt - total_errors)
+
+    row_sums = mat.sum(axis=1, keepdims=True).clip(min=1)
+    mat_norm = mat / row_sums
+
+    labels = [_ids_to_text([c], vocab) for c in class_list]
+
+    # Use a per-cell size of 0.55in so characters have room; minimum 12pt font.
+    cell_size = 0.65
+    fontsize = max(12, min(16, int(cell_size * 72 * 0.55)))
+    fig_w = n * cell_size + 2.5   # extra space for colorbar + y-labels
+    fig_h = n * cell_size + 1.5
+
+    cjk = _cjk_font_prop(fontsize)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(mat_norm, cmap="Reds", vmin=0, vmax=1)
+    plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+
+    if cjk is not None:
+        # Set tick labels with CJK font via individual Text objects
+        ax.set_xticklabels(labels, rotation=90)
+        ax.set_yticklabels(labels)
+        for txt in ax.get_xticklabels():
+            txt.set_fontproperties(cjk)
+        for txt in ax.get_yticklabels():
+            txt.set_fontproperties(cjk)
+    else:
+        # Fallback: show Unicode codepoints (readable without CJK font)
+        cp_labels = []
+        for lbl in labels:
+            if lbl:
+                cp_labels.append("U+{:04X}".format(ord(lbl[0])))
+            else:
+                cp_labels.append("?")
+        ax.set_xticklabels(cp_labels, rotation=90, fontsize=max(7, fontsize - 2))
+        ax.set_yticklabels(cp_labels, fontsize=max(7, fontsize - 2))
+
+    ax.set_xlabel("Predicted", fontsize=11)
+    ax.set_ylabel("Ground Truth", fontsize=11)
+    ax.set_title(f"Confusion Matrix — top {n} error-prone classes (row-normalised)", fontsize=11)
+
+    plt.tight_layout()
+    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Confusion matrix saved: {out_path}")
+
+
+# -------------------------
+# Per-class error rate table
+# -------------------------
+
+def print_per_class_error_rates(
+    error_counter: Counter,
+    gt_total_counter: Counter,
+    vocab,
+    top_k: int = 20,
+) -> list[dict]:
+    """Print and return worst-recalled classes sorted by error rate."""
+    gt_error_totals: Counter = Counter()
+    for (gt, _), cnt in error_counter.items():
+        gt_error_totals[gt] += cnt
+
+    rows = []
+    for cls_id, err_cnt in gt_error_totals.most_common():
+        total = gt_total_counter.get(cls_id, 0)
+        if total == 0:
+            continue
+        err_rate = err_cnt / total
+        # Top confusees for this class
+        confusees = [
+            (_ids_to_text([pr], vocab), cnt)
+            for (gt, pr), cnt in error_counter.most_common()
+            if gt == cls_id
+        ][:3]
+        rows.append({
+            "char": _ids_to_text([cls_id], vocab),
+            "id": cls_id,
+            "errors": err_cnt,
+            "total_gt": total,
+            "error_rate": round(err_rate, 4),
+            "top_confusees": confusees,
+        })
+
+    rows.sort(key=lambda r: r["error_rate"], reverse=True)
+
+    print(f"\n{'='*70}")
+    print(f"WORST-RECALLED CLASSES (top {top_k})")
+    print(f"{'='*70}")
+    print(f"  {'Char':<8} {'Errors':>7} {'Total':>7} {'ErrRate':>8}  Top confusees")
+    print(f"  {'-'*8} {'-'*7} {'-'*7} {'-'*8}  {'-'*30}")
+    for row in rows[:top_k]:
+        confusee_str = ", ".join(f"{ch}×{cnt}" for ch, cnt in row["top_confusees"])
+        print(f"  {row['char']:<8} {row['errors']:>7} {row['total_gt']:>7} {row['error_rate']:>8.3f}  {confusee_str}")
+
+    return rows
+
+
+def save_per_class_errors_csv(
+    rows: list[dict],
+    out_path: Path,
+    vocab,
+) -> dict:
+    """Save ALL per-class error statistics to CSV and return a per-script-type breakdown."""
+    type_stats: dict[str, dict] = {}
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "char", "unicode_hex", "script_type",
+            "total_gt", "errors", "error_rate",
+            "confusee_1", "confusee_1_count",
+            "confusee_2", "confusee_2_count",
+            "confusee_3", "confusee_3_count",
+        ])
+        for row in rows:
+            ch = row["char"]
+            stype = _char_script_type(ch)
+            uni_hex = f"U+{ord(ch[0]):04X}" if ch else "?"
+            confusees = row["top_confusees"]
+            c1, n1 = confusees[0] if len(confusees) > 0 else ("", 0)
+            c2, n2 = confusees[1] if len(confusees) > 1 else ("", 0)
+            c3, n3 = confusees[2] if len(confusees) > 2 else ("", 0)
+            writer.writerow([
+                ch, uni_hex, stype,
+                row["total_gt"], row["errors"], f"{row['error_rate']:.4f}",
+                c1, n1, c2, n2, c3, n3,
+            ])
+            if stype not in type_stats:
+                type_stats[stype] = {"classes_with_errors": 0, "total_gt": 0, "errors": 0}
+            type_stats[stype]["classes_with_errors"] += 1
+            type_stats[stype]["total_gt"] += row["total_gt"]
+            type_stats[stype]["errors"] += row["errors"]
+
+    print(f"\nPER-CLASS ERRORS CSV: {out_path}  ({len(rows)} classes with ≥1 error)")
+    print("\nERROR BREAKDOWN BY SCRIPT TYPE")
+    print(f"  {'Type':<12} {'Classes':>8} {'GT tokens':>10} {'Errors':>8} {'Error %':>8}")
+    print(f"  {'-'*12} {'-'*8} {'-'*10} {'-'*8} {'-'*8}")
+    for stype in ["hiragana", "katakana", "kanji", "latin", "digit", "other"]:
+        if stype in type_stats:
+            st = type_stats[stype]
+            er = st["errors"] / max(1, st["total_gt"]) * 100
+            print(
+                f"  {stype:<12} {st['classes_with_errors']:>8} "
+                f"{st['total_gt']:>10} {st['errors']:>8} {er:>7.1f}%"
+            )
+
+    return type_stats
+
+
+# -------------------------
+# Main validation
+# -------------------------
 
 def run_validation(
     ckpt_path: Path,
     max_batches: int | None,
     split: str = "val",
 ) -> None:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    resolved_job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("JOB_ID")
+    run_tag = f"{timestamp}_job{resolved_job_id}" if resolved_job_id else timestamp
+    out_dir = KURONET_CHECKPOINT_DIR / "validation" / run_tag
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output dir: {out_dir}")
+
     vocab = load_vocab()
     _, val_loader = build_dataloaders(vocab)
 
@@ -75,8 +326,10 @@ def run_validation(
     print(f"Loaded checkpoint: {ckpt_path}  (epoch={epoch})")
     print("=" * 70)
 
+    bg_id = vocab.bg_id if hasattr(vocab, "bg_id") and vocab.BG_TOKEN in vocab.char2id else None
+
     total_loss   = 0.0
-    loss_parts   = {"loss_char": 0., "loss_box": 0., "loss_delta": 0., "loss_score": 0.}
+    loss_parts   = {"loss_char": 0., "loss_box": 0., "loss_delta": 0., "loss_score": 0., "loss_bg": 0.}
     top1_sum     = 0.0
     top5_sum     = 0.0
     cer_sum      = 0.0
@@ -88,9 +341,24 @@ def run_validation(
     n_batches    = 0
     n_images_tot = 0
 
-    error_counter: Counter = Counter()
-    pred_counter:  Counter = Counter()
-    examples: list[dict]   = []
+    # Confusion tracking — accumulated over ALL images in every batch
+    error_counter: Counter = Counter()    # (gt_id, pred_id) -> count
+    pred_counter:  Counter = Counter()    # pred_id -> count
+    gt_total_counter: Counter = Counter() # gt_id -> total occurrences in positives
+
+    examples: list[dict] = []
+
+    # Debug: IoU distribution for positive proposals where GT=し but model predicts BG.
+    # High IoU → BG head over-fires; near-threshold IoU → borderline matching.
+    _shi_bg_ious: list[float] = []
+    _shi_id = vocab.char2id.get("し") if bg_id is not None else None
+
+    # Debug: BG-vs-column breakdown.
+    # For every positive proposal, classify it as (isolated / in-column) × (pred=BG / pred=char).
+    # Expected healthy state: BG predictions cluster on isolated proposals.
+    # Problem state: BG predictions appear inside text columns (real chars misclassified).
+    _bg_col = {"bg_isolated": 0, "bg_in_column": 0,
+               "char_isolated": 0, "char_in_column": 0}
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
@@ -115,10 +383,10 @@ def run_validation(
                 neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
             )
 
-            loss, parts = compute_kuronet_loss(outputs, refine_targets)
+            loss, parts = compute_kuronet_loss(outputs, refine_targets, bg_id=bg_id)
             total_loss += float(loss.item())
             for k in loss_parts:
-                loss_parts[k] += parts[k]
+                loss_parts[k] += parts.get(k, 0.0)
 
             sort_indices = outputs.get("sort_indices", None)
             gt_labels    = refine_targets["matched_gt_labels"]
@@ -152,17 +420,44 @@ def run_validation(
             if pm_b.any():
                 iou_sum += float(iou_b[pm_b].mean().item())
 
-            # Confusion analysis on first sample
-            valid_b = pos_mask_s[0] & gt_labels_s[0].ne(-1)
-            if valid_b.any():
-                pred_ids = outputs["char_logits"][0, valid_b].argmax(dim=-1).tolist()
-                true_ids = gt_labels_s[0][valid_b].tolist()
-                for pid, tid in zip(pred_ids, true_ids):
-                    pred_counter[pid] += 1
-                    if pid != tid:
-                        error_counter[(tid, pid)] += 1
+            # Confusion accumulation — loop over ALL images in the batch (was only [0])
+            for b in range(bsz):
+                valid_b = pos_mask_s[b] & gt_labels_s[b].ne(-1)
+                if valid_b.any():
+                    pred_ids = outputs["char_logits"][b, valid_b].argmax(dim=-1).tolist()
+                    true_ids = gt_labels_s[b][valid_b].tolist()
+                    for pid, tid in zip(pred_ids, true_ids):
+                        pred_counter[pid] += 1
+                        gt_total_counter[tid] += 1
+                        if pid != tid:
+                            error_counter[(tid, pid)] += 1
 
-            # Prediction examples
+            # Debug: し→BG IoU audit (unsorted space, matches refine_targets layout)
+            if _shi_id is not None:
+                pm_raw  = refine_targets["refine_pos_mask"]   # (B, T) bool
+                lbl_raw = refine_targets["matched_gt_labels"]  # (B, T)
+                iou_raw = refine_targets["matched_iou"]        # (B, T)
+                pred_raw = outputs["char_logits"].argmax(dim=-1)  # (B, T)
+                for b in range(bsz):
+                    hit = pm_raw[b] & (lbl_raw[b] == _shi_id) & (pred_raw[b] == bg_id)
+                    _shi_bg_ious.extend(iou_raw[b][hit].tolist())
+
+            # Debug: BG-vs-column breakdown (sorted space, matches isolation_mask layout).
+            # isolation_mask[b][t]=True means proposal t is NOT part of a text column.
+            iso_mask = outputs.get("isolation_mask")  # (B, T) bool or None
+            if bg_id is not None and iso_mask is not None:
+                for b in range(bsz):
+                    valid = pos_mask_s[b]              # (T,) positive proposals, sorted order
+                    if not valid.any():
+                        continue
+                    preds_b = outputs["char_logits"][b, valid].argmax(dim=-1)  # (N_pos,)
+                    iso_b   = iso_mask[b][valid]                               # (N_pos,)
+                    is_bg   = preds_b == bg_id
+                    _bg_col["bg_isolated"]    += int((is_bg  &  iso_b).sum())
+                    _bg_col["bg_in_column"]   += int((is_bg  & ~iso_b).sum())
+                    _bg_col["char_isolated"]  += int((~is_bg &  iso_b).sum())
+                    _bg_col["char_in_column"] += int((~is_bg & ~iso_b).sum())
+
             if len(examples) < KURONET_PREDICTION_SAMPLES:
                 valid_pred = outputs["ordered_mask"][0]
                 pred_ids_ex = outputs["char_logits"][0, valid_pred].argmax(dim=-1).tolist()
@@ -189,7 +484,7 @@ def run_validation(
     print(
         f"  total={avg(total_loss):.4f}"
         f"  char={avg(loss_parts['loss_char']):.4f}"
-        f"  box={avg(loss_parts['loss_box']):.4f}"
+        f"  bg={avg(loss_parts['loss_bg']):.4f}"
         f"  delta={avg(loss_parts['loss_delta']):.4f}"
         f"  score={avg(loss_parts['loss_score']):.4f}"
     )
@@ -219,10 +514,11 @@ def run_validation(
         f"  assembled_CER={avg(cer_sum):.4f}"
         f"  (lower CER = better; 0 = perfect)"
     )
+    print(f"  images_evaluated={n_images_tot}  batches={n_batches}")
 
     top_preds = [
         {"token": _ids_to_text([tid], vocab), "count": cnt}
-        for tid, cnt in pred_counter.most_common(8)
+        for tid, cnt in pred_counter.most_common(10)
     ]
     top_errors = [
         {
@@ -230,16 +526,92 @@ def run_validation(
             "pred": _ids_to_text([pr], vocab),
             "count": cnt,
         }
-        for (gt, pr), cnt in error_counter.most_common(8)
+        for (gt, pr), cnt in error_counter.most_common(10)
     ]
 
     print(f"\nTop predicted tokens:  {top_preds}")
     print(f"Top confusion pairs:   {top_errors}")
 
+    if _shi_bg_ious:
+        arr = sorted(_shi_bg_ious)
+        n = len(arr)
+        buckets = [(0.45, 0.55), (0.55, 0.65), (0.65, 0.75), (0.75, 0.85), (0.85, 1.01)]
+        hist = {f"{lo:.2f}-{hi:.2f}": sum(lo <= v < hi for v in arr) for lo, hi in buckets}
+        print(f"\nDEBUG し→BG IoU audit  (n={n} positive proposals where GT=し, pred=<BG>)")
+        print(f"  IoU histogram: {hist}")
+        print(f"  median={arr[n // 2]:.3f}  mean={sum(arr)/n:.3f}  "
+              f"p25={arr[n // 4]:.3f}  p75={arr[3 * n // 4]:.3f}")
+
+    total_bg   = _bg_col["bg_isolated"]   + _bg_col["bg_in_column"]
+    total_char = _bg_col["char_isolated"] + _bg_col["char_in_column"]
+    total_pos  = total_bg + total_char
+    if total_pos > 0 and any(_bg_col.values()):
+        def _pct(x): return f"{100*x/total_pos:.1f}%"
+        print(f"\nDEBUG BG vs column breakdown  (positive proposals, sorted space)")
+        print(f"  {'':20s}  {'isolated':>10}  {'in-column':>10}")
+        print(f"  {'pred=<BG>':20s}  {_bg_col['bg_isolated']:>10}  {_bg_col['bg_in_column']:>10}"
+              f"  ({_pct(_bg_col['bg_isolated'])} / {_pct(_bg_col['bg_in_column'])})")
+        print(f"  {'pred=char':20s}  {_bg_col['char_isolated']:>10}  {_bg_col['char_in_column']:>10}"
+              f"  ({_pct(_bg_col['char_isolated'])} / {_pct(_bg_col['char_in_column'])})")
+        if total_bg > 0:
+            bg_iso_rate = _bg_col["bg_isolated"] / total_bg
+            print(f"  BG-in-isolated rate: {bg_iso_rate:.3f}  "
+                  f"(1.0 = BG only fires on isolated proposals — ideal)")
+        print(f"  isolation_mask: None" if iso_mask is None else
+              f"  (isolation_mask available — {total_pos} positive ROIs evaluated)")
+
     print("\nPREDICTION EXAMPLES")
     for i, ex in enumerate(examples):
         print(f"  [sample={i}] PRED: {ex['pred'][:150]}")
         print(f"           GT:   {ex['gt'][:150]}")
+
+    # -----------------------------------------------------------------------
+    # Confusion matrix + per-class error rate
+    # -----------------------------------------------------------------------
+    per_class_rows = print_per_class_error_rates(error_counter, gt_total_counter, vocab)
+
+    type_breakdown = save_per_class_errors_csv(
+        rows=per_class_rows,
+        out_path=out_dir / "per_class_errors.csv",
+        vocab=vocab,
+    )
+
+    plot_confusion_matrix(
+        error_counter=error_counter,
+        gt_total_counter=gt_total_counter,
+        vocab=vocab,
+        out_path=out_dir / "confusion_matrix.png",
+        top_n=25,
+    )
+
+    # -----------------------------------------------------------------------
+    # Save summary JSON
+    # -----------------------------------------------------------------------
+    summary = {
+        "checkpoint": str(ckpt_path),
+        "epoch": epoch,
+        "images_evaluated": n_images_tot,
+        "batches": n_batches,
+        "loss": {k: avg(v) for k, v in {**{"total": total_loss}, **loss_parts}.items()},
+        "top1": avg(top1_sum),
+        "top5": avg(top5_sum),
+        "assembled_cer": avg(cer_sum),
+        "coverage": det_recall,
+        "det_precision": det_precision,
+        "det_f1": det_f1,
+        "avg_proposals_per_image": avg_props,
+        "avg_gt_per_image": avg_gt,
+        "mean_iou_positives": avg(iou_sum),
+        "top_confusion_pairs": top_errors,
+        "worst_recalled_classes": per_class_rows[:20],
+        "error_breakdown_by_script": type_breakdown,
+        "total_classes_with_errors": len(per_class_rows),
+    }
+    with open(out_dir / "metrics.json", "w") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"\n✅ metrics saved: {out_dir / 'metrics.json'}")
+    print(f"✅ per-class CSV: {out_dir / 'per_class_errors.csv'}")
+    print(f"✅ confusion matrix: {out_dir / 'confusion_matrix.png'}")
 
 
 def main():

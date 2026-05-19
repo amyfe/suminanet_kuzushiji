@@ -5,6 +5,12 @@ Fixes:
 - no double-sigmoid on heatmap
 - confidence thresh wired correctly
 - full-val metrics + extra logs
+
+New:
+- FN-highlighted visualization (green=TP GT, red=FN GT, blue=pred)
+- Worst-N images by FN count saved instead of first-N
+- PR curve sweep over confidence thresholds
+- FN vs TP box-size analysis
 """
 import torch
 from torch.utils.data import DataLoader
@@ -16,10 +22,15 @@ import json
 import os
 from datetime import datetime
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
-from config import DATA_DIR, DEVICE, IMAGE_SIZE, CHECKPOINT_DIR, DET_SCORE_THRESH, DET_TOP_K, DET_NMS_IOU, DET_MIN_BOX_SIZE
-from model.kuronet import UNet, DetectorHead
+from config import (DATA_DIR, DEVICE, IMAGE_SIZE, CHECKPOINT_DIR,
+                    DET_SCORE_THRESH, DET_TOP_K, DET_NMS_IOU, DET_MIN_BOX_SIZE,
+                    STAGE1_DENSITY_GRID, STAGE1_DENSITY_FACTOR, STAGE1_AVG_GT_PER_IMAGE,
+                    BACKBONE_BASE_FEATURES, BACKBONE_TYPE)
+from model.kuronet import DetectorHead, build_backbone
 from utils import KuzushijiDataset
+from utils.detection_utils import spatial_density_filter
 from utils.vocab import VocabManager
 
 
@@ -70,7 +81,7 @@ def non_max_suppression(boxes, scores, iou_threshold=0.5):
 def extract_boxes_from_heatmap(
     heatmap_probs,      # (1,1,H,W) already sigmoid
     bbox_reg,           # (1,4,H,W) = (dx,dy,bw,bh)
-    confidence_thresh=0.5,     
+    confidence_thresh=0.5,
     output_size=(64, 64),
     image_size=IMAGE_SIZE,
     top_k=200,
@@ -127,15 +138,13 @@ def extract_boxes_from_heatmap(
         x2 = float(np.clip(x2, 0, W_img))
         y2 = float(np.clip(y2, 0, H_img))
 
-        # enforce ordering
         if x2 <= x1 or y2 <= y1:
             skipped_invalid += 1
             continue
 
         boxes.append([x1, y1, x2, y2])
         scores_out.append(float(sc))
-    
-    # Debug: print stats on first batch
+
     if debug:
         bw_vals = bbox_np[2]
         bh_vals = bbox_np[3]
@@ -148,14 +157,94 @@ def extract_boxes_from_heatmap(
     if len(boxes) == 0:
         return [], [], []
 
-    # NMS
     keep = non_max_suppression(boxes, scores_out, iou_threshold=nms_iou)
     boxes = [boxes[i] for i in keep]
     scores_out = [scores_out[i] for i in keep]
 
-    # you currently don’t predict classes in stage1 => dummy class=0
+    boxes, scores_out = spatial_density_filter(
+        boxes, scores_out, image_size,
+        grid_size=STAGE1_DENSITY_GRID,
+        density_factor=STAGE1_DENSITY_FACTOR,
+        avg_gt_per_image=STAGE1_AVG_GT_PER_IMAGE,
+    )
+
     classes = [0] * len(boxes)
     return boxes, scores_out, classes
+
+
+def _extract_all_peaks(
+    heatmap_probs,
+    bbox_reg,
+    output_size,
+    image_size,
+    top_k,
+    min_box_size,
+):
+    """Extract all decoded peaks (box, score) without confidence threshold or NMS.
+
+    Used to cache raw proposals for post-hoc PR-curve threshold sweeps.
+    """
+    hm = heatmap_probs[0, 0]
+    bbox = bbox_reg[0]
+
+    pooled = F.max_pool2d(hm[None, None], kernel_size=3, stride=1, padding=1).squeeze()
+    peak_mask = hm == pooled
+    peak_idx = peak_mask.nonzero(as_tuple=False)
+
+    if peak_idx.numel() == 0:
+        return [], []
+
+    scores = hm[peak_mask]
+    sorted_scores, order = torch.sort(scores, descending=True)
+    if top_k is not None and len(order) > top_k:
+        order = order[:top_k]
+
+    ys = peak_idx[order, 0].detach().cpu().numpy()
+    xs = peak_idx[order, 1].detach().cpu().numpy()
+    scores_np = sorted_scores[:len(order)].detach().cpu().numpy().tolist()
+
+    H_img, W_img = image_size
+    H_out, W_out = output_size
+    stride_h = H_img / float(H_out)
+    stride_w = W_img / float(W_out)
+    bbox_np = bbox.detach().cpu().numpy()
+
+    boxes, scs = [], []
+    for y, x, sc in zip(ys, xs, scores_np):
+        dx, dy, bw, bh = bbox_np[:, y, x]
+        cx = (x + dx) * stride_w
+        cy = (y + dy) * stride_h
+        w = max(bw * stride_w, min_box_size)
+        h = max(bh * stride_h, min_box_size)
+        x1 = float(np.clip(cx - 0.5 * w, 0, W_img))
+        y1 = float(np.clip(cy - 0.5 * h, 0, H_img))
+        x2 = float(np.clip(cx + 0.5 * w, 0, W_img))
+        y2 = float(np.clip(cy + 0.5 * h, 0, H_img))
+        if x2 > x1 and y2 > y1:
+            boxes.append([x1, y1, x2, y2])
+            scs.append(float(sc))
+
+    return boxes, scs
+
+
+def _filter_peaks(all_boxes, all_scores, confidence_thresh, nms_iou):
+    """Apply confidence threshold + NMS + density filter to pre-extracted peak candidates."""
+    paired = [(b, s) for b, s in zip(all_boxes, all_scores) if s >= confidence_thresh]
+    if not paired:
+        return []
+    boxes, scores = zip(*paired)
+    keep = non_max_suppression(list(boxes), list(scores), iou_threshold=nms_iou)
+    if not keep:
+        return []
+    kept_boxes = [boxes[i] for i in keep]
+    kept_scores = [scores[i] for i in keep]
+    kept_boxes, _ = spatial_density_filter(
+        kept_boxes, kept_scores, IMAGE_SIZE,
+        grid_size=STAGE1_DENSITY_GRID,
+        density_factor=STAGE1_DENSITY_FACTOR,
+        avg_gt_per_image=STAGE1_AVG_GT_PER_IMAGE,
+    )
+    return kept_boxes
 
 
 # --------------------------------------------------
@@ -208,6 +297,45 @@ def match_predictions_to_gt(gt_boxes, pred_boxes, iou_threshold=0.5):
     fn = len(gt_boxes) - len(matched_gt)
     return tp, fp, fn, matched_ious
 
+
+def _get_fn_indices(gt_boxes, pred_boxes, iou_threshold=0.5):
+    """Return the set of GT box indices that have no matching prediction (false negatives).
+
+    Uses the same greedy matching as match_predictions_to_gt so the highlighted
+    FN boxes are consistent with the reported TP/FP/FN counts.
+    """
+    if not gt_boxes:
+        return set()
+    if not pred_boxes:
+        return set(range(len(gt_boxes)))
+
+    gt_arr = np.asarray(gt_boxes, dtype=np.float32)
+    pred_arr = np.asarray(pred_boxes, dtype=np.float32)
+    if gt_arr.ndim == 1:
+        gt_arr = gt_arr.reshape(1, 4)
+    if pred_arr.ndim == 1:
+        pred_arr = pred_arr.reshape(1, 4)
+
+    # Pre-compute full IoU matrix
+    ious = np.zeros((len(pred_arr), len(gt_arr)), dtype=np.float32)
+    for i, pred_box in enumerate(pred_arr):
+        ious[i] = compute_iou_batch(pred_box, gt_arr)
+
+    # Greedy: for each prediction, match to best *unmatched* GT — identical to
+    # match_predictions_to_gt so visualized FNs always agree with the metrics
+    matched_gt = set()
+    for i in range(len(pred_arr)):
+        best_iou, best_j = 0.0, -1
+        for j in range(len(gt_arr)):
+            if j not in matched_gt and ious[i, j] > best_iou:
+                best_iou = ious[i, j]
+                best_j = j
+        if best_iou >= iou_threshold:
+            matched_gt.add(best_j)
+
+    return set(range(len(gt_boxes))) - matched_gt
+
+
 def compute_detection_metrics(gt_boxes_list, pred_boxes_list, iou_threshold=0.5):
     total_tp = total_fp = total_fn = 0
     matched_ious = []
@@ -237,11 +365,11 @@ def denormalize_image(image_tensor):
 
 
 # -------------------------
-# Main visualtisation function
+# Visualisation functions
 # -------------------------
 
-def visualize_boxes_only(image_tensor, gt_boxes, pred_boxes, out_path):
-    img = denormalize_image(image_tensor)
+def visualize_boxes_only(image_bgr, gt_boxes, pred_boxes, out_path):
+    img = image_bgr.copy()
     for box in gt_boxes:
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 1)
@@ -250,22 +378,148 @@ def visualize_boxes_only(image_tensor, gt_boxes, pred_boxes, out_path):
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
     cv2.imwrite(str(out_path), img)
 
-def visualize_centers_only(image_tensor, gt_boxes, pred_boxes, out_path):
-    img = denormalize_image(image_tensor)
 
+def visualize_centers_only(image_bgr, gt_boxes, pred_boxes, out_path):
+    img = image_bgr.copy()
     for box in gt_boxes:
         x1, y1, x2, y2 = box
         cx = int(0.5 * (x1 + x2))
         cy = int(0.5 * (y1 + y2))
         cv2.circle(img, (cx, cy), 2, (0, 255, 0), -1)
-
     for box in pred_boxes:
         x1, y1, x2, y2 = box
         cx = int(0.5 * (x1 + x2))
         cy = int(0.5 * (y1 + y2))
         cv2.circle(img, (cx, cy), 2, (0, 0, 255), -1)
-
     cv2.imwrite(str(out_path), img)
+
+
+def visualize_fn_highlighted(image_bgr, gt_boxes, pred_boxes, out_path, iou_threshold=0.5,
+                             fn_count=None, fn_rate=None):
+    """Color-coded: green=TP GT, red=FN GT (thick), blue=all predictions."""
+    img = image_bgr.copy()
+    fn_idx = _get_fn_indices(gt_boxes, pred_boxes, iou_threshold)
+    for i, box in enumerate(gt_boxes):
+        x1, y1, x2, y2 = map(int, box)
+        if i in fn_idx:
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 220), 2)   # red   = FN GT
+        else:
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 0), 1)   # green = TP GT
+    for box in pred_boxes:
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (220, 100, 0), 1)     # blue  = pred
+    if fn_count is not None and fn_rate is not None:
+        label = f"FN={fn_count} ({fn_rate*100:.1f}%)  green=TP  RED=FN  blue=pred"
+        cv2.putText(img, label, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2)
+        cv2.putText(img, label, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    cv2.imwrite(str(out_path), img)
+
+
+def visualize_fn_only(image_bgr, gt_boxes, pred_boxes, out_path, iou_threshold=0.5,
+                      fn_count=None, fn_rate=None):
+    """Show ONLY the missed GT boxes (FNs) — no TP or prediction clutter."""
+    img = image_bgr.copy()
+    fn_idx = _get_fn_indices(gt_boxes, pred_boxes, iou_threshold)
+    for i in fn_idx:
+        x1, y1, x2, y2 = map(int, gt_boxes[i])
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)       # red = missed
+        # small dot at centre so tiny boxes are still visible
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        cv2.circle(img, (cx, cy), 3, (0, 0, 255), -1)
+    if fn_count is not None and fn_rate is not None:
+        label = f"FN={fn_count} ({fn_rate*100:.1f}%)  red=MISSED GT only"
+        cv2.putText(img, label, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2)
+        cv2.putText(img, label, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    cv2.imwrite(str(out_path), img)
+
+
+# -------------------------
+# Analysis plots
+# -------------------------
+
+def plot_pr_curve(pr_results, out_path):
+    thresholds = [r[0] for r in pr_results]
+    precisions = [r[1] for r in pr_results]
+    recalls    = [r[2] for r in pr_results]
+    f1s        = [r[3] for r in pr_results]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    ax1.plot(recalls, precisions, "b-o", markersize=4)
+    for i, (t, p, r, _) in enumerate(pr_results):
+        if i % 3 == 0:
+            ax1.annotate(f"{t:.2f}", (r, p), textcoords="offset points",
+                         xytext=(4, 4), fontsize=7)
+    ax1.set_xlabel("Recall")
+    ax1.set_ylabel("Precision")
+    ax1.set_title("Precision-Recall Curve")
+    ax1.set_xlim(0, 1)
+    ax1.set_ylim(0, 1)
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(thresholds, recalls,    "g-o", markersize=4, label="Recall")
+    ax2.plot(thresholds, precisions, "b-o", markersize=4, label="Precision")
+    ax2.plot(thresholds, f1s,        "r-o", markersize=4, label="F1")
+    best = int(np.argmax(f1s))
+    ax2.axvline(thresholds[best], color="r", linestyle="--", alpha=0.5,
+                label=f"Best F1={f1s[best]:.3f} @ thr={thresholds[best]:.2f}")
+    ax2.set_xlabel("Confidence Threshold")
+    ax2.set_ylabel("Score")
+    ax2.set_title("Metrics vs Confidence Threshold")
+    ax2.legend(fontsize=8)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"PR curve saved: {out_path}")
+
+
+def plot_fn_size_analysis(fn_sizes, tp_sizes, out_path):
+    fn_arr = np.array(fn_sizes) if fn_sizes else np.zeros(0)
+    tp_arr = np.array(tp_sizes) if tp_sizes else np.zeros(0)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    if len(fn_arr):
+        ax1.hist(fn_arr, bins=40, color="red",   alpha=0.6, label=f"FN (n={len(fn_arr)})")
+    if len(tp_arr):
+        ax1.hist(tp_arr, bins=40, color="green", alpha=0.6, label=f"TP (n={len(tp_arr)})")
+    ax1.set_xlabel("Box area (px²)")
+    ax1.set_ylabel("Count")
+    ax1.set_title("Box Area: FN vs TP GT boxes")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    fn_side = np.sqrt(fn_arr) if len(fn_arr) else np.zeros(0)
+    tp_side = np.sqrt(tp_arr) if len(tp_arr) else np.zeros(0)
+    if len(fn_side):
+        ax2.hist(fn_side, bins=40, color="red",   alpha=0.6, label="FN")
+    if len(tp_side):
+        ax2.hist(tp_side, bins=40, color="green", alpha=0.6, label="TP")
+    ax2.set_xlabel("Box side ≈ √area (px)")
+    ax2.set_ylabel("Count")
+    ax2.set_title("Box Side Length: FN vs TP GT boxes")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    title_parts = []
+    if len(fn_arr):
+        title_parts.append(f"FN median area={np.median(fn_arr):.1f}px²")
+    if len(tp_arr):
+        title_parts.append(f"TP median area={np.median(tp_arr):.1f}px²")
+    if title_parts:
+        fig.suptitle("  |  ".join(title_parts), fontsize=11)
+
+    plt.tight_layout()
+    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"FN size analysis saved: {out_path}")
+
+
+# -------------------------
+# Main validation function
+# -------------------------
 
 def validate_stage1(
     checkpoint_path,
@@ -277,6 +531,7 @@ def validate_stage1(
     iou_threshold=0.5,
     min_box_size=DET_MIN_BOX_SIZE,
     job_id=None,
+    worst_n=30,
 ):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     resolved_job_id = job_id or os.environ.get("SLURM_JOB_ID") or os.environ.get("JOB_ID")
@@ -304,21 +559,29 @@ def validate_stage1(
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
-    unet = UNet(in_channels=3, base_features=32).to(DEVICE)
-    detector = DetectorHead(in_ch=32, num_classes=vocab.vocab_size, predict_classes=False).to(DEVICE)
-
     ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+    backbone_type = ckpt.get("backbone_type", BACKBONE_TYPE)
+    backbone = build_backbone(backbone_type, BACKBONE_BASE_FEATURES, pretrained=False).to(DEVICE)
+    detector = DetectorHead(in_ch=BACKBONE_BASE_FEATURES, num_classes=vocab.vocab_size, predict_classes=False).to(DEVICE)
 
-    unet.load_state_dict(ckpt["unet_state_dict"], strict=True)
+    state_key = "backbone_state_dict" if "backbone_state_dict" in ckpt else "unet_state_dict"
+    backbone.load_state_dict(ckpt[state_key], strict=True)
     detector.load_state_dict(ckpt["detector_state_dict"], strict=True)
 
-    unet.eval()
+    backbone.eval()
     detector.eval()
 
     all_gt_boxes = []
     all_pred_boxes = []
+    all_raw_peaks = []   # list of (boxes, scores) per image — for PR curve sweep
 
-    # logs
+    # Buffer for worst-N FN visualization: (fn_count, img_idx, bgr_uint8, gt_boxes, pred_boxes)
+    image_buffer = []
+
+    # FN / TP size accumulation
+    fn_areas = []
+    tp_areas = []
+
     total_gt = 0
     total_pred = 0
 
@@ -330,10 +593,10 @@ def validate_stage1(
             images = batch["image"].to(DEVICE)
             gt_boxes = batch["boxes"][0].cpu().numpy().tolist()
 
-            features = unet(images)
+            features = backbone(images)
             outputs = detector(features)
 
-            heatmap_probs = torch.sigmoid(outputs["heatmap"])  
+            heatmap_probs = torch.sigmoid(outputs["heatmap"])
             bbox_reg = outputs["bbox"]
 
             _, _, Hf, Wf = features.shape
@@ -351,33 +614,57 @@ def validate_stage1(
                 debug=debug_this,
             )
 
+            # Raw peaks (no threshold) for PR-curve sweep
+            raw_boxes, raw_scores = _extract_all_peaks(
+                heatmap_probs=heatmap_probs,
+                bbox_reg=bbox_reg,
+                output_size=(Hf, Wf),
+                image_size=IMAGE_SIZE,
+                top_k=top_k,
+                min_box_size=min_box_size,
+            )
+
             all_gt_boxes.append(gt_boxes)
             all_pred_boxes.append(pred_boxes)
+            all_raw_peaks.append((raw_boxes, raw_scores))
 
             total_gt += len(gt_boxes)
             total_pred += len(pred_boxes)
 
-            # check sth for first batch
             if debug_this:
                 print(f"    num gt boxes: {len(gt_boxes)}")
                 if len(pred_boxes) > 0:
                     pred_arr = np.asarray(pred_boxes, dtype=np.float32)
                     widths = pred_arr[:, 2] - pred_arr[:, 0]
                     heights = pred_arr[:, 3] - pred_arr[:, 1]
-                    print(f"    pred box width stats min/max/mean: {widths.min():.2f} / {widths.max():.2f} / {widths.mean():.2f}")
+                    print(f"    pred box width  stats min/max/mean: {widths.min():.2f} / {widths.max():.2f} / {widths.mean():.2f}")
                     print(f"    pred box height stats min/max/mean: {heights.min():.2f} / {heights.max():.2f} / {heights.mean():.2f}")
                 else:
                     print("    no predicted boxes after decode")
-            if idx < 30:
-                vis_path = out_dir / f"sample_{idx:04d}.png"
-                vis_centers = out_dir / f"sample_{idx:04d}_centers.png"
-                visualize_boxes_only(images[0], gt_boxes, pred_boxes, vis_path)
-                visualize_centers_only(images[0], gt_boxes, pred_boxes, vis_centers)
 
+            # Per-image FN count + size analysis
+            fn_idx = _get_fn_indices(gt_boxes, pred_boxes, iou_threshold)
+            fn_count = len(fn_idx)
+            fn_rate = fn_count / max(1, len(gt_boxes))
+
+            for i, box in enumerate(gt_boxes):
+                x1, y1, x2, y2 = box
+                area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                if i in fn_idx:
+                    fn_areas.append(area)
+                else:
+                    tp_areas.append(area)
+
+            # Store for worst-N selection (denormalize once, keep as uint8 to save memory)
+            bgr = denormalize_image(images[0])
+            image_buffer.append((fn_count, fn_rate, idx, bgr, gt_boxes, pred_boxes))
+
+    # --------------------------------------------------
+    # Global metrics
+    # --------------------------------------------------
     metrics = compute_detection_metrics(all_gt_boxes, all_pred_boxes, iou_threshold=iou_threshold)
 
-    # extra logs
-    avg_gt = total_gt / max(1, len(all_gt_boxes))
+    avg_gt   = total_gt   / max(1, len(all_gt_boxes))
     avg_pred = total_pred / max(1, len(all_gt_boxes))
 
     print("\n" + "=" * 70)
@@ -393,6 +680,102 @@ def validate_stage1(
     print(f"Mean IoU(TP): {metrics['mean_iou_tp']:.4f} (matches={metrics['num_matches']})")
     print("=" * 70)
 
+    # --------------------------------------------------
+    # FN size stats (console)
+    # --------------------------------------------------
+    if fn_areas and tp_areas:
+        fn_arr = np.array(fn_areas)
+        tp_arr = np.array(tp_areas)
+        print(f"\nFN box area  — median: {np.median(fn_arr):.1f}px²  mean: {np.mean(fn_arr):.1f}px²  p25: {np.percentile(fn_arr, 25):.1f}  p75: {np.percentile(fn_arr, 75):.1f}")
+        print(f"TP box area  — median: {np.median(tp_arr):.1f}px²  mean: {np.mean(tp_arr):.1f}px²  p25: {np.percentile(tp_arr, 25):.1f}  p75: {np.percentile(tp_arr, 75):.1f}")
+        fn_small = (fn_arr < np.median(tp_arr)).sum()
+        print(f"FN boxes smaller than TP median: {fn_small}/{len(fn_arr)} ({100*fn_small/len(fn_arr):.1f}%)")
+
+    # --------------------------------------------------
+    # Save worst-N images — two orderings
+    #   by_rate : highest FN proportion (FN / GT)  — best for spotting patterns
+    #   by_count: highest raw FN count             — worst absolute misses
+    # Each folder gets three views per image:
+    #   _fn_only : ONLY the missed boxes (no clutter)
+    #   _fn      : TP=green, FN=red, pred=blue
+    #   _centers : GT=green dot, pred=red dot
+    # --------------------------------------------------
+    per_image_fn_stats = []
+
+    def _save_worst(sorted_buf, folder_name):
+        vis_dir = out_dir / folder_name
+        vis_dir.mkdir(exist_ok=True)
+        for rank, (fn_count, fn_rate, img_idx, bgr, gt_boxes, pred_boxes) in enumerate(sorted_buf[:worst_n]):
+            stem = f"rank{rank:02d}_fn{fn_count}_rate{fn_rate:.2f}_img{img_idx:04d}"
+            visualize_fn_only(bgr, gt_boxes, pred_boxes,
+                              vis_dir / f"{stem}_fn_only.png", iou_threshold,
+                              fn_count=fn_count, fn_rate=fn_rate)
+            visualize_fn_highlighted(bgr, gt_boxes, pred_boxes,
+                                     vis_dir / f"{stem}_fn.png", iou_threshold,
+                                     fn_count=fn_count, fn_rate=fn_rate)
+            visualize_centers_only(bgr, gt_boxes, pred_boxes,
+                                   vis_dir / f"{stem}_centers.png")
+            if rank == 0:  # full box overlay only for rank-0 to save disk
+                visualize_boxes_only(bgr, gt_boxes, pred_boxes,
+                                     vis_dir / f"{stem}_all.png")
+        return vis_dir
+
+    # Collect per-image stats
+    for fn_count, fn_rate, img_idx, _, gt_boxes, pred_boxes in image_buffer:
+        per_image_fn_stats.append({
+            "img_idx": img_idx,
+            "fn_count": fn_count,
+            "fn_rate": round(fn_rate, 4),
+            "gt_count": len(gt_boxes),
+            "pred_count": len(pred_boxes),
+        })
+
+    by_rate  = sorted(image_buffer, key=lambda x: x[1], reverse=True)
+    by_count = sorted(image_buffer, key=lambda x: x[0], reverse=True)
+
+    dir_rate  = _save_worst(by_rate,  "worst_fn_rate")
+    dir_count = _save_worst(by_count, "worst_fn_count")
+
+    per_image_fn_stats.sort(key=lambda r: r["fn_rate"], reverse=True)
+    with open(out_dir / "per_image_fn_stats.json", "w") as f:
+        json.dump(per_image_fn_stats, f, indent=2)
+    print(f"\nWorst-{worst_n} by FN rate:  {dir_rate}")
+    print(f"Worst-{worst_n} by FN count: {dir_count}")
+
+    # --------------------------------------------------
+    # PR curve sweep
+    # --------------------------------------------------
+    print("\nRunning PR-curve threshold sweep...")
+    pr_thresholds = np.linspace(0.05, 0.90, 18).tolist()
+    pr_results = []
+    for thresh in pr_thresholds:
+        filtered = [
+            _filter_peaks(raw_boxes, raw_scores, thresh, nms_iou)
+            for raw_boxes, raw_scores in all_raw_peaks
+        ]
+        m = compute_detection_metrics(all_gt_boxes, filtered, iou_threshold=iou_threshold)
+        pr_results.append((round(thresh, 3), m["precision"], m["recall"], m["f1"]))
+
+    best_f1_row = max(pr_results, key=lambda r: r[3])
+    print(f"  Optimal threshold: {best_f1_row[0]:.2f}  "
+          f"→ P={best_f1_row[1]:.4f}  R={best_f1_row[2]:.4f}  F1={best_f1_row[3]:.4f}")
+    print(f"  Current threshold: {confidence_thresh:.2f}  "
+          f"→ P={metrics['precision']:.4f}  R={metrics['recall']:.4f}  F1={metrics['f1']:.4f}")
+
+    plot_pr_curve(pr_results, out_dir / "pr_curve.png")
+
+    with open(out_dir / "pr_curve.json", "w") as f:
+        json.dump([{"threshold": r[0], "precision": r[1], "recall": r[2], "f1": r[3]}
+                   for r in pr_results], f, indent=2)
+
+    # --------------------------------------------------
+    # FN size analysis plot
+    # --------------------------------------------------
+    plot_fn_size_analysis(fn_areas, tp_areas, out_dir / "fn_size_analysis.png")
+
+    # --------------------------------------------------
+    # Save metrics JSON
+    # --------------------------------------------------
     metrics_to_save = {
         **metrics,
         "confidence_thresh": confidence_thresh,
@@ -403,12 +786,20 @@ def validate_stage1(
         "images_evaluated": len(all_gt_boxes),
         "avg_gt_per_img": avg_gt,
         "avg_pred_per_img": avg_pred,
+        "optimal_threshold": best_f1_row[0],
+        "optimal_f1": best_f1_row[3],
+        "fn_area_median": float(np.median(fn_areas)) if fn_areas else None,
+        "tp_area_median": float(np.median(tp_areas)) if tp_areas else None,
     }
 
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(metrics_to_save, f, indent=2)
-    print(f"✅ saved: {out_dir/'metrics.json'}")
-    print(f"✅ visuals: {out_dir} (first ~30 imgs)")
+
+    print(f"\n✅ saved: {out_dir / 'metrics.json'}")
+    print(f"✅ worst-{worst_n} by FN rate:  {dir_rate}")
+    print(f"✅ worst-{worst_n} by FN count: {dir_count}")
+    print(f"✅ PR curve: {out_dir / 'pr_curve.png'}")
+    print(f"✅ FN size:  {out_dir / 'fn_size_analysis.png'}")
 
     return metrics
 
@@ -423,8 +814,11 @@ if __name__ == "__main__":
     p.add_argument("--nms_iou", type=float, default=DET_NMS_IOU)
     p.add_argument("--iou_thr", type=float, default=0.5)
     p.add_argument("--min_box_size", type=float, default=DET_MIN_BOX_SIZE)
-    p.add_argument("--job_id", type=str, default=None, help="Optional job id suffix for output folder (default: SLURM_JOB_ID env)")
+    p.add_argument("--job_id", type=str, default=None,
+                   help="Optional job id suffix for output folder (default: SLURM_JOB_ID env)")
     p.add_argument("--num_samples", type=int, default=0, help="0 => full split")
+    p.add_argument("--worst_n", type=int, default=30,
+                   help="Save this many worst-FN images (sorted by FN count)")
     args = p.parse_args()
 
     validate_stage1(
@@ -437,4 +831,5 @@ if __name__ == "__main__":
         iou_threshold=args.iou_thr,
         min_box_size=args.min_box_size,
         job_id=args.job_id,
+        worst_n=args.worst_n,
     )

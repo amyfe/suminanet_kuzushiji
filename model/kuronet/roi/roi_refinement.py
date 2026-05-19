@@ -164,12 +164,10 @@ class ROIRefinementHead(nn.Module):
         """
         Convert xyxy boxes to normalized geometry features.
 
-        Args:
-            boxes: (B, T, 4)
-            image_size: (H, W)
-
-        Returns:
-            geom: (B, T, 4) = [cx, cy, bw, bh], normalized to image size
+        Returns [cx, cy, log(bw), log(bh)] — log-space width/height gives a
+        larger magnitude signal (e.g. log(0.02) ≈ -3.9 vs linear 0.02),
+        making it easier for geom_proj to distinguish small chars from large ones.
+        Matches the encoding in ROITokenProjector for consistency.
         """
         h_img, w_img = image_size
 
@@ -183,7 +181,7 @@ class ROIRefinementHead(nn.Module):
         bw = (x2 - x1).clamp_min(1e-6) / max(float(w_img), 1.0)
         bh = (y2 - y1).clamp_min(1e-6) / max(float(h_img), 1.0)
 
-        return torch.stack([cx, cy, bw, bh], dim=-1)
+        return torch.stack([cx, cy, bw.log(), bh.log()], dim=-1)
 
     @staticmethod
     def _apply_box_deltas(

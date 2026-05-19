@@ -26,13 +26,81 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
+from config import KURONET_BG_SCORE_GATE, KURONET_CROP_ENCODER_SIZE
 from model.kuronet.backbone.feature_projector import FeatureProjector
+from model.kuronet.backbone.roi_crop_encoder import ROICropEncoder
 from model.kuronet.context.roi_context import ROIContextEncoder
 from model.kuronet.detection.proposal_utils import extract_coarse_proposals
 from model.kuronet.roi.roi_ordering import ROIReadingOrder
 from model.kuronet.roi.roi_pool import ROIPoolEncoder
 from model.kuronet.roi.roi_refinement import ROIRefinementHead
 from model.kuronet.roi.roi_tokens import ROITokenProjector
+
+
+def _compute_neighbor_features(
+    boxes: torch.Tensor,   # (B, T, 4) xyxy, sorted by reading order
+    mask: torch.Tensor,    # (B, T) bool
+) -> torch.Tensor:
+    """
+    Per-ROI relative geometry to adjacent neighbors in reading order.
+
+    Returns (B, T, 6):
+        [dcx_prev/w, dcy_prev/h, log_area_ratio_prev,
+         dcx_next/w, dcy_next/h, log_area_ratio_next]
+
+    A very small neighbor (log_area_ratio << 0) signals a potential dakuten mark.
+    Boundary and invalid positions are zero-filled.
+    """
+    B, T, _ = boxes.shape
+    device, dtype = boxes.device, boxes.dtype
+
+    cx       = (boxes[..., 0] + boxes[..., 2]) * 0.5       # (B, T)
+    cy       = (boxes[..., 1] + boxes[..., 3]) * 0.5
+    w        = (boxes[..., 2] - boxes[..., 0]).clamp(min=1e-6)
+    h        = (boxes[..., 3] - boxes[..., 1]).clamp(min=1e-6)
+    log_area = (w * h).clamp(min=1e-6).log()
+
+    # Which positions have a valid previous / next neighbor
+    prev_valid = torch.zeros(B, T, dtype=torch.bool, device=device)
+    next_valid = torch.zeros(B, T, dtype=torch.bool, device=device)
+    if T > 1:
+        prev_valid[:, 1:] = mask[:, :-1]
+        next_valid[:, :-1] = mask[:, 1:]
+    prev_valid &= mask
+    next_valid &= mask
+
+    # Shifted copies (only meaningful where *_valid is True)
+    cx_prev = torch.zeros_like(cx)
+    cy_prev = torch.zeros_like(cy)
+    la_prev = torch.zeros_like(log_area)
+    cx_prev[:, 1:] = cx[:, :-1]
+    cy_prev[:, 1:] = cy[:, :-1]
+    la_prev[:, 1:] = log_area[:, :-1]
+
+    cx_next = torch.zeros_like(cx)
+    cy_next = torch.zeros_like(cy)
+    la_next = torch.zeros_like(log_area)
+    cx_next[:, :-1] = cx[:, 1:]
+    cy_next[:, :-1] = cy[:, 1:]
+    la_next[:, :-1] = log_area[:, 1:]
+
+    dcx_prev  = torch.zeros_like(cx)
+    dcy_prev  = torch.zeros_like(cy)
+    dlog_prev = torch.zeros_like(log_area)
+    dcx_prev[prev_valid]  = ((cx - cx_prev) / w)[prev_valid]
+    dcy_prev[prev_valid]  = ((cy - cy_prev) / h)[prev_valid]
+    dlog_prev[prev_valid] = (la_prev - log_area)[prev_valid]
+
+    dcx_next  = torch.zeros_like(cx)
+    dcy_next  = torch.zeros_like(cy)
+    dlog_next = torch.zeros_like(log_area)
+    dcx_next[next_valid]  = ((cx_next - cx) / w)[next_valid]
+    dcy_next[next_valid]  = ((cy_next - cy) / h)[next_valid]
+    dlog_next[next_valid] = (la_next - log_area)[next_valid]
+
+    return torch.stack(
+        [dcx_prev, dcy_prev, dlog_prev, dcx_next, dcy_next, dlog_next], dim=-1
+    )  # (B, T, 6)
 
 
 class KuroNetRecognizer(nn.Module):
@@ -86,11 +154,23 @@ class KuroNetRecognizer(nn.Module):
         det_min_box_size: float = 1.66,
 
         dropout: float = 0.1,
+
+        # Background class ID (last vocab token). Predictions equal to this
+        # are filtered out of the transcription at inference time.
+        bg_id: Optional[int] = None,
+
+        # Pretrained EfficientNet-B0 on raw image crops (Clanuwat VGG-16 equivalent).
+        # When enabled, each ROI crop is fed through a frozen pretrained network and
+        # the resulting features are added to roi_feats before refinement.
+        use_crop_encoder: bool = True,
+        crop_encoder_size: tuple[int, int] = KURONET_CROP_ENCODER_SIZE,
+        freeze_crop_encoder: bool = True,
     ):
         super().__init__()
 
         self.backbone = backbone
         self.detector = detector
+        self.bg_id = bg_id
 
         self.det_score_thresh = float(det_score_thresh)
         self.det_top_k = int(det_top_k)
@@ -127,6 +207,29 @@ class KuroNetRecognizer(nn.Module):
 
         self.roi_order = ROIReadingOrder(line_merge_thresh_ratio=0.6)
 
+        # --- Pretrained ROI crop encoder (EfficientNet-B0, Clanuwat VGG-16 equivalent) ---
+        # Fused via concat+project rather than simple addition so the network can
+        # learn to weight UNet features vs. ImageNet features independently.
+        if use_crop_encoder:
+            self.roi_crop_encoder: Optional[ROICropEncoder] = ROICropEncoder(
+                out_dim=roi_feat_dim,
+                crop_size=crop_encoder_size,
+                freeze_encoder=freeze_crop_encoder,
+                pretrained=True,
+            )
+            # Projects [roi_feats || crop_feats] -> roi_feat_dim
+            _fusion = nn.Linear(roi_feat_dim * 2, roi_feat_dim, bias=True)
+            with torch.no_grad():
+                nn.init.zeros_(_fusion.weight)
+                nn.init.zeros_(_fusion.bias)
+                # First roi_feat_dim columns → identity, second half → zero
+                _fusion.weight[:, :roi_feat_dim].copy_(torch.eye(roi_feat_dim))
+            self.crop_fusion = _fusion
+
+        else:
+            self.roi_crop_encoder = None
+            self.crop_fusion = None
+
         self.roi_tokens = ROITokenProjector(
             roi_feat_dim=roi_feat_dim,
             token_dim=token_dim,
@@ -134,6 +237,15 @@ class KuroNetRecognizer(nn.Module):
             dropout=dropout,
             use_score_branch=bool(token_use_score_branch),
         )
+
+        # --- Neighbor feature projection (dakuten discriminator) ---
+        # Projects 6 relative-geometry scalars (prev/next neighbor Δcx, Δcy, log_area_ratio)
+        # into token space and adds to token_feats before the BiGRU.
+        # Zero-init so it starts neutral and learns incrementally.
+        _nbr = nn.Linear(6, token_dim, bias=True)
+        nn.init.zeros_(_nbr.weight)
+        nn.init.zeros_(_nbr.bias)
+        self.neighbor_proj: nn.Linear = _nbr
 
         # --- Context encoder (optional) ---
 
@@ -234,9 +346,23 @@ class KuroNetRecognizer(nn.Module):
             image_size=image_size,
         )
 
+        # --- Pretrained crop features (EfficientNet-B0 on raw image crops) ---
+        # Concat-project fusion: [roi_feats || crop_feats] -> roi_feat_dim.
+        # Gives the network independent control over how much to trust each source.
+        roi_feats_for_refine = roi_out["roi_feats"]
+        if self.roi_crop_encoder is not None and self.crop_fusion is not None:
+            crop_feats = self.roi_crop_encoder(
+                images=images,
+                roi_boxes=roi_out["roi_boxes"],
+                roi_mask=roi_out["roi_mask"],
+            )
+            roi_feats_for_refine = self.crop_fusion(
+                torch.cat([roi_feats_for_refine, crop_feats], dim=-1)
+            )
+
         # --- ROI refinement ---
         refine_out = self.roi_refine(
-            roi_feats=roi_out["roi_feats"],
+            roi_feats=roi_feats_for_refine,
             roi_boxes=roi_out["roi_boxes"],
             roi_scores=roi_out["roi_scores"],
             roi_mask=roi_out["roi_mask"],
@@ -263,7 +389,6 @@ class KuroNetRecognizer(nn.Module):
 
         # --- ROI token projection ---
         token_feats, token_mask = self.roi_tokens(
-            roi_feats=ordered["roi_feats"],
             refined_feats=ordered["refined_feats"],
             refined_boxes=ordered["boxes"],
             refine_scores=ordered["refine_scores"],
@@ -271,11 +396,26 @@ class KuroNetRecognizer(nn.Module):
             image_size=image_size,
         )
 
+        # --- Neighbor features (relative geometry to adjacent reading-order neighbors) ---
+        # Adds dakuten-discriminating signal: a tiny neighbor (log_area_ratio << 0)
+        # at a small spatial offset is a strong cue for voiced marks (び vs ひ, etc.).
+        nbr_feats = _compute_neighbor_features(ordered["boxes"], ordered["mask"])
+        token_feats = token_feats + self.neighbor_proj(nbr_feats)
+
         # --- Context encoder (optional BiGRU) ---
         if self.use_context and self.context_encoder is not None:
+            # Normalized (cx, cy) from refined boxes in sorted order.
+            # ordered["boxes"] is (B, T, 4) in image xyxy coordinates.
+            sorted_boxes = ordered["boxes"]
+            cx = (sorted_boxes[..., 0] + sorted_boxes[..., 2]) * 0.5 / float(w_img)
+            cy = (sorted_boxes[..., 1] + sorted_boxes[..., 3]) * 0.5 / float(h_img)
+            spatial_coords = torch.stack([cx, cy], dim=-1)  # (B, T, 2)
+
             context_feats, context_mask = self.context_encoder(
                 seq=token_feats,
                 mask=token_mask,
+                spatial_coords=spatial_coords,
+                refine_scores=ordered["refine_scores"],
             )
         else:
             context_feats = token_feats
@@ -304,6 +444,7 @@ class KuroNetRecognizer(nn.Module):
             "ordered_boxes": ordered["boxes"],
             "ordered_mask": ordered["mask"],
             "sort_indices": ordered["sort_indices"],
+            "isolation_mask": ordered.get("isolation_mask", None),
             "ordering_diagnostics": ordered.get("ordering_diagnostics", None),
 
             # Token and context features (sorted order)
@@ -344,6 +485,7 @@ class KuroNetRecognizer(nn.Module):
         orientations: List[str],
         vocab,
         score_thresh: float = 0.0,
+        bg_score_gate: float = KURONET_BG_SCORE_GATE,
     ) -> List[str]:
         """
         Inference: returns a transcription string per image.
@@ -352,12 +494,17 @@ class KuroNetRecognizer(nn.Module):
           1. Run forward pass
           2. Argmax over char_logits to get predicted char IDs
           3. Filter by roi_mask (and optionally refine_score threshold)
-          4. ROIs are already in reading order from sort_batch
-          5. Decode IDs with vocab -> list of chars -> join as string
+          4. Score-gated BG suppression: if sigmoid(refine_score) > bg_score_gate
+             AND pred == bg_id, override with best non-BG class.
+          5. ROIs are already in reading order from sort_batch
+          6. Decode IDs with vocab -> list of chars -> join as string
 
         Args:
             score_thresh: minimum refine_score (sigmoid) to include an ROI.
                           0.0 = include all valid ROIs (roi_mask only).
+            bg_score_gate: minimum refine_score (sigmoid) above which a BG
+                           prediction is suppressed and replaced with the best
+                           non-BG class.  0.0 disables the gate.
         """
         self.eval()
         outputs = self.forward(images, orientations)
@@ -390,7 +537,34 @@ class KuroNetRecognizer(nn.Module):
             logits_b = char_logits[b, valid_positions]  # (N_valid, V)
             pred_ids = logits_b.argmax(dim=-1).tolist()  # (N_valid,)
 
-            # Decode with vocab (skip special tokens)
+            # Score-gated BG suppression: a high-quality proposal (high refine_score)
+            # predicted as BG is likely a real character misclassified.
+            # Override its prediction with the best non-BG class.
+            if (
+                self.bg_id is not None
+                and bg_score_gate > 0.0
+                and sort_indices is not None
+                and refine_scores is not None
+            ):
+                si_b = sort_indices[b]
+                orig_positions = si_b[valid_positions]   # map sorted -> original order
+                raw_scores = refine_scores[b].index_select(0, orig_positions)
+                roi_quality = torch.sigmoid(raw_scores)  # (N_valid,)
+
+                suppressed: List[int] = []
+                for i, p_id in enumerate(pred_ids):
+                    if p_id == self.bg_id and float(roi_quality[i]) > bg_score_gate:
+                        lgt = logits_b[i].clone()
+                        lgt[self.bg_id] = float("-inf")
+                        suppressed.append(int(lgt.argmax().item()))
+                    else:
+                        suppressed.append(p_id)
+                pred_ids = suppressed
+
+            # Filter remaining background predictions
+            if self.bg_id is not None:
+                pred_ids = [p for p in pred_ids if p != self.bg_id]
+
             chars = vocab.decode(pred_ids, remove_special=True)
             results.append("".join(chars))
 

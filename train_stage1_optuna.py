@@ -25,6 +25,8 @@ from tqdm import tqdm
 from optuna.trial import TrialState
 
 from config import (
+    BACKBONE_BASE_FEATURES,
+    BACKBONE_TYPE,
     CHECKPOINT_DIR,
     DATA_DIR,
     DEVICE,
@@ -37,7 +39,7 @@ from config import (
     NUM_WORKERS,
     USE_MIXED_PRECISION,
 )
-from model.kuronet import DetectorHead, UNet
+from model.kuronet import DetectorHead, build_backbone
 from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
@@ -92,7 +94,7 @@ def make_dataloaders(vocab: VocabManager, batch_size: int) -> Tuple[DataLoader, 
 
 @torch.no_grad()
 def validate_detector(
-    unet: UNet,
+    backbone,
     detector: DetectorHead,
     dataloader: DataLoader,
     heatmap_sigma: float,
@@ -103,7 +105,7 @@ def validate_detector(
     bbox_radius: int = 1,
     pos_threshold: float = 0.3,
 ) -> float:
-    unet.eval()
+    backbone.eval()
     detector.eval()
 
     total_loss = 0.0
@@ -123,7 +125,7 @@ def validate_detector(
         ]
 
         with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
-            features = unet(images)
+            features = backbone(images)
             _, _, hf, wf = features.shape
             gt_heat, gt_bbox, gt_bbox_mask, _ = build_detection_targets(
                 boxes,
@@ -176,16 +178,16 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     vocab = VocabManager.from_annotations(ann_files)
     train_loader, val_loader = make_dataloaders(vocab, batch_size)
 
-    unet = UNet(in_channels=3, base_features=32).to(DEVICE)
+    backbone = build_backbone(BACKBONE_TYPE, BACKBONE_BASE_FEATURES).to(DEVICE)
     detector = DetectorHead(
-        in_ch=32,
+        in_ch=BACKBONE_BASE_FEATURES,
         num_classes=vocab.vocab_size,
         dropout_rate=dropout_rate,
         predict_classes=False,
     ).to(DEVICE)
 
     optimizer = optim.Adam(
-        list(unet.parameters()) + list(detector.parameters()),
+        list(backbone.parameters()) + list(detector.parameters()),
         lr=lr,
         weight_decay=weight_decay,
     )
@@ -196,7 +198,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     best_val = float("inf")
 
     for epoch in range(args.epochs):
-        unet.train()
+        backbone.train()
         detector.train()
 
         optimizer.zero_grad(set_to_none=True)
@@ -223,7 +225,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
             ]
 
             with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
-                features = unet(images)
+                features = backbone(images)
                 _, _, hf, wf = features.shape
                 gt_heat, gt_bbox, gt_bbox_mask, _ = build_detection_targets(
                     boxes,
@@ -256,7 +258,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
             if (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                 if scaler is not None:
                     scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(list(unet.parameters()) + list(detector.parameters()), 1.0)
+                torch.nn.utils.clip_grad_norm_(list(backbone.parameters()) + list(detector.parameters()), 1.0)
 
                 if scaler is not None:
                     scaler.step(optimizer)
@@ -272,7 +274,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
         if len(train_loader) % GRADIENT_ACCUMULATION_STEPS != 0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(list(unet.parameters()) + list(detector.parameters()), 1.0)
+            torch.nn.utils.clip_grad_norm_(list(backbone.parameters()) + list(detector.parameters()), 1.0)
             if scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
@@ -283,7 +285,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
         scheduler.step()
 
         val_loss = validate_detector(
-            unet=unet,
+            backbone=backbone,
             detector=detector,
             dataloader=val_loader,
             heatmap_sigma=heatmap_sigma,
@@ -303,7 +305,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     # Compute detection F1 on val set for recall-focused training mode.
     # Uses fixed inference params so trials are comparable on the same metric.
     if getattr(args, "optimize_f1", False):
-        unet.eval()
+        backbone.eval()
         detector.eval()
         all_gt_boxes: list = []
         all_pred_boxes: list = []
@@ -311,7 +313,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
             for batch in val_loader:
                 images = batch["image"].to(DEVICE)
                 gt_boxes = batch["boxes"][0].cpu().numpy().tolist()
-                features = unet(images)
+                features = backbone(images)
                 outputs = detector(features)
                 _, _, hf, wf = features.shape
                 pred_boxes, _, _ = extract_boxes_from_heatmap(
@@ -371,13 +373,15 @@ def objective_validation(trial: optuna.Trial, args: argparse.Namespace) -> float
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
-    unet = UNet(in_channels=3, base_features=32).to(DEVICE)
-    detector = DetectorHead(in_ch=32, num_classes=vocab.vocab_size, predict_classes=False).to(DEVICE)
-
     ckpt = torch.load(args.checkpoint, map_location=DEVICE)
-    unet.load_state_dict(ckpt["unet_state_dict"], strict=True)
+    backbone_type = ckpt.get("backbone_type", BACKBONE_TYPE)
+    backbone = build_backbone(backbone_type, BACKBONE_BASE_FEATURES, pretrained=False).to(DEVICE)
+    detector = DetectorHead(in_ch=BACKBONE_BASE_FEATURES, num_classes=vocab.vocab_size, predict_classes=False).to(DEVICE)
+
+    state_key = "backbone_state_dict" if "backbone_state_dict" in ckpt else "unet_state_dict"
+    backbone.load_state_dict(ckpt[state_key], strict=True)
     detector.load_state_dict(ckpt["detector_state_dict"], strict=True)
-    unet.eval()
+    backbone.eval()
     detector.eval()
 
     all_gt_boxes = []
@@ -391,7 +395,7 @@ def objective_validation(trial: optuna.Trial, args: argparse.Namespace) -> float
         images = batch["image"].to(DEVICE)
         gt_boxes = batch["boxes"][0].cpu().numpy().tolist()
 
-        features = unet(images)
+        features = backbone(images)
         outputs = detector(features)
 
         heatmap_probs = torch.sigmoid(outputs["heatmap"])
