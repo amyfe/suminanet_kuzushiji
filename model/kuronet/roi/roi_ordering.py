@@ -167,21 +167,18 @@ class ROIReadingOrder:
 
     def _horizontal_sort_indices(self, boxes: torch.Tensor) -> torch.Tensor:
         """
-        Horizontal reading order using gap-based row detection.
+        Horizontal reading order: rows top-to-bottom, within each row left-to-right.
 
-        1. Sort boxes by y-center (top to bottom).
-        2. Detect natural row breaks: gaps > 1.5 × 75th-percentile height.
-           Using the 75th percentile rather than the median makes this robust
-           to many small FP boxes (illustrations) that would pull the median down.
-        3. Sort rows top-to-bottom; sort within each row left-to-right.
+        Uses a compound sort key (row_rank * scale + x_left) instead of a Python
+        for-loop, eliminating GPU–CPU sync points from repeated .tolist() calls.
         """
         if boxes.numel() == 0:
             return torch.zeros((0,), dtype=torch.long, device=boxes.device)
 
         y_center = (boxes[:, 1] + boxes[:, 3]) * 0.5
-        heights = (boxes[:, 3] - boxes[:, 1]).clamp_min(1.0)
+        heights  = (boxes[:, 3] - boxes[:, 1]).clamp_min(1.0)
 
-        h75 = self._percentile_size(heights, 0.75)
+        h75        = self._percentile_size(heights, 0.75)
         gap_thresh = 1.5 * h75
 
         sorted_yc, sorted_idx = y_center.sort(descending=False)
@@ -195,40 +192,37 @@ class ROIReadingOrder:
         else:
             is_break = torch.ones(1, dtype=torch.bool, device=boxes.device)
 
-        row_ids = is_break.long().cumsum(0) - 1
-        num_rows = int(row_ids.max().item()) + 1
+        row_ids = is_break.long().cumsum(0) - 1   # (n,) in sorted order
 
-        sorted_indices: List[int] = []
-        for row_id in range(num_rows):
-            in_row = (row_ids == row_id)
-            orig_indices = sorted_idx[in_row]
-            x_left = boxes[orig_indices, 0]
-            within_row = orig_indices[x_left.argsort(descending=False)]
-            sorted_indices.extend(within_row.tolist())
+        # Map row IDs back to original box indices (scatter reverse of sort)
+        row_ids_orig = torch.zeros(boxes.size(0), dtype=torch.long, device=boxes.device)
+        row_ids_orig.scatter_(0, sorted_idx, row_ids)
 
-        return torch.tensor(sorted_indices, device=boxes.device, dtype=torch.long)
+        # Compound key: row_rank * scale + x_left
+        # Row rank is row_ids_orig (top row = 0), scale > max(x_right) so row dominates.
+        scale    = float(boxes[:, 2].max().item()) + 1.0
+        sort_key = row_ids_orig.to(boxes.dtype) * scale + boxes[:, 0]
+
+        return sort_key.argsort()
 
     def _vertical_sort_indices(self, boxes: torch.Tensor) -> torch.Tensor:
         """
-        Vertical reading order using gap-based column detection.
+        Vertical reading order: columns right-to-left (Edo), within each column top-to-bottom.
 
-        1. Sort boxes by x-center (left to right).
-        2. Detect natural column breaks: gaps > 1.5 × 75th-percentile width.
-           The 75th-percentile threshold is more robust to small FP boxes that
-           would pull the median width down and merge distinct columns.
-        3. Sort columns right-to-left (Edo reading direction).
-        4. Sort within each column top-to-bottom.
+        Uses a compound sort key (col_rank * scale + y_top) instead of a Python
+        for-loop, eliminating GPU–CPU sync points from repeated .tolist() calls.
+        col_rank = (num_cols - 1 - col_id) so the rightmost column gets rank 0.
         """
         if boxes.numel() == 0:
             return torch.zeros((0,), dtype=torch.long, device=boxes.device)
 
         x_center = (boxes[:, 0] + boxes[:, 2]) * 0.5
-        widths = (boxes[:, 2] - boxes[:, 0]).clamp_min(1.0)
+        widths   = (boxes[:, 2] - boxes[:, 0]).clamp_min(1.0)
 
-        w75 = self._percentile_size(widths, 0.75)
+        w75        = self._percentile_size(widths, 0.75)
         gap_thresh = 1.5 * w75
 
-        sorted_xc, sorted_idx = x_center.sort(descending=False)  # left → right
+        sorted_xc, sorted_idx = x_center.sort(descending=False)   # left → right
 
         if sorted_xc.numel() > 1:
             gaps = sorted_xc[1:] - sorted_xc[:-1]
@@ -239,18 +233,21 @@ class ROIReadingOrder:
         else:
             is_break = torch.ones(1, dtype=torch.bool, device=boxes.device)
 
-        col_ids = is_break.long().cumsum(0) - 1
+        col_ids  = is_break.long().cumsum(0) - 1   # (n,) in sorted order
         num_cols = int(col_ids.max().item()) + 1
 
-        sorted_indices: List[int] = []
-        for col_id in range(num_cols - 1, -1, -1):  # right → left
-            in_col = (col_ids == col_id)
-            orig_indices = sorted_idx[in_col]
-            y_top = boxes[orig_indices, 1]
-            within_col = orig_indices[y_top.argsort(descending=False)]
-            sorted_indices.extend(within_col.tolist())
+        # Map col IDs back to original box indices (scatter reverse of sort)
+        col_ids_orig = torch.zeros(boxes.size(0), dtype=torch.long, device=boxes.device)
+        col_ids_orig.scatter_(0, sorted_idx, col_ids)
 
-        return torch.tensor(sorted_indices, device=boxes.device, dtype=torch.long)
+        # Compound key: col_rank * scale + y_top
+        # col_rank reverses col order so rightmost column (highest col_id) gets rank 0.
+        # scale > max(y_bottom) guarantees column rank dominates over y_top.
+        col_rank = (num_cols - 1 - col_ids_orig).to(boxes.dtype)
+        scale    = float(boxes[:, 3].max().item()) + 1.0
+        sort_key = col_rank * scale + boxes[:, 1]
+
+        return sort_key.argsort()
 
     def _compute_isolation_mask(
         self,
@@ -258,13 +255,18 @@ class ROIReadingOrder:
         orientation: str,
         min_col_size: int = 3,
         size_ratio: float = 3.0,
+        furi_ratio: float = 2.5,
     ) -> torch.Tensor:
         """
-        Mark boxes that are likely illustration false-positives.
+        Mark boxes that are likely illustration false-positives or furigana sub-columns.
 
-        A box is isolated (True) when its column/row has fewer than
-        min_col_size members OR its area exceeds size_ratio × the column
-        median area.  Uses the same gap-based grouping as the sort methods.
+        A box is isolated (True) when:
+          - its column/row has fewer than min_col_size members, OR
+          - its area exceeds size_ratio × the column median area (illustration/oversized), OR
+          - it belongs to a group whose median area is furi_ratio× smaller than an adjacent
+            group and the two groups are close (gap < 3 × gap_thresh) — furigana sub-columns.
+
+        Uses the same gap-based grouping as the sort methods.
         """
         n = boxes.size(0)
         if n == 0:
@@ -300,15 +302,44 @@ class ROIReadingOrder:
         group_ids = torch.zeros(n, dtype=torch.long, device=boxes.device)
         group_ids.scatter_(0, sorted_idx, group_ids_sorted)
 
-        isolated = torch.zeros(n, dtype=torch.bool, device=boxes.device)
-        for g in range(num_groups):
-            in_group = group_ids == g
-            count    = int(in_group.sum().item())
-            if count < min_col_size:
-                isolated[in_group] = True
-            else:
-                med_area = float(areas[in_group].median().item())
-                isolated[in_group] = isolated[in_group] | (areas[in_group] > size_ratio * med_area)
+        # Vectorized group stats — groups are contiguous in the sorted-by-center order.
+        group_counts = torch.bincount(group_ids_sorted, minlength=num_groups)   # (G,)
+        group_ends   = group_counts.cumsum(0)                                    # (G,)
+        group_starts = group_ends - group_counts                                 # (G,)
+
+        # Median area per group: take the area at the median sorted position.
+        # (Groups are ordered by primary axis, not by area, so this is a positional
+        # median — close enough to the true median for a 3× outlier threshold.)
+        med_pos      = (group_starts + group_counts // 2).clamp(0, n - 1)       # (G,)
+        areas_sorted = areas[sorted_idx]                                          # (n,)
+        group_med_areas = areas_sorted[med_pos]                                   # (G,)
+
+        # Group centers: mean of sorted_c values within each group
+        coord_sum = sorted_c.new_zeros(num_groups)
+        coord_sum.scatter_add_(0, group_ids_sorted, sorted_c)
+        group_centers_t = coord_sum / group_counts.to(sorted_c.dtype)            # (G,)
+
+        # --- First pass: per-ROI isolation (small group or oversized box) ---
+        group_count_per_roi = group_counts[group_ids]     # (n,) in original order
+        group_med_per_roi   = group_med_areas[group_ids]  # (n,)
+        isolated = (group_count_per_roi < min_col_size) | (areas > size_ratio * group_med_per_roi)
+
+        # --- Second pass: furigana-like sub-column detection ---
+        # For adjacent group pairs (g, g+1): if they are close and one group's median
+        # area is furi_ratio× smaller, that group is furigana → mark it isolated.
+        if num_groups > 1:
+            gaps_g = group_centers_t[1:] - group_centers_t[:-1]           # (G-1,)
+            close  = gaps_g < 3.0 * gap_thresh                             # (G-1,)
+            ratios = group_med_areas[1:] / (group_med_areas[:-1] + 1e-6)  # (G-1,)
+
+            # ratio = area(g+1)/area(g):
+            #   ratio > furi_ratio  → g+1 much bigger → g is the furigana (flag g)
+            #   ratio < 1/furi_ratio → g much bigger  → g+1 is the furigana (flag g+1)
+            furi_isolated = torch.zeros(num_groups, dtype=torch.bool, device=boxes.device)
+            furi_isolated[:num_groups - 1].logical_or_(close & (ratios > furi_ratio))
+            furi_isolated[1:].logical_or_(close & (ratios < (1.0 / furi_ratio)))
+
+            isolated = isolated | furi_isolated[group_ids]
 
         return isolated
 

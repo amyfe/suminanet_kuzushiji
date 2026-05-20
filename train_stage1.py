@@ -1,4 +1,5 @@
 
+import argparse
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -21,7 +22,7 @@ from utils.training_helpers.helper_stage1 import (
 )
 from utils.vocab import VocabManager
 
-def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3, val_split=None):
+def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3, val_split=None, resume_ckpt=None):
     """Stage 1: Train DetectorHead to localize characters.
     
     Args:
@@ -44,9 +45,10 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     vocab = VocabManager.from_annotations(ann_files)
     pad_id = vocab.pad_id
 
-    # Clean up existing checkpoints: keep only newest, rename to checkpoint_old.pt
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    prune_existing_checkpoints(checkpoint_dir)
+    if resume_ckpt is None:
+        # Clean up existing checkpoints only when starting fresh.
+        prune_existing_checkpoints(checkpoint_dir)
 
     # Dataset + loader - use pre-existing splits or random split if val_split provided
     if val_split is None:
@@ -86,18 +88,36 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         lr=lr, weight_decay=WEIGHT_DECAY
     )
     
-    # Scheduler
+    # Scheduler — T_max is the total intended number of epochs, not remaining epochs,
+    # so the cosine curve shape is preserved across a resume.
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
-    
+
     # Mixed precision (use new API to avoid deprecation warning)
     scaler = torch.amp.GradScaler(device='cuda') if USE_MIXED_PRECISION else None
-    
+
+    best_val = None
+    patience_ctr = 0
+    start_epoch = 0
+
+    if resume_ckpt is not None:
+        ckpt = torch.load(resume_ckpt, map_location=DEVICE)
+        backbone.load_state_dict(ckpt["backbone_state_dict"])
+        detector.load_state_dict(ckpt["detector_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch   = int(ckpt.get("epoch", 0))
+        best_val      = ckpt.get("best_val", None)
+        patience_ctr  = int(ckpt.get("patience_ctr", 0))
+        print(
+            f"▶ Resumed from {resume_ckpt}  "
+            f"(epoch={start_epoch}, best_val={best_val}, patience_ctr={patience_ctr})"
+        )
+
     print(f"Stage 1: Training DetectorHead for {num_epochs} epochs (early stopping patience={patience})...")
     print(f"Training set: {len(train_dataset)} images | Validation set: {len(val_dataset)} images")
     bbox_radius = 1
-    best_val = None
-    patience_ctr = 0
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         # Training
         backbone.train()
         detector.train()
@@ -252,6 +272,9 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
             "unet_state_dict": backbone.state_dict(),  # backward-compat alias
             "detector_state_dict": detector.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_val": best_val,
+            "patience_ctr": patience_ctr,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "vocab_size": vocab.vocab_size,
@@ -277,11 +300,31 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     
     return backbone, detector
 
-def train(args=None):  
-    print("="*60)
+def train(args=None):
+    parser = argparse.ArgumentParser(description="Stage 1: train detector head")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        metavar="CKPT",
+        help="Path to a stage-1 checkpoint to resume from (e.g. checkpoints/stage1_detection/detector_epoch5.pt)",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=NUM_EPOCHS,
+        help="Total number of training epochs (including already-completed ones when resuming)",
+    )
+    parsed = parser.parse_args(args)
+
+    print("=" * 60)
     print("STAGE 1: TRAINING DETECTOR (Spatial Localization)")
-    print("="*60)
-    train_detector_stage(num_epochs=NUM_EPOCHS, lr=None)
-        
+    print("=" * 60)
+    train_detector_stage(
+        num_epochs=parsed.epochs,
+        lr=None,
+        resume_ckpt=Path(parsed.resume) if parsed.resume else None,
+    )
+
 if __name__ == "__main__":
-    train()  
+    train()

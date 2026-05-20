@@ -199,6 +199,7 @@ def build_refinement_targets(
     gt_labels_list: Optional[List[torch.Tensor]] = None,
     pos_iou_thresh: float = 0.5,
     neg_iou_thresh: float = 0.2,
+    ignore_label_ids: Optional[List[int]] = None,
 ) -> dict:
     """
     Build supervision targets for ROI refinement stage.
@@ -248,53 +249,55 @@ def build_refinement_targets(
     matched_iou = torch.zeros((bsz, t_max), device=device, dtype=dtype)
     matched_gt_index = torch.full((bsz, t_max), -1, device=device, dtype=torch.long)
 
+    # Precompute ignore-label tensor once (avoids repeated Python set / .item() loop per sample)
+    _ignore_ids_t: Optional[torch.Tensor] = None
+    if ignore_label_ids is not None:
+        _ignore_ids_t = torch.tensor(ignore_label_ids, dtype=torch.long, device=device)
+
     for b in range(bsz):
         valid_t = int(roi_mask[b].sum().item())
         if valid_t == 0:
             continue
 
-        boxes_b = coarse_boxes[b, :valid_t]
+        boxes_b    = coarse_boxes[b, :valid_t]
         gt_boxes_b = gt_boxes_list[b].to(device=device, dtype=dtype)
 
         if gt_boxes_b.numel() == 0:
             refine_neg_mask[b, :valid_t] = True
             continue
 
-        pred_idx, gt_idx, ious = greedy_match_iou(boxes_b, gt_boxes_b)
+        # Vectorized max-IoU assignment (Faster R-CNN style).
+        # Each proposal independently picks its best-matching GT — no one-to-one constraint.
+        # For Kuzushiji (non-overlapping characters, ~300 props / ~236 GT), this gives
+        # the same training signal as greedy matching at a fraction of the CPU cost.
+        iou_mat           = box_iou(boxes_b, gt_boxes_b)   # (valid_t, M)
+        max_iou, best_gt  = iou_mat.max(dim=1)             # (valid_t,)
 
-        # initialize unmatched valid ROIs as negatives
-        refine_neg_mask[b, :valid_t] = True
-
-        if pred_idx.numel() == 0:
-            continue
-
-        matched_gt_boxes_b = gt_boxes_b.index_select(0, gt_idx)
-        deltas_b = boxes_to_deltas(boxes_b.index_select(0, pred_idx), matched_gt_boxes_b)
-
-        matched_gt_boxes[b, pred_idx] = matched_gt_boxes_b
-        target_deltas[b, pred_idx] = deltas_b
-        matched_iou[b, pred_idx] = ious
-        matched_gt_index[b, pred_idx] = gt_idx
+        best_gt_boxes = gt_boxes_b[best_gt]                # (valid_t, 4)
+        matched_gt_boxes[b, :valid_t]  = best_gt_boxes
+        target_deltas[b, :valid_t]     = boxes_to_deltas(boxes_b, best_gt_boxes)
+        matched_iou[b, :valid_t]       = max_iou
+        matched_gt_index[b, :valid_t]  = best_gt
 
         if gt_labels_list is not None:
             gt_labels_b = gt_labels_list[b].to(device=device, dtype=torch.long)
-            matched_gt_labels[b, pred_idx] = gt_labels_b.index_select(0, gt_idx)
+            matched_gt_labels[b, :valid_t] = gt_labels_b[best_gt]
 
-        pos = ious >= pos_iou_thresh
-        neg = ious < neg_iou_thresh
+        pos = max_iou >= pos_iou_thresh
+        neg = max_iou <  neg_iou_thresh
         ign = (~pos) & (~neg)
 
-        pos_idx = pred_idx[pos]
-        neg_idx = pred_idx[neg]
-        ign_idx = pred_idx[ign]
+        # Proposals matched to ignored label IDs (e.g. UNK) are excluded from all losses.
+        if _ignore_ids_t is not None and gt_labels_list is not None:
+            _label_ign = torch.isin(matched_gt_labels[b, :valid_t], _ignore_ids_t)
+            if _label_ign.any():
+                ign = ign | _label_ign
+                pos = pos & ~_label_ign
+                neg = neg & ~_label_ign
 
-        refine_pos_mask[b, pos_idx] = True
-        refine_neg_mask[b, pos_idx] = False
-
-        refine_neg_mask[b, neg_idx] = True
-
-        refine_ignore_mask[b, ign_idx] = True
-        refine_neg_mask[b, ign_idx] = False
+        refine_pos_mask[b, :valid_t]    = pos
+        refine_neg_mask[b, :valid_t]    = neg
+        refine_ignore_mask[b, :valid_t] = ign
 
     # padded positions should be neither pos nor neg nor ignore
     refine_pos_mask = refine_pos_mask & roi_mask

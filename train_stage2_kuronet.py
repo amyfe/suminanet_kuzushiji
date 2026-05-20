@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
@@ -44,6 +45,8 @@ from config import (
     KURONET_GRAD_ACCUM_STEPS,
     KURONET_FOCAL_GAMMA,
     KURONET_RARE_CHAR_THRESH,
+    KURONET_HARD_NEG_WEIGHT,
+    KURONET_HARD_NEG_TOP_K,
     KURONET_BG_WEIGHT,
     KURONET_STRONG_BG_WEIGHT,
     KURONET_LAMBDA_BOX,
@@ -139,7 +142,6 @@ def build_dataloaders(vocab: VocabManager):
         f"{len(rare_chars)} classes  ({len(rare_chars)/max(1,len(char_freq))*100:.1f}% of vocab)"
     )
 
-    # Option A: dataset applies stronger augmentation for rare-char images.
     train_dataset = KuzushijiDataset(
         Path(DATA_DIR),
         vocab=vocab,
@@ -156,11 +158,6 @@ def build_dataloaders(vocab: VocabManager):
         split="val",
     )
 
-    # Option B: weighted sampling — images containing rare chars are drawn more often.
-    # Combined with Option A (stronger pixel augmentation on the same images).
-    # Reduced boost_scale from 3.0 to 1.5: rare char upweighting helps balance, but too much
-    # upweighting creates class imbalance that hurts learning when classifier is pre-trained.
-    # With warmup initialization, the network learns more stable representations.
     sample_weights = compute_sample_weights(
         items=train_dataset.items,
         char_counter=char_freq,
@@ -364,6 +361,7 @@ def compute_kuronet_loss(
     outputs: dict,
     refine_targets: dict,
     bg_id: Optional[int] = None,
+    hn_keys: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     """
     Single-phase KuroNet loss.
@@ -423,6 +421,24 @@ def compute_kuronet_loss(
         gamma=KURONET_FOCAL_GAMMA,
         ignore_index=-1,
     )
+
+    # Hard negative mining: extra CE penalty for previously-confused pairs.
+    # hn_keys is a pre-encoded int64 tensor (gt * V + pred), built once per epoch
+    # in train_epoch so this inner loop does only a single torch.isin GPU call.
+    if hn_keys is not None and hn_keys.numel() > 0:
+        logits_flat = outputs["char_logits"][pos_mask_sorted]   # (N_pos, V)
+        labels_flat = gt_labels_sorted[pos_mask_sorted]          # (N_pos,)
+        valid = labels_flat.ge(0)
+        if valid.any():
+            logits_valid = logits_flat[valid]
+            gt_valid     = labels_flat[valid]
+            pred_ids     = logits_valid.argmax(dim=-1)
+            V            = logits_valid.size(-1)
+            batch_keys   = gt_valid * V + pred_ids
+            hn_mask      = torch.isin(batch_keys, hn_keys)
+            if hn_mask.any():
+                loss_hn   = F.cross_entropy(logits_valid[hn_mask], gt_valid[hn_mask])
+                loss_char = loss_char + KURONET_HARD_NEG_WEIGHT * loss_hn
 
     # Background supervision: FP proposals learn to predict <BG>.
     # Isolated negatives (column with < 3 members OR area > 3x column median)
@@ -628,6 +644,7 @@ def validate_kuronet(
                 gt_labels_list=gt_labels_list,
                 pos_iou_thresh=STAGE2_REFINE_POS_IOU,
                 neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
+                ignore_label_ids=[vocab.unk_id],
             )
 
             loss, parts = compute_kuronet_loss(outputs, refine_targets, bg_id=bg_id)
@@ -763,6 +780,13 @@ def validate_kuronet(
         for i, ex in enumerate(examples):
             print(f"[VAL PRED] sample={i} | PRED: {ex['pred']} | GT: {ex['gt']}")
 
+    # Top-K confusion pairs for hard negative mining in the next epoch
+    top_k_pairs = [
+        (int(gt), int(pr))
+        for (gt, pr), _ in error_counter.most_common(KURONET_HARD_NEG_TOP_K)
+    ]
+    metrics["hard_neg_pairs"] = top_k_pairs
+
     return metrics
 
 
@@ -787,6 +811,21 @@ def select_model_score(metrics: dict) -> float:
 # Training epoch
 # ---------------------------------------------------------------------------
 
+def _build_hard_neg_keys(
+    hard_neg_pairs: Optional[set],
+    vocab_size: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Pre-encode hard negative pairs as int64 keys (gt * V + pred) for fast isin lookup."""
+    if not hard_neg_pairs:
+        return None
+    V = vocab_size
+    keys = [g * V + p for g, p in hard_neg_pairs if 0 <= g < V and 0 <= p < V]
+    if not keys:
+        return None
+    return torch.tensor(keys, dtype=torch.long, device=device)
+
+
 def train_epoch(
     model: KuroNetRecognizer,
     train_loader: DataLoader,
@@ -795,6 +834,7 @@ def train_epoch(
     vocab: VocabManager,
     epoch: int,
     grad_accum_steps: int,
+    hard_neg_pairs: Optional[set] = None,
 ) -> dict:
     model.train()
     if FREEZE_BACKBONE:
@@ -804,12 +844,14 @@ def train_epoch(
 
     bg_id = vocab.bg_id if hasattr(vocab, "bg_id") and vocab.BG_TOKEN in vocab.char2id else None
 
+    # Pre-encode hard-neg pairs once per epoch (avoids rebuilding a list every batch step)
+    hn_keys = _build_hard_neg_keys(hard_neg_pairs, vocab.vocab_size, torch.device(DEVICE))
+
     total_loss = 0.0
     loss_parts: dict[str, float] = {"loss_char": 0., "loss_box": 0., "loss_delta": 0., "loss_score": 0., "loss_bg": 0.}
     top1_sum = 0.0
     n_batches = 0
 
-    pad_id = vocab.pad_id
     optimizer.zero_grad()
 
     bar = tqdm(
@@ -839,7 +881,9 @@ def train_epoch(
                 neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
             )
 
-            loss, parts = compute_kuronet_loss(outputs, refine_targets, bg_id=bg_id)
+            loss, parts = compute_kuronet_loss(
+                outputs, refine_targets, bg_id=bg_id, hn_keys=hn_keys,
+            )
             loss = loss / grad_accum_steps
 
         scaler.scale(loss).backward()
@@ -959,7 +1003,17 @@ def main():
     )
     scaler = torch.amp.GradScaler("cuda", enabled=USE_MIXED_PRECISION)
 
+    hard_neg_path = KURONET_CHECKPOINT_DIR / "hard_neg_pairs.json"
+
     for epoch in range(start_epoch, args.epochs + 1):
+        # Load confusion pairs saved by the previous epoch's validation
+        hard_neg_pairs: Optional[set] = None
+        if hard_neg_path.exists():
+            with open(hard_neg_path) as f:
+                raw = json.load(f)
+                hard_neg_pairs = {(int(g), int(p)) for g, p in raw}
+            print(f"Loaded {len(hard_neg_pairs)} hard-negative pairs from {hard_neg_path.name}")
+
         train_metrics = train_epoch(
             model=model,
             train_loader=train_loader,
@@ -968,6 +1022,7 @@ def main():
             vocab=vocab,
             epoch=epoch,
             grad_accum_steps=args.grad_accum,
+            hard_neg_pairs=hard_neg_pairs,
         )
 
         print(
@@ -986,6 +1041,13 @@ def main():
             vocab=vocab,
             max_batches=KURONET_VALIDATION_BATCHES,
         )
+
+        # Persist top-K confusion pairs for the next epoch's hard negative mining
+        new_pairs = val_metrics.pop("hard_neg_pairs", [])
+        if new_pairs:
+            with open(hard_neg_path, "w") as f:
+                json.dump(new_pairs, f)
+            print(f"Saved {len(new_pairs)} hard-negative pairs → {hard_neg_path.name}")
 
         score = select_model_score(val_metrics)
         ckpt_state = {

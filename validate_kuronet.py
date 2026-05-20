@@ -94,6 +94,24 @@ def _char_script_type(ch: str) -> str:
     return "other"
 
 
+def _is_kana_script_mixup(gt_ch: str, pred_ch: str) -> bool:
+    """True when gt and pred are the same phoneme written in different kana scripts.
+
+    Hiragana (U+3041–U+3096) and katakana (U+30A1–U+30F6) share a consistent
+    offset of 0x60 for corresponding characters.  Iteration marks are a special case.
+    """
+    if not gt_ch or not pred_ch:
+        return False
+    g, p = ord(gt_ch[0]), ord(pred_ch[0])
+    if 0x3041 <= g <= 0x3096 and 0x30A1 <= p <= 0x30F6 and g + 0x60 == p:
+        return True
+    if 0x30A1 <= g <= 0x30F6 and 0x3041 <= p <= 0x3096 and g - 0x60 == p:
+        return True
+    # Iteration marks: ゝ(309D)↔ヽ(30FD), ゞ(309E)↔ヾ(30FE)
+    _iter_pairs = {0x309D: 0x30FD, 0x309E: 0x30FE, 0x30FD: 0x309D, 0x30FE: 0x309E}
+    return _iter_pairs.get(g) == p
+
+
 def _cjk_font_prop(size: float):
     """Return a FontProperties for CJK tick labels, or None if font unavailable."""
     try:
@@ -155,9 +173,9 @@ def plot_confusion_matrix(
 
     labels = [_ids_to_text([c], vocab) for c in class_list]
 
-    # Use a per-cell size of 0.55in so characters have room; minimum 12pt font.
-    cell_size = 0.65
-    fontsize = max(12, min(16, int(cell_size * 72 * 0.55)))
+    # Scale cell size down for large matrices so the figure stays manageable.
+    cell_size = max(0.4, min(0.65, 18.0 / max(n, 1)))
+    fontsize  = max(8,   min(16,  int(cell_size * 72 * 0.55)))
     fig_w = n * cell_size + 2.5   # extra space for colorbar + y-labels
     fig_h = n * cell_size + 1.5
 
@@ -328,23 +346,26 @@ def run_validation(
 
     bg_id = vocab.bg_id if hasattr(vocab, "bg_id") and vocab.BG_TOKEN in vocab.char2id else None
 
-    total_loss   = 0.0
-    loss_parts   = {"loss_char": 0., "loss_box": 0., "loss_delta": 0., "loss_score": 0., "loss_bg": 0.}
-    top1_sum     = 0.0
-    top5_sum     = 0.0
-    cer_sum      = 0.0
-    iou_sum      = 0.0
-    cov_sum      = 0.0
-    props_sum    = 0.0
-    gt_sum       = 0.0
-    pos_sum      = 0.0
-    n_batches    = 0
-    n_images_tot = 0
+    total_loss        = 0.0
+    loss_parts        = {"loss_char": 0., "loss_box": 0., "loss_delta": 0., "loss_score": 0., "loss_bg": 0.}
+    top1_sum          = 0.0
+    top5_sum          = 0.0
+    cer_sum           = 0.0
+    iou_sum           = 0.0
+    cov_sum           = 0.0
+    props_sum         = 0.0
+    gt_sum            = 0.0
+    pos_sum           = 0.0
+    ordering_viol_sum = 0.0
+    ordering_viol_n   = 0
+    n_batches         = 0
+    n_images_tot      = 0
 
     # Confusion tracking — accumulated over ALL images in every batch
-    error_counter: Counter = Counter()    # (gt_id, pred_id) -> count
-    pred_counter:  Counter = Counter()    # pred_id -> count
-    gt_total_counter: Counter = Counter() # gt_id -> total occurrences in positives
+    error_counter:       Counter = Counter()  # (gt_id, pred_id) -> count, all mismatches
+    kana_mixup_counter:  Counter = Counter()  # (gt_id, pred_id) -> count, same phoneme wrong script
+    pred_counter:        Counter = Counter()  # pred_id -> count
+    gt_total_counter:    Counter = Counter()  # gt_id -> total occurrences in positives
 
     examples: list[dict] = []
 
@@ -406,6 +427,16 @@ def run_validation(
 
             bsz = images.size(0)
             n_images_tot += bsz
+
+            ordering_diag = outputs.get("ordering_diagnostics")
+            if ordering_diag is not None:
+                viol_b   = ordering_diag["primary_violation_fraction"]  # (B,)
+                valid_cb = ordering_diag["valid_counts"]                 # (B,)
+                for b in range(bsz):
+                    if int(valid_cb[b].item()) > 1:
+                        ordering_viol_sum += float(viol_b[b].item())
+                        ordering_viol_n   += 1
+
             for b in range(bsz):
                 n_gt   = boxes_list[b].size(0)
                 n_pos  = int(refine_targets["refine_pos_mask"][b].sum().item())
@@ -431,6 +462,11 @@ def run_validation(
                         gt_total_counter[tid] += 1
                         if pid != tid:
                             error_counter[(tid, pid)] += 1
+                            if _is_kana_script_mixup(
+                                _ids_to_text([tid], vocab),
+                                _ids_to_text([pid], vocab),
+                            ):
+                                kana_mixup_counter[(tid, pid)] += 1
 
             # Debug: し→BG IoU audit (unsorted space, matches refine_targets layout)
             if _shi_id is not None:
@@ -496,6 +532,8 @@ def run_validation(
     det_precision = avg_pos / max(1e-6, avg_props)
     det_f1        = 2 * det_precision * det_recall / max(1e-6, det_precision + det_recall)
 
+    mean_ordering_viol = ordering_viol_sum / max(1, ordering_viol_n)
+
     print("\nPROPOSAL SUMMARY")
     print(
         f"  avg_proposals/img={avg_props:.1f}"
@@ -505,6 +543,10 @@ def run_validation(
         f"  precision={det_precision:.4f}"
         f"  F1={det_f1:.4f}"
         f"  mean_IoU+={avg(iou_sum):.4f}"
+    )
+    print(
+        f"  ordering_violation_rate={mean_ordering_viol:.4f}"
+        f"  (fraction of adjacent ROI pairs out of reading order; 0=perfect)"
     )
 
     print("\nCLASSIFICATION SUMMARY")
@@ -529,8 +571,36 @@ def run_validation(
         for (gt, pr), cnt in error_counter.most_common(10)
     ]
 
+    total_errors     = sum(error_counter.values())
+    total_kana_mixup = sum(kana_mixup_counter.values())
+    total_hard       = total_errors - total_kana_mixup
+
+    hard_error_counter = Counter({
+        k: v for k, v in error_counter.items()
+        if not _is_kana_script_mixup(_ids_to_text([k[0]], vocab), _ids_to_text([k[1]], vocab))
+    })
+    top_hard_errors = [
+        {"gt": _ids_to_text([gt], vocab), "pred": _ids_to_text([pr], vocab), "count": cnt}
+        for (gt, pr), cnt in hard_error_counter.most_common(10)
+    ]
+
     print(f"\nTop predicted tokens:  {top_preds}")
     print(f"Top confusion pairs:   {top_errors}")
+    print(f"Top hard errors (excl. kana-script mixup):  {top_hard_errors}")
+
+    if total_errors > 0:
+        top_kana_mixup = [
+            {"gt": _ids_to_text([gt], vocab), "pred": _ids_to_text([pr], vocab), "count": cnt}
+            for (gt, pr), cnt in kana_mixup_counter.most_common(10)
+        ]
+        print(f"\nERROR SPLIT  (classification errors on detected proposals)")
+        print(
+            f"  total={total_errors}"
+            f"  kana_script_mixup={total_kana_mixup} ({100*total_kana_mixup/total_errors:.1f}%)"
+            f"  hard={total_hard} ({100*total_hard/total_errors:.1f}%)"
+        )
+        print(f"  (kana_script_mixup = same phoneme, wrong hiragana/katakana script — acceptable for translation)")
+        print(f"Top kana-mixup pairs:  {top_kana_mixup}")
 
     if _shi_bg_ious:
         arr = sorted(_shi_bg_ious)
@@ -581,8 +651,35 @@ def run_validation(
         gt_total_counter=gt_total_counter,
         vocab=vocab,
         out_path=out_dir / "confusion_matrix.png",
-        top_n=25,
+        top_n=40,
     )
+
+    # Hard-errors confusion matrix: excludes kana script mixups (ハ↔は etc.).
+    # Focuses on mistakes that actually matter for translation.
+    if hard_error_counter:
+        plot_confusion_matrix(
+            error_counter=hard_error_counter,
+            gt_total_counter=gt_total_counter,
+            vocab=vocab,
+            out_path=out_dir / "confusion_matrix_hard.png",
+            top_n=40,
+        )
+
+    # Kana-focused confusion matrix: only rows where GT is hiragana or katakana.
+    # Zooms in on script-type confusion (ハ↔は etc.) and iteration mark clusters.
+    _kana_scripts = {"hiragana", "katakana"}
+    kana_error_counter = Counter({
+        (gt, pr): cnt for (gt, pr), cnt in error_counter.items()
+        if _char_script_type(_ids_to_text([gt], vocab)) in _kana_scripts
+    })
+    if kana_error_counter:
+        plot_confusion_matrix(
+            error_counter=kana_error_counter,
+            gt_total_counter=gt_total_counter,
+            vocab=vocab,
+            out_path=out_dir / "confusion_matrix_kana.png",
+            top_n=30,
+        )
 
     # -----------------------------------------------------------------------
     # Save summary JSON
@@ -599,10 +696,18 @@ def run_validation(
         "coverage": det_recall,
         "det_precision": det_precision,
         "det_f1": det_f1,
+        "ordering_violation_rate": mean_ordering_viol,
         "avg_proposals_per_image": avg_props,
         "avg_gt_per_image": avg_gt,
         "mean_iou_positives": avg(iou_sum),
         "top_confusion_pairs": top_errors,
+        "top_hard_errors": top_hard_errors,
+        "error_split": {
+            "total": total_errors,
+            "kana_script_mixup": total_kana_mixup,
+            "hard_errors": total_hard,
+            "kana_mixup_pct": round(100 * total_kana_mixup / max(1, total_errors), 2),
+        },
         "worst_recalled_classes": per_class_rows[:20],
         "error_breakdown_by_script": type_breakdown,
         "total_classes_with_errors": len(per_class_rows),

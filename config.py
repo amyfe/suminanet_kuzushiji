@@ -281,8 +281,14 @@ KURONET_FOCAL_GAMMA          = 1.0
 
 # Character augmentation: threshold below which a character is considered rare.
 # Rare-char images get stronger augmentation (Option A) and are oversampled (Option B).
-# Training stats: freq < 20 covers ~60% of classes but only ~1.3% of tokens.
-KURONET_RARE_CHAR_THRESH     = 20
+# Training stats: freq < 20 → 2508 classes (59% of vocab, 1.2% of tokens)
+#                 freq < 50 → 3103 classes (73% of vocab, 2.9% of tokens)
+KURONET_RARE_CHAR_THRESH     = 50
+
+# Hard negative mining: extra loss weight applied when the model confuses a tracked pair.
+# Pairs are derived from the previous epoch's top-K validation confusion pairs.
+KURONET_HARD_NEG_WEIGHT      = 1.5   # multiplier on CE loss for confused pairs
+KURONET_HARD_NEG_TOP_K       = 50    # how many top confusion pairs to track per epoch
 
 # Optimizer
 KURONET_LR                   = 1.0841999197654953e-4
