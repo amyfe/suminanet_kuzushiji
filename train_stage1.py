@@ -78,10 +78,25 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                             collate_fn=lambda b: collate_fn(b, pad_id), pin_memory=True,
                             prefetch_factor=2, persistent_workers=NUM_WORKERS > 0)
     
+    # When resuming, honour the backbone type that was used when the checkpoint was saved.
+    # Checkpoints store 'backbone_type'; if it differs from config, build accordingly.
+    effective_backbone_type = BACKBONE_TYPE
+    if resume_ckpt is not None:
+        _peek = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+        ckpt_backbone_type = _peek.get("backbone_type", None)
+        if ckpt_backbone_type is not None and ckpt_backbone_type != BACKBONE_TYPE:
+            print(
+                f"⚠  Checkpoint backbone_type='{ckpt_backbone_type}' differs from "
+                f"config BACKBONE_TYPE='{BACKBONE_TYPE}'. "
+                f"Building '{ckpt_backbone_type}' to match the checkpoint."
+            )
+            effective_backbone_type = ckpt_backbone_type
+        del _peek
+
     # Build model
-    backbone = build_backbone(BACKBONE_TYPE, BACKBONE_BASE_FEATURES).to(DEVICE)
+    backbone = build_backbone(effective_backbone_type, BACKBONE_BASE_FEATURES).to(DEVICE)
     detector = DetectorHead(in_ch=BACKBONE_BASE_FEATURES, num_classes=vocab.vocab_size, dropout_rate=STAGE1_DROPOUT_RATE, predict_classes=False).to(DEVICE)  # Disable class head to save memory
-    print(f"✅ Model initialized: backbone={BACKBONE_TYPE}, features={BACKBONE_BASE_FEATURES}, vocab={vocab.vocab_size} classes")
+    print(f"✅ Model initialized: backbone={effective_backbone_type}, features={BACKBONE_BASE_FEATURES}, vocab={vocab.vocab_size} classes")
     # Optimizer
     optimizer = optim.Adam(
         list(backbone.parameters()) + list(detector.parameters()),

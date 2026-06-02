@@ -229,3 +229,4 @@ checkpoints/
 #ignore my notes
 .vscode/linenote/
 .local
+output/

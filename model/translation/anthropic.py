@@ -1,61 +1,144 @@
-import anthropic
-import os
-from typing import Dict, Optional
+"""
+Edo-period Kuzushiji translation pipeline.
+
+Pipeline:  Image → KuroNet transcription → MeCab+UniDic normalization
+           → Modern Japanese → English
+
+Usage
+-----
+  # From a pre-transcribed string:
+  pipeline = EdoPeriodTranslationPipeline()
+  result = pipeline.translate_text("此蝦にいのじはがる")
+
+  # End-to-end from an image (requires KuroNet models loaded):
+  result = pipeline.process_image(
+      image_path="page.jpg",
+      kuronet_model=model,
+      vocab=vocab,
+  )
+
+  # From a result.json produced by infer.py:
+  result = pipeline.process_result_json("output/result.json")
+"""
+
+from __future__ import annotations
+
 import json
+import os
+import re
+from pathlib import Path
+from typing import Dict, Optional
+
+import anthropic
+from anthropic.types import TextBlock
+
+from model.translation.mecab_normalizer import HistoricalJapaneseNormalizer
+
+
+# Characters that are very likely furigana (small kana reading hints beside kanji).
+_HIRAGANA  = "ぁ-ゖ"
+_KATAKANA  = "ァ-ヶ"
+_RE_KANA_ONLY = re.compile(f"^[{_HIRAGANA}{_KATAKANA}]+$")
+
+
+def _strip_furigana_heuristic(text: str) -> str:
+    """
+    Lightweight furigana filter: remove isolated kana-only runs that are
+    surrounded by kanji (likely reading annotations injected by the OCR).
+    """
+    text = re.sub(
+        r"(?<=[一-鿿㐀-䶿])([" + _HIRAGANA + _KATAKANA + r"])(?=[一-鿿㐀-䶿])",
+        "",
+        text,
+    )
+    return text
+
+
+def _preprocess_for_translation(text: str, strip_furigana: bool = True) -> str:
+    """Clean up transcription before sending to the LLM."""
+    if strip_furigana:
+        text = _strip_furigana_heuristic(text)
+    text = text.replace("", "").replace("\x00", "")
+    return text.strip()
+
+
+def _sum_usage(*responses: anthropic.types.Message) -> Dict[str, int]:
+    """Accumulate input/output token counts across multiple API responses."""
+    inp = sum(r.usage.input_tokens for r in responses)
+    out = sum(r.usage.output_tokens for r in responses)
+    return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
+
 
 class EdoPeriodTranslationPipeline:
     """
-    Complete pipeline for translating Edo period Japanese texts to English.
-    Pipeline: Image → Transcription → Modern Japanese → English
+    Three-step pipeline:
+      0. MeCab + UniDic normalization (ChaMame-style historical kana normalization)
+      1. Classical Japanese → Modern Japanese  (Claude)
+      2. Modern Japanese   → English           (Claude)
     """
-    
+
+    MODEL = "claude-sonnet-4-6"
+
     def __init__(self, api_key: Optional[str] = None):
+        key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not key:
+            raise ValueError(
+                "Anthropic API key required. Set the ANTHROPIC_API_KEY environment "
+                "variable or pass api_key= to the constructor."
+            )
+        self.client = anthropic.Anthropic(api_key=key)
+        self._normalizer = HistoricalJapaneseNormalizer()
+
+    # ------------------------------------------------------------------
+    # Step 0: MeCab + UniDic normalization
+    # ------------------------------------------------------------------
+
+    def normalize_historical(self, text: str) -> Dict:
         """
-        Initialize the pipeline with Anthropic API.
-        
-        Args:
-            api_key: Anthropic API key. If None, reads from ANTHROPIC_API_KEY env variable
+        Normalize Edo-period kana conventions to modern kana using MeCab + UniDic.
+        Returns a dict with normalized text, method used, and token list.
         """
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        if not self.api_key:
-            raise ValueError("API key required. Set ANTHROPIC_API_KEY env variable or pass api_key parameter")
-        
-        self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.model = "claude-sonnet-4-20250514"  # Latest Claude Sonnet
-    
-    def transcribe_image(self, model, image_path: str) -> str:
-        """
-        Step 1: Transcribe classical Japanese from image.
-        Replace this with your trained model.
-        
-        Args:
-            image_path: Path to the image file
-            
-        Returns:
-            Transcribed classical Japanese text
-        """
-        # TODO: Replace with your actual transcription model
-        # For now, this is a placeholder
-        print(f"[Transcription] Processing image: {image_path}")
-        
-        # Example: return your_model.transcribe(image_path)
-        # Placeholder return for testing
-        # return "古文の例文がここに入ります"
-        return model.transcribe(image_path)
-    
-    def classical_to_modern(self, classical_text: str) -> Dict[str, str]:
-        """
-        Step 2: Convert classical/Edo-period Japanese to modern Japanese.
-        
-        Args:
-            classical_text: Classical Japanese text from transcription
-            
-        Returns:
-            Dict with 'modern_japanese' and 'notes' (any ambiguities)
-        """
-        print(f"[Classical→Modern] Converting: {classical_text[:50]}...")
-        
-        prompt = f"""You are an expert in classical Japanese literature, specifically Edo period texts (1603-1868).
+        result = self._normalizer.normalize(text)
+        return {
+            "normalized": result.normalized,
+            "method": result.method,
+            "notes": result.notes,
+            "tokens": result.tokens,
+        }
+
+    # ------------------------------------------------------------------
+    # Step 1: transcription (delegates to infer.py)
+    # ------------------------------------------------------------------
+
+    def transcribe_image(
+        self,
+        image_path: str | Path,
+        kuronet_model,
+        vocab,
+        score_thresh: float = 0.0,
+        bg_score_gate: float = 0.5,
+    ) -> str:
+        from infer import load_image, run_inference
+
+        image_tensor, _ = load_image(image_path)
+        result = run_inference(
+            kuronet_model, image_tensor, vocab,
+            score_thresh=score_thresh,
+            bg_score_gate=bg_score_gate,
+        )
+        return result["transcription"]
+
+    def transcribe_from_result_json(self, result_json_path: str | Path) -> str:
+        with open(result_json_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("transcription", "")
+
+    # ------------------------------------------------------------------
+    # Step 2: classical → modern Japanese
+    # ------------------------------------------------------------------
+
+    def _build_classical_to_modern_prompt(self, text: str) -> str:
+        return f"""You are an expert in classical Japanese literature, specifically Edo period texts (1603-1868).
 
 Convert the following classical Japanese text to modern Japanese (現代日本語).
 
@@ -63,68 +146,45 @@ Requirements:
 - Preserve the original meaning and nuance precisely
 - Convert classical grammar forms to modern equivalents
 - Update archaic vocabulary to contemporary terms
-- Maintain the tone and register appropriate to the original context
-- If there are ambiguous passages, note them
+- Maintain the tone and register of the original
+- Note ambiguous passages
+
+The text was produced by an OCR model and may contain recognition errors. Use context to infer the intended meaning where possible.
 
 Classical Japanese text:
-{classical_text}
+{text}
 
 Respond in JSON format:
 {{
     "modern_japanese": "the converted modern Japanese text",
-    "notes": "any ambiguities or important conversion decisions (can be empty string if none)"
+    "notes": "any ambiguities or important conversion decisions (empty string if none)"
 }}"""
 
-        try:
-            message = self.client.messages.create(
-                model=self.model,
-                max_tokens=2000,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            
-            # Extract response
-            response_text = message.content[0].text
-            
-            # Parse JSON response
-            # Remove markdown code blocks if present
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in response_text:
-                response_text = response_text.split("```")[1].split("```")[0].strip()
-            
-            result = json.loads(response_text)
-            
-            print(f"[Classical→Modern] Success: {result['modern_japanese'][:50]}...")
-            return result
-            
-        except Exception as e:
-            print(f"[Classical→Modern] Error: {str(e)}")
-            raise
-    
-    def translate_to_english(self, modern_japanese: str, classical_text: str = "") -> Dict[str, str]:
-        """
-        Step 3: Translate modern Japanese to English.
-        
-        Args:
-            modern_japanese: Modern Japanese text from previous step
-            classical_text: Original classical text for context (optional)
-            
-        Returns:
-            Dict with 'english_translation' and 'translation_notes'
-        """
-        print(f"[Modern→English] Translating: {modern_japanese[:50]}...")
-        
-        context = f"\n\nOriginal classical text for context:\n{classical_text}" if classical_text else ""
-        
-        prompt = f"""Translate the following modern Japanese text to natural, fluent English.
+    def classical_to_modern(self, classical_text: str) -> Dict[str, str]:
+        """Convert Edo-period classical Japanese to modern Japanese via Claude."""
+        prompt = self._build_classical_to_modern_prompt(classical_text)
+        response = self._call_claude(prompt)
+        return self._parse_json_response(self._response_text(response))
 
-This text was originally from an Edo period Japanese document and has been converted to modern Japanese. Provide a translation that:
-- Reads naturally in English
-- Preserves the meaning and nuance
-- Maintains appropriate formality level
-- Notes any cultural context that may be important for understanding
+    # ------------------------------------------------------------------
+    # Step 3: modern Japanese → English
+    # ------------------------------------------------------------------
+
+    def _build_translate_to_english_prompt(
+        self, modern_japanese: str, classical_text: str = ""
+    ) -> str:
+        context = (
+            f"\n\nOriginal classical text for reference:\n{classical_text}"
+            if classical_text
+            else ""
+        )
+        return f"""Translate the following modern Japanese text to natural, fluent English.
+
+The text is from an Edo-period Japanese document that has been converted to modern Japanese. Your translation should:
+- Read naturally in English
+- Preserve the meaning and nuance
+- Maintain appropriate formality
+- Note important cultural context where relevant
 
 Modern Japanese text:
 {modern_japanese}{context}
@@ -132,104 +192,152 @@ Modern Japanese text:
 Respond in JSON format:
 {{
     "english_translation": "the English translation",
-    "translation_notes": "any important cultural context or translation decisions (can be empty string if none)"
+    "translation_notes": "cultural context or important decisions (empty string if none)"
 }}"""
 
-        try:
-            message = self.client.messages.create(
-                model=self.model,
-                max_tokens=2000,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            
-            # Extract response
-            response_text = message.content[0].text
-            
-            # Parse JSON response
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in response_text:
-                response_text = response_text.split("```")[1].split("```")[0].strip()
-            
-            result = json.loads(response_text)
-            
-            print(f"[Modern→English] Success: {result['english_translation'][:50]}...")
-            return result
-            
-        except Exception as e:
-            print(f"[Modern→English] Error: {str(e)}")
-            raise
-    
-    def process(self, model, image_path: str) -> Dict:
+    def translate_to_english(
+        self, modern_japanese: str, classical_text: str = ""
+    ) -> Dict[str, str]:
+        """Translate modern Japanese to English via Claude."""
+        prompt = self._build_translate_to_english_prompt(modern_japanese, classical_text)
+        response = self._call_claude(prompt)
+        return self._parse_json_response(self._response_text(response))
+
+    # ------------------------------------------------------------------
+    # Combined pipelines
+    # ------------------------------------------------------------------
+
+    def translate_text(
+        self,
+        classical_text: str,
+        strip_furigana: bool = True,
+        normalize_historical: bool = True,
+    ) -> Dict:
         """
-        Complete pipeline: Image → Classical → Modern → English
-        
-        Args:
-            image_path: Path to image file with classical Japanese text
-            
-        Returns:
-            Dict containing all intermediate results and final translation
+        Full pipeline from a classical Japanese string.
+
+        Returns dict with: classical_japanese, normalized_japanese,
+        normalization_method, normalization_notes, modern_japanese,
+        conversion_notes, english_translation, translation_notes, usage.
         """
-        print(f"\n{'='*60}")
-        print(f"Processing: {image_path}")
-        print(f"{'='*60}\n")
-        
-        # Step 1: Transcribe
-        classical_text = self.transcribe_image(model, image_path)
-        
-        # Step 2: Classical to Modern
-        modern_result = self.classical_to_modern(classical_text)
-        
-        # Step 3: Modern to English
-        translation_result = self.translate_to_english(
-            modern_result['modern_japanese'],
-            classical_text
+        cleaned = _preprocess_for_translation(classical_text, strip_furigana=strip_furigana)
+
+        # Step 0: MeCab + UniDic normalization
+        if normalize_historical:
+            norm = self._normalizer.normalize(cleaned)
+            text_for_llm = norm.normalized
+        else:
+            norm = None
+            text_for_llm = cleaned
+
+        # Step 1: classical → modern Japanese
+        modern_prompt = self._build_classical_to_modern_prompt(text_for_llm)
+        modern_resp = self._call_claude(modern_prompt)
+        modern = self._parse_json_response(self._response_text(modern_resp))
+
+        # Step 2: modern → English
+        english_prompt = self._build_translate_to_english_prompt(
+            modern["modern_japanese"], classical_text=cleaned
         )
-        
-        # Compile results
-        final_result = {
-            'classical_japanese': classical_text,
-            'modern_japanese': modern_result['modern_japanese'],
-            'conversion_notes': modern_result['notes'],
-            'english_translation': translation_result['english_translation'],
-            'translation_notes': translation_result['translation_notes']
+        english_resp = self._call_claude(english_prompt)
+        translation = self._parse_json_response(self._response_text(english_resp))
+
+        return {
+            "classical_japanese":    cleaned,
+            "normalized_japanese":   norm.normalized if norm else cleaned,
+            "normalization_method":  norm.method if norm else "none",
+            "normalization_notes":   norm.notes if norm else "",
+            "modern_japanese":       modern["modern_japanese"],
+            "conversion_notes":      modern.get("notes", ""),
+            "english_translation":   translation["english_translation"],
+            "translation_notes":     translation.get("translation_notes", ""),
+            "usage":                 _sum_usage(modern_resp, english_resp),
         }
-        
-        print(f"\n{'='*60}")
-        print("PIPELINE COMPLETE")
-        print(f"{'='*60}\n")
-        
-        return final_result
+
+    def process_image(
+        self,
+        image_path: str | Path,
+        kuronet_model,
+        vocab,
+        strip_furigana: bool = True,
+        normalize_historical: bool = True,
+        score_thresh: float = 0.0,
+        bg_score_gate: float = 0.5,
+    ) -> Dict:
+        """End-to-end: image file → English translation."""
+        classical = self.transcribe_image(
+            image_path, kuronet_model, vocab,
+            score_thresh=score_thresh,
+            bg_score_gate=bg_score_gate,
+        )
+        return self.translate_text(
+            classical,
+            strip_furigana=strip_furigana,
+            normalize_historical=normalize_historical,
+        )
+
+    def process_result_json(
+        self,
+        result_json_path: str | Path,
+        strip_furigana: bool = True,
+        normalize_historical: bool = True,
+    ) -> Dict:
+        """Translate from a pre-computed infer.py result.json file."""
+        classical = self.transcribe_from_result_json(result_json_path)
+        return self.translate_text(
+            classical,
+            strip_furigana=strip_furigana,
+            normalize_historical=normalize_historical,
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _call_claude(self, prompt: str) -> anthropic.types.Message:
+        return self.client.messages.create(
+            model=self.MODEL,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+    @staticmethod
+    def _response_text(response: anthropic.types.Message) -> str:
+        for block in response.content:
+            if isinstance(block, TextBlock):
+                return block.text
+        raise ValueError(f"No TextBlock found in response content: {response.content}")
+
+    @staticmethod
+    def _parse_json_response(text: str) -> dict:
+        if "```json" in text:
+            text = text.split("```json", 1)[1].split("```", 1)[0]
+        elif "```" in text:
+            text = text.split("```", 1)[1].split("```", 1)[0]
+        return json.loads(text.strip())
 
 
-# Example usage
+# ---------------------------------------------------------------------------
+# CLI smoke test
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    # Initialize pipeline
+    sample = "かくて年月を経て、遂に都へ上りけり"
+    print(f"Input: {sample}\n")
+
     pipeline = EdoPeriodTranslationPipeline()
-    
-    # Example with a direct classical text (bypass transcription for testing)
-    classical_sample = "かくて年月を経て、遂に都へ上りけり"
-    
-    print("Testing with sample classical text...")
-    print(f"Input: {classical_sample}\n")
-    
-    # Test classical to modern conversion
-    modern_result = pipeline.classical_to_modern(classical_sample)
-    print(f"\nModern Japanese: {modern_result['modern_japanese']}")
-    if modern_result['notes']:
-        print(f"Notes: {modern_result['notes']}")
-    
-    # Test translation
-    translation_result = pipeline.translate_to_english(
-        modern_result['modern_japanese'],
-        classical_sample
-    )
-    print(f"\nEnglish: {translation_result['english_translation']}")
-    if translation_result['translation_notes']:
-        print(f"Translation Notes: {translation_result['translation_notes']}")
-    
-    print("\n" + "="*60)
-    print("To use with images, replace transcribe_image() with your model")
-    print("="*60)
+
+    norm = pipeline.normalize_historical(sample)
+    print(f"Normalized ({norm['method']}): {norm['normalized']}")
+    if norm["notes"]:
+        print(f"Norm notes: {norm['notes']}")
+
+    result = pipeline.translate_text(sample)
+
+    print(f"\nModern Japanese : {result['modern_japanese']}")
+    if result["conversion_notes"]:
+        print(f"Conversion notes: {result['conversion_notes']}")
+    print(f"\nEnglish         : {result['english_translation']}")
+    if result["translation_notes"]:
+        print(f"Translation notes: {result['translation_notes']}")
+    print(f"\nTokens used     : {result['usage']}")
