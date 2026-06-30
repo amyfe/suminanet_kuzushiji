@@ -100,33 +100,31 @@ class ROICropEncoder(nn.Module):
         bsz, t_max, _ = roi_boxes.shape
         Hc, Wc = self.crop_size
 
-        # Build flat list of (batch_idx, x1, y1, x2, y2) for all valid ROIs
-        batch_indices: List[torch.Tensor] = []
-        for b in range(bsz):
-            n_valid = int(roi_mask[b].sum().item())
-            idx = torch.full((n_valid,), b, dtype=roi_boxes.dtype, device=roi_boxes.device)
-            batch_indices.append(idx)
-
         # Gather valid boxes across the batch
-        valid_mask_flat = roi_mask.reshape(-1)             # (B*T,)
-        boxes_flat = roi_boxes.reshape(-1, 4)             # (B*T, 4)
-        batch_idx_flat = torch.arange(bsz, device=roi_boxes.device).unsqueeze(1) \
-                             .expand(bsz, t_max).reshape(-1).to(roi_boxes.dtype)  # (B*T,)
+        valid_mask_flat = roi_mask.reshape(-1)                           # (B*T,)
+        boxes_flat      = roi_boxes.reshape(-1, 4)                       # (B*T, 4)
+        # Batch index column: integer-valued, tiled as [0…0, 1…1, …]
+        batch_idx_flat  = torch.arange(bsz, device=roi_boxes.device) \
+                              .unsqueeze(1).expand(bsz, t_max).reshape(-1)  # (B*T,) int64
 
-        valid_boxes = boxes_flat[valid_mask_flat]          # (N_valid, 4)
-        valid_batch = batch_idx_flat[valid_mask_flat]      # (N_valid,)
+        valid_boxes = boxes_flat[valid_mask_flat]        # (N_valid, 4)
+        valid_batch = batch_idx_flat[valid_mask_flat]    # (N_valid,) int64
 
         if valid_boxes.numel() == 0:
             return images.new_zeros((0, 3, Hc, Wc))
 
-        # RoIAlign expects rois as (N, 5): [batch_idx, x1, y1, x2, y2]
-        rois = torch.cat([valid_batch.unsqueeze(1), valid_boxes], dim=1)  # (N_valid, 5)
+        # tv_roi_align requires the rois tensor to be float32 regardless of input dtype.
+        # Cast batch index and boxes explicitly — roi_boxes may arrive as float16 under AMP.
+        rois = torch.cat(
+            [valid_batch.unsqueeze(1).float(), valid_boxes.float()], dim=1
+        )  # (N_valid, 5) float32
 
         h_img, w_img = images.shape[-2:]
         spatial_scale = 1.0  # boxes are in image pixel coords
 
+        # tv_roi_align requires float32; explicit cast so AMP bfloat16 inputs don't silently produce wrong-dtype crops
         crops = tv_roi_align(
-            images.float(),
+            images.to(dtype=torch.float32),
             rois,
             output_size=(Hc, Wc),
             spatial_scale=spatial_scale,
@@ -154,6 +152,15 @@ class ROICropEncoder(nn.Module):
         """
         bsz, t_max, _ = roi_boxes.shape
 
+        # Compute scatter indices from the same mask snapshot used by _extract_crops.
+        # Reading roi_mask once here guarantees the (b_valid, t_valid) indices are
+        # consistent with the N_valid crops that _extract_crops will extract.
+        valid_mask_flat = roi_mask.reshape(-1)   # (B*T,)
+        b_idx = torch.arange(bsz, device=images.device).unsqueeze(1).expand(bsz, t_max).reshape(-1)
+        t_idx = torch.arange(t_max, device=images.device).unsqueeze(0).expand(bsz, t_max).reshape(-1)
+        b_valid = b_idx[valid_mask_flat]   # (N_valid,)
+        t_valid = t_idx[valid_mask_flat]   # (N_valid,)
+
         crops = self._extract_crops(images, roi_boxes, roi_mask)  # (N_valid, 3, Hc, Wc)
 
         if crops.size(0) == 0:
@@ -171,15 +178,6 @@ class ROICropEncoder(nn.Module):
 
         proj_feats = self.out_proj(enc_feats)  # (N_valid, out_dim)
 
-        # Scatter back to padded (B, T, out_dim)
         out = images.new_zeros((bsz, t_max, self.out_dim))
-        valid_mask_flat = roi_mask.reshape(-1)   # (B*T,)
-
-        b_idx = torch.arange(bsz, device=images.device).unsqueeze(1).expand(bsz, t_max).reshape(-1)
-        t_idx = torch.arange(t_max, device=images.device).unsqueeze(0).expand(bsz, t_max).reshape(-1)
-
-        b_valid = b_idx[valid_mask_flat]   # (N_valid,)
-        t_valid = t_idx[valid_mask_flat]   # (N_valid,)
-
         out[b_valid, t_valid] = proj_feats.to(out.dtype)
         return out

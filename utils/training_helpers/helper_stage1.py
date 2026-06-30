@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from config import STAGE1_BBOX_WEIGHT, STAGE1_FOCAL_POS_THRESHOLD, STAGE1_HEATMAP_SIGMA, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_POS_WEIGHT
+from config import STAGE1_AVG_GT_PER_IMAGE, STAGE1_BBOX_WEIGHT, STAGE1_DIOU_WEIGHT, STAGE1_FOCAL_POS_THRESHOLD, STAGE1_HEATMAP_SIGMA, STAGE1_SIGMA_FLOOR, STAGE1_SIGMA_CEIL, STAGE1_SIGMA_SCALE, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_POS_WEIGHT
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
 
@@ -70,6 +70,7 @@ def collate_fn(batch, pad_id):
     boxes = [b.get("boxes", torch.empty((0, 4))) for b in batch]
     labels = [b.get("labels", torch.empty((0,), dtype=torch.long)) for b in batch]
     orientations = [b.get("orientation", "horizontal") for b in batch]
+    image_stems = [b.get("image_stem", "") for b in batch]
 
     # Text sequences - keep batch alignment by inserting a short all-pad placeholder
     # for samples without transcripts. This preserves B-way correspondence between
@@ -90,15 +91,25 @@ def collate_fn(batch, pad_id):
     text_padded = nn.utils.rnn.pad_sequence(text_ids_list, batch_first=True, padding_value=pad_id)
     text_lengths = torch.tensor(text_lengths_list, dtype=torch.long)
 
-    return {
+    result = {
         "image": images,
         "text_ids": text_padded,
         "text_lengths": text_lengths,
         "boxes": boxes,
         "labels": labels,
         "orientations": orientations,
+        "image_stems": image_stems,
         "text_ids_present": torch.tensor(text_ids_present, dtype=torch.bool),
     }
+
+    if "illus_mask" in batch[0]:
+        result["illus_mask"] = torch.stack([b["illus_mask"] for b in batch], dim=0)
+
+    result["avg_gt_per_image"] = [
+        b.get("avg_gt_per_image", STAGE1_AVG_GT_PER_IMAGE) for b in batch
+    ]
+
+    return result
 
 
 def scheduled_teacher_forcing(epoch, total_epochs, start=1.0, end=0.2, schedule="exp"):
@@ -122,6 +133,75 @@ def masked_bbox_smoothl1_loss(
     gt_pos = gt_bbox.permute(0, 2, 3, 1)[gt_bbox_mask]
 
     return F.smooth_l1_loss(pred_pos, gt_pos, reduction="mean")
+
+
+def masked_bbox_diou_loss(
+    pred_bbox: torch.Tensor,      # (B, 4, H, W) — deltas (dx, dy, bw, bh) in grid units
+    gt_bbox: torch.Tensor,        # (B, 4, H, W) — same format
+    gt_bbox_mask: torch.Tensor,   # (B, H, W) bool
+    image_size: tuple[int, int],  # (img_h, img_w)
+) -> torch.Tensor:
+    """
+    DIoU loss on positive cells.
+
+    Bboxes are stored as (dx, dy, bw, bh) in grid-unit deltas:
+        cx_abs = (col + dx) * stride_w,  w_abs = bw * stride_w
+        cy_abs = (row + dy) * stride_h,  h_abs = bh * stride_h
+
+    DIoU = 1 - IoU + d² / c²  (d = centre distance, c = enclosing-box diagonal).
+    Directly optimises IoU, which the validation metric (IoU ≥ 0.5) measures,
+    plus a centre-distance penalty that SmoothL1 in delta space only approximates.
+    """
+    if gt_bbox_mask.sum() == 0:
+        return pred_bbox.new_tensor(0.0)
+
+    B, _, H, W = pred_bbox.shape
+    img_h, img_w = image_size
+    stride_h = img_h / H
+    stride_w = img_w / W
+
+    # Grid coordinates (row, col) — broadcast over batch
+    rows = torch.arange(H, device=pred_bbox.device, dtype=pred_bbox.dtype).view(1, H, 1).expand(B, H, W)
+    cols = torch.arange(W, device=pred_bbox.device, dtype=pred_bbox.dtype).view(1, 1, W).expand(B, H, W)
+
+    def _to_xyxy(bbox: torch.Tensor):
+        cx = (cols + bbox[:, 0]) * stride_w
+        cy = (rows + bbox[:, 1]) * stride_h
+        w  = bbox[:, 2] * stride_w
+        h  = bbox[:, 3] * stride_h
+        return cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5
+
+    px1, py1, px2, py2 = _to_xyxy(pred_bbox)
+    gx1, gy1, gx2, gy2 = _to_xyxy(gt_bbox)
+
+    # Select positive cells
+    px1 = px1[gt_bbox_mask]; py1 = py1[gt_bbox_mask]
+    px2 = px2[gt_bbox_mask]; py2 = py2[gt_bbox_mask]
+    gx1 = gx1[gt_bbox_mask]; gy1 = gy1[gt_bbox_mask]
+    gx2 = gx2[gt_bbox_mask]; gy2 = gy2[gt_bbox_mask]
+
+    # Intersection
+    ix1 = torch.maximum(px1, gx1); iy1 = torch.maximum(py1, gy1)
+    ix2 = torch.minimum(px2, gx2); iy2 = torch.minimum(py2, gy2)
+    inter = (ix2 - ix1).clamp_min(0) * (iy2 - iy1).clamp_min(0)
+
+    p_area = (px2 - px1).clamp_min(0) * (py2 - py1).clamp_min(0)
+    g_area = (gx2 - gx1).clamp_min(0) * (gy2 - gy1).clamp_min(0)
+    union  = (p_area + g_area - inter).clamp_min(1e-6)
+    iou    = inter / union
+
+    # Centre-distance penalty
+    pcx = (px1 + px2) * 0.5; pcy = (py1 + py2) * 0.5
+    gcx = (gx1 + gx2) * 0.5; gcy = (gy1 + gy2) * 0.5
+    d_sq = (pcx - gcx) ** 2 + (pcy - gcy) ** 2
+
+    # Enclosing-box diagonal
+    ex1 = torch.minimum(px1, gx1); ey1 = torch.minimum(py1, gy1)
+    ex2 = torch.maximum(px2, gx2); ey2 = torch.maximum(py2, gy2)
+    c_sq = ((ex2 - ex1) ** 2 + (ey2 - ey1) ** 2).clamp_min(1e-6)
+
+    diou = 1.0 - iou + d_sq / c_sq
+    return diou.mean()
 
 
 def validate_detector(unet, detector, dataloader, device, use_mixed_precision, bbox_radius=0):
@@ -156,6 +236,9 @@ def validate_detector(unet, detector, dataloader, device, use_mixed_precision, b
                 image_size=tuple(images.shape[-2:]),
                 device=device,
                 sigma=STAGE1_HEATMAP_SIGMA,
+                sigma_floor=STAGE1_SIGMA_FLOOR,
+                sigma_ceil=STAGE1_SIGMA_CEIL,
+                sigma_scale=STAGE1_SIGMA_SCALE,
                 bbox_radius=bbox_radius,
             )
 
@@ -172,7 +255,11 @@ def validate_detector(unet, detector, dataloader, device, use_mixed_precision, b
                 pos_threshold=STAGE1_FOCAL_POS_THRESHOLD,
             )
             loss_bbox = masked_bbox_smoothl1_loss(bbox_reg, gt_bbox, gt_bbox_mask)
-            loss = loss_heatmap + STAGE1_BBOX_WEIGHT * loss_bbox
+            loss_diou = masked_bbox_diou_loss(
+                bbox_reg, gt_bbox, gt_bbox_mask,
+                image_size=tuple(images.shape[-2:]),
+            )
+            loss = loss_heatmap + STAGE1_BBOX_WEIGHT * loss_bbox + STAGE1_DIOU_WEIGHT * loss_diou
 
             if batch_idx == 0:
                 print("\n[VAL DEBUG]")

@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 
-from config import IMAGE_SIZE
+from config import IMAGE_SIZE, KURONET_COPY_PASTE_PROB, SAM2_MASKS_DIR, SAM2_PREPROCESSING, STAGE1_AVG_GT_PER_IMAGE
 from model.kuronet.roi.roi_ordering import infer_reading_orientation_from_boxes, ROIReadingOrder
 
 
@@ -76,6 +76,9 @@ class KuzushijiDataset(Dataset):
         # Set to None here; assigned in _build_copy_paste_db() called at the end of __init__.
         self.copy_paste_db: Optional[Dict[str, List[np.ndarray]]] = None
 
+        # Cached once per dataset instance — do not instantiate fresh on every __getitem__ call.
+        self.roi_order = ROIReadingOrder()
+
         # ---------------------------
         # Sammle alle Annotationen
         # ---------------------------
@@ -116,7 +119,8 @@ class KuzushijiDataset(Dataset):
 
             self.items.append({
                 "ann": ann,
-                "img_path": self.root_dir / img_path
+                "img_path": self.root_dir / img_path,
+                "n_gt": len(ann.get("boxes", [])),   # exact GT count for per-image density filter
             })
 
         # Option C: build copy-paste crop database (train only, requires cv2).
@@ -229,8 +233,7 @@ class KuzushijiDataset(Dataset):
         if len(boxes) > 0:
             boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
             mask = torch.ones((boxes_tensor.size(0),), dtype=torch.bool)
-            orderer = ROIReadingOrder()
-            _, _, sort_idx = orderer.sort_single(boxes_tensor, mask, orientation)
+            _, _, sort_idx = self.roi_order.sort_single(boxes_tensor, mask, orientation)
             sorted_indices = sort_idx.detach().cpu().tolist()
             boxes = [boxes[i] for i in sorted_indices]
             labels = [labels[i] for i in sorted_indices]
@@ -239,7 +242,7 @@ class KuzushijiDataset(Dataset):
         # Applied on the resized PIL image before the tensor transform so that
         # crops are at the correct 512×512 scale. New boxes are appended in-place;
         # IoU-based GT matching in the loss is order-independent so no re-sort needed.
-        if self.copy_paste_db is not None and random.random() < 0.4:
+        if self.copy_paste_db is not None and random.random() < KURONET_COPY_PASTE_PROB:
             try:
                 import cv2
                 from utils.char_augmentation import copy_paste_rare_chars
@@ -253,8 +256,9 @@ class KuzushijiDataset(Dataset):
                     n_paste=2,
                 )
                 image = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-            except Exception:
-                pass  # never break training due to augmentation failure
+            except Exception as exc:
+                import warnings
+                warnings.warn(f"copy_paste_rare_chars failed (non-fatal): {exc}", stacklevel=2)
 
         # Convert to tensors
         boxes = torch.tensor(boxes, dtype=torch.float32)
@@ -270,13 +274,33 @@ class KuzushijiDataset(Dataset):
         else:
             image = self.transform(image)
 
+        # SAM2 illustration mask — loaded when SAM2_PREPROCESSING=True.
+        # Shape: (1, H, W) float32 tensor at IMAGE_SIZE, values in [0, 1].
+        # Zero tensor if file missing. Old bool masks are upcast cleanly by .float().
+        illus_mask = None
+        if SAM2_PREPROCESSING:
+            mask_path = Path(SAM2_MASKS_DIR) / f"{img_path.stem}.npy"
+            if mask_path.exists():
+                arr = np.load(mask_path)
+                illus_mask = torch.from_numpy(arr).float().unsqueeze(0)  # (1, H, W) float32
+            else:
+                h_t, w_t = self.resize_to
+                illus_mask = torch.zeros((1, h_t, w_t), dtype=torch.float32)
+
+        n_gt = self.items[idx]["n_gt"]
         sample = {
             "image": image,
             "boxes": boxes,
             "labels": torch.tensor(label_ids, dtype=torch.long) if label_ids else None,
             "raw_labels": labels,
             "orientation": orientation,
+            "image_stem": img_path.stem,
+            # Per-image GT count for adaptive spatial density filter; falls back to global
+            # STAGE1_AVG_GT_PER_IMAGE when n_gt is 0 (illustrated/blank pages).
+            "avg_gt_per_image": float(n_gt) if n_gt > 0 else STAGE1_AVG_GT_PER_IMAGE,
         }
+        if illus_mask is not None:
+            sample["illus_mask"] = illus_mask
 
         # ---------------------------
         # Sequence for ATTENTION Decoder

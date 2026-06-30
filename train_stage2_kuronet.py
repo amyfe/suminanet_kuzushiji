@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -40,6 +43,8 @@ from config import (
     KURONET_CHECKPOINT_DIR,
     KURONET_CLASSIFIER_HIDDEN,
     KURONET_CER_SCORE_THRESH,
+    KURONET_LAMBDA_SCRIPT,
+    KURONET_EARLY_STOPPING_PATIENCE,
     KURONET_ENABLE_TQDM,
     KURONET_EPOCHS,
     KURONET_GRAD_ACCUM_STEPS,
@@ -59,25 +64,31 @@ from config import (
     KURONET_PREDICTION_SAMPLES,
     KURONET_PROGRESS_POSTFIX_N,
     KURONET_ROI_SIZE,
+    KURONET_ROI_POOL_OUTPUT_SIZE,
+    KURONET_RESIDUAL_SCALE_INIT,
     KURONET_USE_CONTEXT,
+    KURONET_CONTEXT_BLOCK_GAP_FACTOR,
     KURONET_USE_CROP_ENCODER,
     KURONET_CROP_ENCODER_SIZE,
     KURONET_FREEZE_CROP_ENCODER,
+    KURONET_FREEZE_CROP_ENCODER_AFTER,
     KURONET_VALIDATION_BATCHES,
     KURONET_WEIGHT_DECAY,
     NUM_WORKERS,
     STAGE2_CONTEXT_HIDDEN_DIM,
     STAGE2_CONTEXT_NUM_LAYERS,
+    STAGE2_CONTEXT_MODE,
     DET_MIN_BOX_SIZE,
     DET_NMS_IOU,
-    DET_SCORE_THRESH,
     DET_TOP_K,
+    KURONET_DET_SCORE_THRESH,
     STAGE2_DROPOUT_RATE,
     STAGE2_PROJ_DIM,
     STAGE2_REFINE_HIDDEN_DIM,
     STAGE2_REFINE_NEG_IOU,
     STAGE2_REFINE_POS_IOU,
     STAGE2_REFINE_POS_WEIGHT,
+    STAGE2_USE_HUNGARIAN,
     STAGE2_ROI_FEAT_DIM,
     STAGE2_TOKEN_DIM,
     STAGE2_TOKEN_HIDDEN_DIM,
@@ -108,8 +119,15 @@ from utils.training_helpers.helper_stage2 import (
     _normalize_orientation_label,
     reorder_by_sort_indices,
 )
-from utils.text_normalization import render_tokens
+from utils.text_normalization import render_tokens, unicode_token_to_char
 from utils.vocab import VocabManager
+
+
+def _atomic_save(obj, path):
+    """Write checkpoint atomically: save to .tmp then rename, so crashes never leave a corrupt file."""
+    tmp = Path(str(path) + ".tmp")
+    torch.save(obj, tmp)
+    tmp.replace(path)
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +262,10 @@ def build_kuronet_model(
 
         proj_dim=STAGE2_PROJ_DIM,
         roi_size=KURONET_ROI_SIZE,
+        roi_pool_output_size=KURONET_ROI_POOL_OUTPUT_SIZE,
         roi_feat_dim=STAGE2_ROI_FEAT_DIM,
         refine_hidden_dim=STAGE2_REFINE_HIDDEN_DIM,
+        residual_scale_init=KURONET_RESIDUAL_SCALE_INIT,
         token_dim=STAGE2_TOKEN_DIM,
         token_hidden_dim=STAGE2_TOKEN_HIDDEN_DIM,
         token_use_score_branch=STAGE2_TOKEN_USE_SCORE_BRANCH,
@@ -253,10 +273,12 @@ def build_kuronet_model(
         use_context=KURONET_USE_CONTEXT,
         context_hidden_dim=STAGE2_CONTEXT_HIDDEN_DIM,
         context_num_layers=STAGE2_CONTEXT_NUM_LAYERS,
+        context_mode=STAGE2_CONTEXT_MODE,
+        context_block_gap_factor=KURONET_CONTEXT_BLOCK_GAP_FACTOR,
 
         classifier_hidden_dim=KURONET_CLASSIFIER_HIDDEN,
 
-        det_score_thresh=DET_SCORE_THRESH,
+        det_score_thresh=KURONET_DET_SCORE_THRESH,
         det_top_k=DET_TOP_K,
         det_nms_iou=DET_NMS_IOU,
         det_min_box_size=DET_MIN_BOX_SIZE,
@@ -283,11 +305,14 @@ def build_kuronet_model(
     # aux_head_context is Linear(STAGE2_CONTEXT_HIDDEN_DIM, STAGE2_REFINE_HIDDEN_DIM).
     # classifier   is Linear(STAGE2_CONTEXT_HIDDEN_DIM, KURONET_CLASSIFIER_HIDDEN).
     # The first layer transfers only if both hidden dims match.
-    assert STAGE2_REFINE_HIDDEN_DIM == KURONET_CLASSIFIER_HIDDEN, (
-        f"STAGE2_REFINE_HIDDEN_DIM ({STAGE2_REFINE_HIDDEN_DIM}) must equal "
-        f"KURONET_CLASSIFIER_HIDDEN ({KURONET_CLASSIFIER_HIDDEN}) for "
-        f"warmup aux_head_context → KuroNet classifier weight transfer."
-    )
+    # This is only relevant when a warmup checkpoint is provided; a plain resume or
+    # fresh-start training with KURONET_CLASSIFIER_HIDDEN != STAGE2_REFINE_HIDDEN_DIM is fine.
+    if warmup_ckpt is not None and STAGE2_REFINE_HIDDEN_DIM != KURONET_CLASSIFIER_HIDDEN:
+        print(
+            f"WARNING: STAGE2_REFINE_HIDDEN_DIM ({STAGE2_REFINE_HIDDEN_DIM}) != "
+            f"KURONET_CLASSIFIER_HIDDEN ({KURONET_CLASSIFIER_HIDDEN}) — "
+            f"warmup aux_head_context → classifier weight transfer will be skipped."
+        )
 
     # Warm-start from warmup checkpoint (shared ROI pipeline weights)
     if warmup_ckpt is not None:
@@ -327,6 +352,12 @@ def build_kuronet_model(
                 print("Classifier fully warm-started from aux_head_context (4/4 tensors).")
             elif n_copied > 0:
                 print(f"Classifier partially warm-started from aux_head_context ({n_copied}/4 tensors).")
+            elif STAGE2_REFINE_HIDDEN_DIM != KURONET_CLASSIFIER_HIDDEN:
+                print(
+                    f"Classifier warm-start skipped: hidden dim mismatch "
+                    f"({STAGE2_REFINE_HIDDEN_DIM} vs {KURONET_CLASSIFIER_HIDDEN}) — "
+                    f"classifier randomly initialized."
+                )
             else:
                 print("WARNING: classifier warm-start from aux_head_context failed — classifier is randomly initialized.")
 
@@ -357,11 +388,30 @@ def get_trainable_params(model: KuroNetRecognizer):
 # Loss
 # ---------------------------------------------------------------------------
 
+def build_kanji_vocab_weights(vocab: "VocabManager", kanji_weight: float = 1.8) -> torch.Tensor:
+    """
+    Build a per-vocabulary weight tensor for script-stratified focal loss.
+
+    Kanji tokens receive kanji_weight (default 1.8×) while hiragana/katakana/other
+    keep weight 1.0.  Following Clanuwat et al.: kanji are visually ambiguous and
+    data-sparse, so they need proportionally larger gradient signal.
+
+    The tensor is built once at training startup and cached on the target device.
+    """
+    weights = torch.ones(vocab.vocab_size, dtype=torch.float32)
+    for id_, ch in vocab.id2char.items():
+        if _char_to_script_type(ch) == _SCRIPT_KANJI:
+            weights[id_] = kanji_weight
+    return weights
+
+
 def compute_kuronet_loss(
     outputs: dict,
     refine_targets: dict,
     bg_id: Optional[int] = None,
     hn_keys: Optional[torch.Tensor] = None,
+    vocab: Optional["VocabManager"] = None,
+    vocab_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     """
     Single-phase KuroNet loss.
@@ -420,6 +470,7 @@ def compute_kuronet_loss(
         pos_mask=pos_mask_sorted,
         gamma=KURONET_FOCAL_GAMMA,
         ignore_index=-1,
+        vocab_weights=vocab_weights,
     )
 
     # Hard negative mining: extra CE penalty for previously-confused pairs.
@@ -441,21 +492,21 @@ def compute_kuronet_loss(
                 loss_char = loss_char + KURONET_HARD_NEG_WEIGHT * loss_hn
 
     # Background supervision: FP proposals learn to predict <BG>.
-    # Isolated negatives (column with < 3 members OR area > 3x column median)
-    # are likely illustration regions and get stronger supervision.
-    # In-column negatives (text-region FPs) get the gentler weight.
+    # Only applied to truly isolated negatives (small group / oversized box) — likely
+    # illustration regions.  Furigana sub-column negatives are excluded: they are real
+    # kana characters whose proposals may have low IoU due to small size, so pushing
+    # them toward <BG> would silently drop glosses from the transcription.
     if bg_id is not None:
-        iso_mask = outputs.get("isolation_mask", None)
+        iso_mask  = outputs.get("isolation_mask", None)   # small/oversized FPs only
+        furi_mask = outputs.get("furigana_mask",  None)   # furigana sub-columns — excluded
         if iso_mask is not None:
-            iso_neg    = iso_mask & neg_mask_sorted
-            normal_neg = (~iso_mask) & neg_mask_sorted
-            loss_bg = (
-                KURONET_STRONG_BG_WEIGHT * background_classification_loss(
-                    char_logits=outputs["char_logits"], neg_mask=iso_neg, bg_id=bg_id,
-                )
-                + KURONET_BG_WEIGHT * background_classification_loss(
-                    char_logits=outputs["char_logits"], neg_mask=normal_neg, bg_id=bg_id,
-                )
+            # Exclude furigana from BG supervision even if they also triggered the
+            # size/group-count isolation criterion (a single furigana glyph near a
+            # larger column satisfies both conditions).
+            not_furi = ~furi_mask if furi_mask is not None else torch.ones_like(iso_mask)
+            iso_neg  = iso_mask & not_furi & neg_mask_sorted
+            loss_bg = KURONET_STRONG_BG_WEIGHT * background_classification_loss(
+                char_logits=outputs["char_logits"], neg_mask=iso_neg, bg_id=bg_id,
             )
         else:
             loss_bg = KURONET_BG_WEIGHT * background_classification_loss(
@@ -466,20 +517,38 @@ def compute_kuronet_loss(
     else:
         loss_bg = loss_char.new_tensor(0.0)
 
+    # --- Script-type auxiliary loss ---
+    loss_script = loss_char.new_tensor(0.0)
+    if KURONET_LAMBDA_SCRIPT > 0.0 and vocab is not None and "script_logits" in outputs:
+        script_labels = _build_script_label_tensor(
+            gt_labels=gt_labels_sorted,
+            pos_mask=pos_mask_sorted,
+            vocab=vocab,
+        )
+        # script_logits: (B, T, 4) in sorted order
+        B, T, _ = outputs["script_logits"].shape
+        sl_flat = outputs["script_logits"].reshape(B * T, 4)
+        lbl_flat = script_labels.reshape(B * T)
+        valid = lbl_flat >= 0
+        if valid.any():
+            loss_script = F.cross_entropy(sl_flat[valid], lbl_flat[valid])
+
     total = (
-        KURONET_LAMBDA_CHAR  * loss_char
+        KURONET_LAMBDA_CHAR   * loss_char
         + KURONET_LAMBDA_BOX   * loss_box
         + KURONET_LAMBDA_DELTA * loss_delta
         + KURONET_LAMBDA_SCORE * loss_score
         + loss_bg
+        + KURONET_LAMBDA_SCRIPT * loss_script
     )
 
     return total, {
-        "loss_char":  loss_char,
-        "loss_box":   loss_box,
-        "loss_delta": loss_delta,
-        "loss_score": loss_score,
-        "loss_bg":    loss_bg,
+        "loss_char":   loss_char,
+        "loss_box":    loss_box,
+        "loss_delta":  loss_delta,
+        "loss_score":  loss_score,
+        "loss_bg":     loss_bg,
+        "loss_script": loss_script,
     }
 
 
@@ -505,6 +574,64 @@ def _top_k_accuracy(
 
 def _ids_to_text(ids: list[int], vocab: VocabManager) -> str:
     return render_tokens(vocab.decode(ids, remove_special=True))
+
+
+# Script-type labels used by the auxiliary head.
+# 0=hiragana  1=katakana  2=kanji  3=other
+_SCRIPT_HIRAGANA = 0
+_SCRIPT_KATAKANA = 1
+_SCRIPT_KANJI    = 2
+_SCRIPT_OTHER    = 3
+
+
+def _char_to_script_type(ch: str) -> int:
+    """Map a Unicode character to a script-type index.
+
+    Annotation labels are stored as "U+XXXX" token strings — unicode_token_to_char
+    converts them to the actual character before the range check.  NFC normalization
+    then collapses NFKD voiced kana (base + combining dakuten) to a single codepoint.
+    """
+    import unicodedata
+    if not ch:
+        return _SCRIPT_OTHER
+    ch = unicode_token_to_char(ch)          # "U+306E" → "の"
+    ch_nfc = unicodedata.normalize("NFC", ch)
+    cp = ord(ch_nfc[0])
+    if 0x3041 <= cp <= 0x3096:      # hiragana block
+        return _SCRIPT_HIRAGANA
+    if 0x30A1 <= cp <= 0x30F6:      # katakana block
+        return _SCRIPT_KATAKANA
+    if (0x4E00 <= cp <= 0x9FFF       # CJK unified
+            or 0x3400 <= cp <= 0x4DBF   # CJK extension A
+            or 0xF900 <= cp <= 0xFAFF): # CJK compatibility
+        return _SCRIPT_KANJI
+    return _SCRIPT_OTHER
+
+
+def _build_script_label_tensor(
+    gt_labels: torch.Tensor,       # (B, T) char IDs
+    pos_mask: torch.Tensor,        # (B, T) bool — only positives have a valid char
+    vocab: VocabManager,
+) -> torch.Tensor:
+    """
+    Build per-ROI script-type labels for the auxiliary script head.
+
+    Returns (B, T) long tensor with values in {0,1,2,3}.
+    Positions where pos_mask is False (or label == -1) are set to -1 so
+    cross_entropy with ignore_index=-1 skips them.
+    """
+    B, T = gt_labels.shape
+    out = gt_labels.new_full((B, T), -1)
+    for b in range(B):
+        for t in range(T):
+            if not pos_mask[b, t]:
+                continue
+            lid = int(gt_labels[b, t].item())
+            if lid < 0:
+                continue
+            ch = vocab.id2char.get(lid, "")
+            out[b, t] = _char_to_script_type(ch)
+    return out
 
 
 def _edit_distance(a: str, b: str) -> int:
@@ -587,6 +714,8 @@ def validate_kuronet(
     val_loader: DataLoader,
     vocab: VocabManager,
     max_batches: Optional[int] = None,
+    vocab_weights: Optional[torch.Tensor] = None,
+    sam2_dir: Optional[Path] = None,
 ) -> dict:
     """
     Validation loop for KuroNetRecognizer.
@@ -600,7 +729,7 @@ def validate_kuronet(
     bg_id = vocab.bg_id if hasattr(vocab, "bg_id") and vocab.BG_TOKEN in vocab.char2id else None
 
     total_loss = 0.0
-    loss_parts: dict[str, float] = {"loss_char": 0., "loss_box": 0., "loss_delta": 0., "loss_score": 0., "loss_bg": 0.}
+    loss_parts: dict[str, float] = {"loss_char": 0., "loss_box": 0., "loss_delta": 0., "loss_score": 0., "loss_bg": 0., "loss_script": 0.}
 
     top1_sum = 0.0
     top5_sum = 0.0
@@ -617,10 +746,37 @@ def validate_kuronet(
     pred_counter: Counter = Counter()
     gt_total_counter: Counter = Counter()
 
+    # Per-script accuracy (main classifier evaluated on GT-matched ROIs)
+    # Keys: "hiragana", "katakana", "kanji", "other"
+    _SCRIPT_NAMES = ["hiragana", "katakana", "kanji", "other"]
+    script_correct: dict[str, int] = {s: 0 for s in _SCRIPT_NAMES}
+    script_total:   dict[str, int] = {s: 0 for s in _SCRIPT_NAMES}
+
     # For prediction examples
     examples: list[dict] = []
 
     pad_id = vocab.pad_id
+
+    # Coverage gap breakdown accumulators
+    iou_02_sum = 0.0
+    iou_02_gt  = 0
+
+    # Ordering diagnostics accumulators
+    order_mono_sum  = 0.0
+    order_viol_sum  = 0.0
+    order_diag_n    = 0
+
+    # Isolation / furigana stats
+    iso_neg_sum  = 0    # isolated negatives (get BG supervision)
+    iso_pos_sum  = 0    # isolated positives (GT-matched but geometrically isolated)
+    iso_pos_bg   = 0    # of those: predicted as BG → shows if model wrongly kills them
+    furi_neg_sum = 0    # furigana negatives (no BG supervision)
+    furi_pos_sum = 0    # furigana positives (GT-matched furigana)
+    furi_pos_bg  = 0    # of those: predicted as BG
+
+    # CER score-threshold audit: count tokens kept vs filtered per image
+    cer_thresh_kept    = 0
+    cer_thresh_filtered = 0
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
@@ -634,7 +790,11 @@ def validate_kuronet(
                 _normalize_orientation_label(o) for o in batch["orientations"]
             ]
 
-            outputs = model(images, orientations)
+            sam2_boxes, sam2_scores = None, None
+            if sam2_dir is not None:
+                stems = batch.get("image_stems", [])
+                sam2_boxes, sam2_scores = _load_sam2_proposals(stems, sam2_dir, torch.device(DEVICE))
+            outputs = model(images, orientations, sam2_boxes, sam2_scores)
 
             # Build refinement targets in original box order
             refine_targets = build_refinement_targets(
@@ -645,9 +805,11 @@ def validate_kuronet(
                 pos_iou_thresh=STAGE2_REFINE_POS_IOU,
                 neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
                 ignore_label_ids=[vocab.unk_id],
+                use_hungarian=STAGE2_USE_HUNGARIAN,
             )
 
-            loss, parts = compute_kuronet_loss(outputs, refine_targets, bg_id=bg_id)
+            loss, parts = compute_kuronet_loss(outputs, refine_targets, bg_id=bg_id, vocab=vocab,
+                                              vocab_weights=vocab_weights)
             total_loss += float(loss.item())
             for k in loss_parts:
                 loss_parts[k] += float(parts[k].item())
@@ -686,7 +848,90 @@ def validate_kuronet(
             if pm_b.any():
                 iou_sum += float(iou_b[pm_b].mean().item())
 
-            # Confusion pairs — loop over ALL images in the batch (not just [0])
+            # --- Coverage gap: Stage-1-equivalent recall at IoU > 0.2 ---
+            # For each GT box, check whether ANY proposal has IoU > 0.2.
+            # This mirrors the Stage 1 validation criterion and lets us measure how
+            # much coverage is lost to the stricter IoU 0.45 positive threshold vs
+            # how much is genuinely missed by the detector.
+            roi_boxes_t = outputs["roi_boxes"]   # (B, T, 4) padded
+            roi_mask_t  = outputs["roi_mask"]    # (B, T) bool
+            for b in range(bsz):
+                gt_b   = boxes_list[b].cpu()             # (G, 4)
+                props_b = roi_boxes_t[b][roi_mask_t[b]].cpu()  # (P, 4)
+                iou_02_gt += gt_b.size(0)
+                if gt_b.size(0) == 0 or props_b.size(0) == 0:
+                    continue
+                # IoU matrix: (P, G)
+                px1, py1, px2, py2 = props_b[:, 0], props_b[:, 1], props_b[:, 2], props_b[:, 3]
+                gx1, gy1, gx2, gy2 = gt_b[:, 0], gt_b[:, 1], gt_b[:, 2], gt_b[:, 3]
+                ix1 = torch.max(px1.unsqueeze(1), gx1.unsqueeze(0))   # (P, G)
+                iy1 = torch.max(py1.unsqueeze(1), gy1.unsqueeze(0))
+                ix2 = torch.min(px2.unsqueeze(1), gx2.unsqueeze(0))
+                iy2 = torch.min(py2.unsqueeze(1), gy2.unsqueeze(0))
+                inter = (ix2 - ix1).clamp(0) * (iy2 - iy1).clamp(0)  # (P, G)
+                area_p = (px2 - px1) * (py2 - py1)                    # (P,)
+                area_g = (gx2 - gx1) * (gy2 - gy1)                    # (G,)
+                union  = area_p.unsqueeze(1) + area_g.unsqueeze(0) - inter
+                iou_pg = inter / (union + 1e-6)                        # (P, G)
+                # A GT box is "covered at 0.2" if any proposal has IoU > 0.2
+                covered = (iou_pg.max(dim=0).values > 0.2).sum().item()
+                iou_02_sum += covered
+
+            # --- CER score-threshold audit ---
+            # Count how many ordered proposals survive vs are filtered by KURONET_CER_SCORE_THRESH
+            if KURONET_CER_SCORE_THRESH > 0.0:
+                rs = outputs.get("refine_scores")
+                si = outputs.get("sort_indices")
+                om = outputs["ordered_mask"]
+                for b in range(bsz):
+                    sorted_pos = om[b].nonzero(as_tuple=True)[0]
+                    if sorted_pos.numel() == 0:
+                        continue
+                    if rs is not None and si is not None:
+                        orig = si[b][sorted_pos]
+                        scores = torch.sigmoid(rs[b][orig])
+                        kept = int((scores >= KURONET_CER_SCORE_THRESH).sum().item())
+                    else:
+                        kept = sorted_pos.numel()
+                    cer_thresh_kept     += kept
+                    cer_thresh_filtered += sorted_pos.numel() - kept
+
+            # Ordering diagnostics
+            od = outputs.get("ordering_diagnostics")
+            if od is not None:
+                mono_t = od["primary_monotonic_fraction"]   # (B,)
+                viol_t = od["primary_violation_fraction"]   # (B,)
+                order_mono_sum += float(mono_t.mean().item())
+                order_viol_sum += float(viol_t.mean().item())
+                order_diag_n   += 1
+
+            # Isolation / furigana stats (needs neg_mask in sorted order)
+            neg_mask   = refine_targets["refine_neg_mask"]
+            neg_mask_s = reorder_by_sort_indices(neg_mask.long(), sort_indices).bool() \
+                         if sort_indices is not None else neg_mask
+            iso_mask  = outputs.get("isolation_mask")
+            furi_mask = outputs.get("furigana_mask")
+            if iso_mask is not None and bg_id is not None:
+                logits_flat = outputs["char_logits"]   # (B, T, V)
+                # isolated
+                m_iso_neg = iso_mask & neg_mask_s
+                m_iso_pos = iso_mask & pos_mask_s
+                iso_neg_sum += int(m_iso_neg.sum().item())
+                iso_pos_sum += int(m_iso_pos.sum().item())
+                if m_iso_pos.any():
+                    preds_iso = logits_flat[m_iso_pos].argmax(dim=-1)
+                    iso_pos_bg += int((preds_iso == bg_id).sum().item())
+            if furi_mask is not None and bg_id is not None:
+                logits_flat = outputs["char_logits"]
+                m_furi_neg = furi_mask & neg_mask_s
+                m_furi_pos = furi_mask & pos_mask_s
+                furi_neg_sum += int(m_furi_neg.sum().item())
+                furi_pos_sum += int(m_furi_pos.sum().item())
+                if m_furi_pos.any():
+                    preds_furi = logits_flat[m_furi_pos].argmax(dim=-1)
+                    furi_pos_bg += int((preds_furi == bg_id).sum().item())
+
+            # Confusion pairs + per-script accuracy
             for b in range(bsz):
                 valid_b = pos_mask_s[b] & gt_labels_s[b].ne(-1)
                 if valid_b.any():
@@ -697,6 +942,13 @@ def validate_kuronet(
                         gt_total_counter[tid] += 1
                         if pid != tid:
                             error_counter[(tid, pid)] += 1
+                        # Per-script accuracy bucket
+                        ch = vocab.id2char.get(tid, "")
+                        stype = _char_to_script_type(ch)
+                        sname = _SCRIPT_NAMES[stype]
+                        script_total[sname] += 1
+                        if pid == tid:
+                            script_correct[sname] += 1
 
             # Log prediction examples
             if len(examples) < KURONET_PREDICTION_SAMPLES and KURONET_LOG_PREDICTIONS:
@@ -725,19 +977,36 @@ def validate_kuronet(
     det_precision = avg_pos_img / max(1e-6, avg_props)
     det_f1        = 2 * det_precision * det_recall / max(1e-6, det_precision + det_recall)
 
+    # Coverage gap breakdown
+    stage1_equiv_recall = iou_02_sum / max(1, iou_02_gt)
+    iou_gap_pp = (stage1_equiv_recall - det_recall) * 100  # pp lost to IoU 0.2→0.45 threshold
+
+    # CER threshold audit
+    cer_thresh_total = cer_thresh_kept + cer_thresh_filtered
+    cer_thresh_filter_rate = cer_thresh_filtered / max(1, cer_thresh_total)
+
     metrics = {
         "val_loss":    avg(total_loss),
         "top1_acc":    avg(top1_sum),
         "top5_acc":    avg(top5_sum),
         "assembled_cer": avg(cer_sum),
-        "coverage":       det_recall,
-        "det_precision":  det_precision,
-        "det_f1":         det_f1,
+        "coverage":            det_recall,
+        "stage1_equiv_recall": stage1_equiv_recall,
+        "det_precision":       det_precision,
+        "det_f1":              det_f1,
         "avg_proposals_per_image": avg_props,
         "avg_pos_per_image":       avg_pos_img,
         "avg_gt_per_image":        avg_gt_img,
         "avg_iou_on_positives":    avg(iou_sum),
+        "cer_thresh_kept":         cer_thresh_kept,
+        "cer_thresh_filtered":     cer_thresh_filtered,
+        "cer_thresh_filter_rate":  cer_thresh_filter_rate,
         **{f"val_{k}": avg(v) for k, v in loss_parts.items()},
+        **{
+            f"acc_{s}": script_correct[s] / max(1, script_total[s])
+            for s in _SCRIPT_NAMES
+        },
+        **{f"n_{s}": script_total[s] for s in _SCRIPT_NAMES},
     }
 
     # Print summary
@@ -746,19 +1015,61 @@ def validate_kuronet(
         f" (char={metrics['val_loss_char']:.4f}"
         f", box={metrics['val_loss_box']:.4f}"
         f", delta={metrics['val_loss_delta']:.4f}"
-        f", score={metrics['val_loss_score']:.4f})"
+        f", score={metrics['val_loss_score']:.4f}"
+        f", script={metrics['val_loss_script']:.4f})"
     )
     print(
         f"Val | top1={metrics['top1_acc']:.4f}"
         f"  top5={metrics['top5_acc']:.4f}"
         f"  CER={metrics['assembled_cer']:.4f}"
-        f"  recall={metrics['coverage']:.4f}"
+        f"  coverage={metrics['coverage']:.4f}"
         f"  prec={metrics['det_precision']:.4f}"
         f"  F1={metrics['det_f1']:.4f}"
         f"  IoU+={metrics['avg_iou_on_positives']:.4f}"
         f"  props/img={metrics['avg_proposals_per_image']:.1f}"
         f"  gt/img={metrics['avg_gt_per_image']:.1f}"
     )
+    # Coverage gap breakdown
+    print(
+        f"Coverage gap | Stage-1-equiv recall (IoU>0.2): {stage1_equiv_recall:.4f}"
+        f"  KuroNet coverage (IoU>0.45): {det_recall:.4f}"
+        f"  → IoU-threshold gap: {iou_gap_pp:.2f} pp"
+    )
+    print(
+        f"CER thresh={KURONET_CER_SCORE_THRESH:.2f} audit |"
+        f" kept={cer_thresh_kept}  filtered={cer_thresh_filtered}"
+        f"  filter_rate={cer_thresh_filter_rate:.3f}"
+        f"  (ROIs removed from CER string assembly)"
+    )
+    # Ordering diagnostics
+    if order_diag_n > 0:
+        avg_mono = order_mono_sum / order_diag_n
+        avg_viol = order_viol_sum / order_diag_n
+        print(
+            f"Ordering | primary_mono={avg_mono:.3f}  primary_viol={avg_viol:.3f}"
+            f"  (fraction of consecutive pairs in correct reading-axis order)"
+        )
+
+    # Isolation / furigana breakdown
+    # Shows whether the neighbour-based geometry check is working and whether
+    # furigana is being incorrectly suppressed toward <BG>.
+    def _bg_pct(n_bg: int, n_total: int) -> str:
+        return f"{100*n_bg/max(1,n_total):.1f}%" if n_total > 0 else "n/a"
+
+    print(
+        f"Isolation | iso_neg={iso_neg_sum}"
+        f"  iso_pos={iso_pos_sum}(BG={_bg_pct(iso_pos_bg, iso_pos_sum)})"
+        f"  furi_neg={furi_neg_sum}"
+        f"  furi_pos={furi_pos_sum}(BG={_bg_pct(furi_pos_bg, furi_pos_sum)})"
+        f"  [iso_neg→BG supervised; furi free]"
+    )
+
+    # Per-script accuracy on main classifier
+    script_parts = "  ".join(
+        f"{s}={script_correct[s]/max(1,script_total[s]):.3f}(n={script_total[s]})"
+        for s in _SCRIPT_NAMES
+    )
+    print(f"Per-script acc | {script_parts}")
 
     # Top predictions and errors
     top_preds = [
@@ -780,11 +1091,48 @@ def validate_kuronet(
         for i, ex in enumerate(examples):
             print(f"[VAL PRED] sample={i} | PRED: {ex['pred']} | GT: {ex['gt']}")
 
-    # Top-K confusion pairs for hard negative mining in the next epoch
+    # Top-K confusion pairs for hard negative mining in the next epoch.
+    # Excluded pair types (mining these destabilises training):
+    #   1. pred == bg_id  → BG-escape pairs trigger a cascade into voiced/unvoiced errors
+    #   2. ALL intra-kana confusions (both gt AND pred are hiragana or katakana) →
+    #      kana confusions (き↔さ, て↔く, ハ↔は, …) are handled by the script-aux-head
+    #      (λ=0.15); penalising them through hard-neg mining creates conflicting gradients
+    #   3. Iteration marks (ゝ/ヽ/ゞ/ヾ/〱/〲) confused with visually similar kana
+    #      are a visual-similarity floor that extra loss weight cannot overcome
+    # Mining focuses on kanji↔kanji and kanji↔other confusions, where the aux head
+    # cannot help and gradient signal is most needed.
+
+    _ITERATION_MARK_IDS: set = {
+        vocab.char2id[c] for c in ("ゝ", "ヽ", "ゞ", "ヾ", "〱", "〲")
+        if c in vocab.char2id
+    }
+
+    def _is_kana(char_id: int) -> bool:
+        ch = vocab.id2char.get(char_id, "")
+        if not ch:
+            return False
+        try:
+            cp = ord(unicode_token_to_char(ch)[0])
+        except Exception:
+            return False
+        return (0x3041 <= cp <= 0x3096) or (0x30A1 <= cp <= 0x30F6)
+
+    def _exclude_hard_neg(gt_id: int, pred_id: int) -> bool:
+        if bg_id is not None and pred_id == bg_id:
+            return True
+        if gt_id in _ITERATION_MARK_IDS or pred_id in _ITERATION_MARK_IDS:
+            return True
+        # Exclude ALL intra-kana pairs (both characters are hiragana or katakana)
+        if _is_kana(gt_id) and _is_kana(pred_id):
+            return True
+        return False
+
+    # Scan up to 3× top-K candidates so filtering still yields KURONET_HARD_NEG_TOP_K pairs
     top_k_pairs = [
         (int(gt), int(pr))
-        for (gt, pr), _ in error_counter.most_common(KURONET_HARD_NEG_TOP_K)
-    ]
+        for (gt, pr), _ in error_counter.most_common(KURONET_HARD_NEG_TOP_K * 3)
+        if not _exclude_hard_neg(int(gt), int(pr))
+    ][:KURONET_HARD_NEG_TOP_K]
     metrics["hard_neg_pairs"] = top_k_pairs
 
     return metrics
@@ -811,6 +1159,38 @@ def select_model_score(metrics: dict) -> float:
 # Training epoch
 # ---------------------------------------------------------------------------
 
+def _load_sam2_proposals(
+    image_stems: list[str],
+    sam2_dir: Path,
+    device: torch.device,
+) -> tuple[list[torch.Tensor] | None, list[torch.Tensor] | None]:
+    """
+    Load pre-computed SAM2 proposal files for a batch.
+
+    Returns (coarse_boxes_list, coarse_scores_list) where each element corresponds to
+    one image.  Returns (None, None) when all files are missing (falls back to detector).
+    """
+    boxes_list:  list[torch.Tensor] = []
+    scores_list: list[torch.Tensor] = []
+    any_found = False
+
+    for stem in image_stems:
+        pt_path = sam2_dir / f"{stem}.pt"
+        if pt_path.exists():
+            data = torch.load(pt_path, map_location=device)
+            boxes_list.append(data["boxes"].to(device, dtype=torch.float32))
+            scores_list.append(data["scores"].to(device, dtype=torch.float32))
+            any_found = True
+        else:
+            # Fallback: empty tensors → model will use its own detector for this image
+            boxes_list.append(torch.zeros((0, 4), device=device, dtype=torch.float32))
+            scores_list.append(torch.zeros((0,), device=device, dtype=torch.float32))
+
+    if not any_found:
+        return None, None
+    return boxes_list, scores_list
+
+
 def _build_hard_neg_keys(
     hard_neg_pairs: Optional[set],
     vocab_size: int,
@@ -826,6 +1206,21 @@ def _build_hard_neg_keys(
     return torch.tensor(keys, dtype=torch.long, device=device)
 
 
+# ---------------------------------------------------------------------------
+# Timing helpers
+# ---------------------------------------------------------------------------
+
+# Print a timing breakdown every this many batches (0 = disabled).
+CHECK_TIMING_EVERY_N = 50
+
+
+def _sync() -> float:
+    """Synchronize CUDA and return current wall time."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
 def train_epoch(
     model: KuroNetRecognizer,
     train_loader: DataLoader,
@@ -835,6 +1230,8 @@ def train_epoch(
     epoch: int,
     grad_accum_steps: int,
     hard_neg_pairs: Optional[set] = None,
+    vocab_weights: Optional[torch.Tensor] = None,
+    sam2_dir: Optional[Path] = None,
 ) -> dict:
     model.train()
     if FREEZE_BACKBONE:
@@ -848,7 +1245,7 @@ def train_epoch(
     hn_keys = _build_hard_neg_keys(hard_neg_pairs, vocab.vocab_size, torch.device(DEVICE))
 
     total_loss = 0.0
-    loss_parts: dict[str, float] = {"loss_char": 0., "loss_box": 0., "loss_delta": 0., "loss_score": 0., "loss_bg": 0.}
+    loss_parts: dict[str, float] = {"loss_char": 0., "loss_box": 0., "loss_delta": 0., "loss_score": 0., "loss_bg": 0., "loss_script": 0.}
     top1_sum = 0.0
     n_batches = 0
 
@@ -861,16 +1258,30 @@ def train_epoch(
         dynamic_ncols=True,
     )
 
+    # Timing accumulators (wall-clock seconds, GPU-synchronised)
+    t_data = t_transfer = t_forward = t_targets = t_loss = t_backward = t_step = t_metrics = 0.0
+    t_batch_start = _sync()
+
     for batch_idx, batch in enumerate(bar):
-        images       = batch["image"].to(DEVICE, non_blocking=True)
-        boxes_list   = [b.to(DEVICE, dtype=torch.float32) for b in batch["boxes"]]
+        t0 = _sync()
+        t_data += t0 - t_batch_start   # time the dataloader took to produce this batch
+
+        images         = batch["image"].to(DEVICE, non_blocking=True)
+        boxes_list     = [b.to(DEVICE, dtype=torch.float32) for b in batch["boxes"]]
         gt_labels_list = [l.to(DEVICE, dtype=torch.long) for l in batch["labels"]]
-        orientations = [
-            _normalize_orientation_label(o) for o in batch["orientations"]
-        ]
+        orientations   = [_normalize_orientation_label(o) for o in batch["orientations"]]
+        t1 = _sync()
+        t_transfer += t1 - t0
 
         with torch.amp.autocast("cuda", enabled=USE_MIXED_PRECISION):
-            outputs = model(images, orientations)
+            # If SAM2 proposals are available for this batch, bypass the frozen detector.
+            sam2_boxes, sam2_scores = None, None
+            if sam2_dir is not None:
+                stems = batch.get("image_stems", [])
+                sam2_boxes, sam2_scores = _load_sam2_proposals(stems, sam2_dir, torch.device(DEVICE))
+            outputs = model(images, orientations, sam2_boxes, sam2_scores)
+            t2 = _sync()
+            t_forward += t2 - t1
 
             refine_targets = build_refinement_targets(
                 coarse_boxes=outputs["roi_boxes"],
@@ -879,14 +1290,23 @@ def train_epoch(
                 gt_labels_list=gt_labels_list,
                 pos_iou_thresh=STAGE2_REFINE_POS_IOU,
                 neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
+                ignore_label_ids=[vocab.unk_id],
+                use_hungarian=STAGE2_USE_HUNGARIAN,
             )
+            t3 = _sync()
+            t_targets += t3 - t2
 
             loss, parts = compute_kuronet_loss(
-                outputs, refine_targets, bg_id=bg_id, hn_keys=hn_keys,
+                outputs, refine_targets, bg_id=bg_id, hn_keys=hn_keys, vocab=vocab,
+                vocab_weights=vocab_weights,
             )
             loss = loss / grad_accum_steps
+            t4 = _sync()
+            t_loss += t4 - t3
 
         scaler.scale(loss).backward()
+        t5 = _sync()
+        t_backward += t5 - t4
 
         if (batch_idx + 1) % grad_accum_steps == 0:
             scaler.unscale_(optimizer)
@@ -894,10 +1314,14 @@ def train_epoch(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+        t6 = _sync()
+        t_step += t6 - t5
 
         total_loss += float(loss.item()) * grad_accum_steps
         for k in loss_parts:
             loss_parts[k] += float(parts[k].item())
+        t7 = _sync()
+        t_metrics += t7 - t6
 
         # Quick train accuracy (top-1 on positives in sorted order)
         with torch.no_grad():
@@ -912,6 +1336,23 @@ def train_epoch(
             top1_sum += _top_k_accuracy(outputs["char_logits"], gt_labels_s, pos_mask_s, k=1)
 
         n_batches += 1
+        t_batch_start = _sync()   # start timing next batch's data-load from here
+
+        # if CHECK_TIMING_EVERY_N > 0 and n_batches % CHECK_TIMING_EVERY_N == 0:
+        #     n = n_batches
+        #     total_t = t_data + t_transfer + t_forward + t_targets + t_loss + t_backward + t_step + t_metrics
+        #     print(
+        #         f"\n[TIMING] step {n_batches} | "
+        #         f"total={total_t/n*1000:.0f}ms/batch  "
+        #         f"data={t_data/n*1000:.0f}  "
+        #         f"transfer={t_transfer/n*1000:.0f}  "
+        #         f"forward={t_forward/n*1000:.0f}  "
+        #         f"targets={t_targets/n*1000:.0f}  "
+        #         f"loss={t_loss/n*1000:.0f}  "
+        #         f"backward={t_backward/n*1000:.0f}  "
+        #         f"optim={t_step/n*1000:.0f}  "
+        #         f"metrics={t_metrics/n*1000:.0f}  (all ms)"
+        #     )
 
         if (batch_idx + 1) % KURONET_PROGRESS_POSTFIX_N == 0:
             bar.set_postfix({
@@ -945,11 +1386,63 @@ def main():
     parser.add_argument("--lr", type=float, default=KURONET_LR)
     parser.add_argument("--weight-decay", type=float, default=KURONET_WEIGHT_DECAY)
     parser.add_argument("--grad-accum", type=int, default=KURONET_GRAD_ACCUM_STEPS)
+    parser.add_argument(
+        "--sam2_proposals",
+        type=str,
+        default=None,
+        help=(
+            "Directory of SAM2-refined proposal files produced by preprocess_sam2_proposals.py. "
+            "When set, per-image pre-computed boxes replace the frozen detector's output, "
+            "directly addressing the IoU-threshold coverage gap. "
+            "Files must be named <image_stem>.pt and contain {boxes, scores} tensors."
+        ),
+    )
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="Ignore warmup_ckpt even if provided (for pure-resume runs)",
+    )
     args = parser.parse_args()
+    if getattr(args, "no_warmup", False):
+        args.warmup_ckpt = None
 
-    print("=" * 70)
-    print("KURONET RECOGNIZER TRAINING (per-ROI classifier)")
-    print("=" * 70)
+    # Setup logging — tee stdout so every print() also lands in the log file
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True, parents=True)
+
+    class _Tee:
+        def __init__(self, *streams):
+            self._streams = streams
+        def write(self, data):
+            for s in self._streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self._streams:
+                s.flush()
+
+    _log_fh = open(log_dir / "train_stage2_kuronet.log", "a")
+    sys.stdout = _Tee(sys.__stdout__, _log_fh)
+    sys.stderr = _Tee(sys.__stderr__, _log_fh)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_dir / 'train_stage2_kuronet.log'),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
+
+    # Fixed input sizes → cuDNN finds optimal kernels once and reuses them.
+    # float32 matmul uses TF32 on Ampere+, slightly lower precision but 8× faster.
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+
+    logger.info("=" * 70)
+    logger.info("KURONET RECOGNIZER TRAINING (per-ROI classifier)")
+    logger.info("=" * 70)
 
     KURONET_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -957,14 +1450,28 @@ def main():
     train_loader, val_loader = build_dataloaders(vocab)
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
+    # Pre-compute per-class focal loss weights (Clanuwat-inspired: kanji needs more gradient)
+    vocab_weights = build_kanji_vocab_weights(vocab, kanji_weight=1.8).to(DEVICE)
+
+    # SAM2 refined proposals directory (optional)
+    sam2_dir: Optional[Path] = Path(args.sam2_proposals) if args.sam2_proposals else None
+    if sam2_dir is not None:
+        if not sam2_dir.exists():
+            print(f"WARNING: --sam2_proposals dir not found: {sam2_dir} — running detector as fallback")
+            sam2_dir = None
+        else:
+            n_files = sum(1 for _ in sam2_dir.glob("*.pt"))
+            print(f"SAM2 proposals: {sam2_dir}  ({n_files} files)")
+
     # Build model
     model = build_kuronet_model(
         vocab=vocab,
         warmup_ckpt=args.warmup_ckpt,
     )
 
-    start_epoch = 1
-    best_score  = -float("inf")
+    start_epoch  = 1
+    best_score   = -float("inf")
+    patience_ctr = 0
 
     # Resume from checkpoint
     if args.resume is not None:
@@ -972,8 +1479,9 @@ def main():
         if resume_path.exists():
             ckpt = torch.load(resume_path, map_location=DEVICE)
             _load_compatible_state_dict(model, ckpt["model_state_dict"])
-            start_epoch = int(ckpt.get("epoch", 0)) + 1
-            best_score  = float(ckpt.get("best_score", -float("inf")))
+            start_epoch  = int(ckpt.get("epoch", 0)) + 1
+            best_score   = float(ckpt.get("best_score", -float("inf")))
+            patience_ctr = int(ckpt.get("patience_ctr", 0))
             print(f"Resumed from {resume_path} (epoch {start_epoch - 1})")
         else:
             print(f"WARNING: resume checkpoint not found: {resume_path}")
@@ -995,11 +1503,16 @@ def main():
     for pg in optimizer.param_groups:
         if "initial_lr" not in pg:
             pg["initial_lr"] = pg.get("lr", args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Warm restarts every 20 epochs so LR never stays near eta_min for long.
+    # T_0=20: restarts at epoch 20, 40, … giving periodic gradient boosts.
+    # _LRScheduler.__init__ calls step() once, advancing last_epoch by 1, so
+    # pass start_epoch - 2 to land at the correct position after construction.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
-        T_max=args.epochs,
+        T_0=20,
+        T_mult=1,
         eta_min=KURONET_LR_ETA_MIN,
-        last_epoch=start_epoch - 2,  # -2 so first step lands at epoch 1 LR
+        last_epoch=start_epoch - 2,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=USE_MIXED_PRECISION)
 
@@ -1008,11 +1521,11 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         # Load confusion pairs saved by the previous epoch's validation
         hard_neg_pairs: Optional[set] = None
-        if hard_neg_path.exists():
-            with open(hard_neg_path) as f:
-                raw = json.load(f)
-                hard_neg_pairs = {(int(g), int(p)) for g, p in raw}
-            print(f"Loaded {len(hard_neg_pairs)} hard-negative pairs from {hard_neg_path.name}")
+        # if epoch >= 10 and hard_neg_path.exists():
+        #     with open(hard_neg_path) as f:
+        #         raw = json.load(f)
+        #         hard_neg_pairs = {(int(g), int(p)) for g, p in raw}
+        #     print(f"Loaded {len(hard_neg_pairs)} hard-negative pairs from {hard_neg_path.name}")
 
         train_metrics = train_epoch(
             model=model,
@@ -1023,6 +1536,8 @@ def main():
             epoch=epoch,
             grad_accum_steps=args.grad_accum,
             hard_neg_pairs=hard_neg_pairs,
+            vocab_weights=vocab_weights,
+            sam2_dir=sam2_dir,
         )
 
         print(
@@ -1040,6 +1555,8 @@ def main():
             val_loader=val_loader,
             vocab=vocab,
             max_batches=KURONET_VALIDATION_BATCHES,
+            vocab_weights=vocab_weights,
+            sam2_dir=sam2_dir,
         )
 
         # Persist top-K confusion pairs for the next epoch's hard negative mining
@@ -1049,27 +1566,59 @@ def main():
                 json.dump(new_pairs, f)
             print(f"Saved {len(new_pairs)} hard-negative pairs → {hard_neg_path.name}")
 
-        score = select_model_score(val_metrics)
+        # Two-phase crop encoder freeze: unfreeze for domain adaptation, then freeze to save compute.
+        # Triggered once when epoch crosses KURONET_FREEZE_CROP_ENCODER_AFTER.
+        # if (
+        #     KURONET_FREEZE_CROP_ENCODER_AFTER > 0
+        #     and epoch == KURONET_FREEZE_CROP_ENCODER_AFTER
+        #     and model.roi_crop_encoder is not None
+        #     and not model.roi_crop_encoder.freeze_encoder
+        # ):
+        #     for p in model.roi_crop_encoder.encoder.parameters():
+        #         p.requires_grad_(False)
+        #     model.roi_crop_encoder.encoder.eval()
+        #     model.roi_crop_encoder.freeze_encoder = True
+        #     n_frozen = sum(p.numel() for p in model.roi_crop_encoder.encoder.parameters())
+        #     print(
+        #         f"[Epoch {epoch}] Crop encoder frozen "
+        #         f"({n_frozen:,} EfficientNet-B0 params removed from backprop)"
+        #    )
+
+        score   = select_model_score(val_metrics)
+        is_best = score > best_score
+        if is_best:
+            best_score   = score
+            patience_ctr = 0
+        else:
+            patience_ctr += 1
+
         ckpt_state = {
             "epoch":            epoch,
             "model_state_dict": model.state_dict(),
             "best_score":       best_score,
+            "patience_ctr":     patience_ctr,
             "val_metrics":      val_metrics,
             "train_metrics":    train_metrics,
         }
 
-        # Save epoch checkpoint
+        # Save epoch checkpoint (atomic write: .tmp → final path, safe on crash)
         epoch_path = KURONET_CHECKPOINT_DIR / f"kuronet_epoch{epoch}.pt"
-        torch.save(ckpt_state, epoch_path)
+        _atomic_save(ckpt_state, epoch_path)
 
-        if score > best_score:
-            best_score = score
-            best_path  = KURONET_CHECKPOINT_DIR / "kuronet_best.pt"
-            torch.save(ckpt_state, best_path)
+        if is_best:
+            best_path = KURONET_CHECKPOINT_DIR / "kuronet_best.pt"
+            _atomic_save(ckpt_state, best_path)
             print(f"✅ saved best: kuronet_best.pt (score={score:.4f})")
 
-        # Keep last 3 epoch checkpoints
-        prune_to_keep_last_n(KURONET_CHECKPOINT_DIR, keep=3)
+        # Keep last 2 epoch checkpoints + best
+        prune_to_keep_last_n(KURONET_CHECKPOINT_DIR, keep=2)
+
+        if KURONET_EARLY_STOPPING_PATIENCE > 0 and patience_ctr >= KURONET_EARLY_STOPPING_PATIENCE:
+            print(
+                f"Early stopping: {patience_ctr} epochs without improvement. "
+                f"best={best_score:.4f}"
+            )
+            break
 
         scheduler.step()
 

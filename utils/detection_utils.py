@@ -1,5 +1,6 @@
 """Helper functions for detection training."""
 import math
+from typing import List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -16,6 +17,7 @@ def build_detection_targets(
     sigma=1.0,
     sigma_floor=1.5,    # raised from 0.5 — ensures small chars get learnable targets
     sigma_ceil=3.0,     # raised from 2.0 — gives large chars proportional coverage
+    sigma_scale=0.20,   # multiplier: sigma_eff = sigma * sqrt(bw*bh) * sigma_scale
     bbox_radius=0,      # 0 = only center cell (most stable)
     heatmap_min=1e-6):
     """
@@ -76,7 +78,7 @@ def build_detection_targets(
             dx = cx - float(ix)
             dy = cy - float(iy)
 
-            gaussian_sigma = min(sigma_ceil, max(sigma_floor, sigma * math.sqrt(bw * bh) * 0.20))
+            gaussian_sigma = min(sigma_ceil, max(sigma_floor, sigma * math.sqrt(bw * bh) * sigma_scale))
             yy = torch.arange(0, H_out, device=device).view(H_out, 1).float()
             xx = torch.arange(0, W_out, device=device).view(1, W_out).float()
             g = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * gaussian_sigma ** 2))
@@ -322,6 +324,221 @@ def _greedy_iou_match(pred_boxes, gt_boxes, use_x_only=False):
         torch.tensor(pred_idx, device=pred_boxes.device, dtype=torch.long),
         torch.tensor(gt_idx, device=gt_boxes.device, dtype=torch.long),
     )
+
+
+def _extract_all_peaks(
+    heatmap_probs: torch.Tensor,   # (1, 1, H, W) already sigmoid
+    bbox_reg: torch.Tensor,        # (1, 4, H, W) = (dx, dy, bw, bh)
+    output_size: tuple,            # (Hf, Wf)
+    image_size: tuple,             # (H_img, W_img)
+    top_k: int = 2000,
+    min_box_size: float = 2.0,
+) -> Tuple[List[List[float]], List[float]]:
+    """Extract ALL decoded peaks without confidence threshold or NMS.
+
+    Returns (boxes, scores) as Python lists.  Used to cache raw proposal candidates
+    for post-hoc threshold sweeps and gap-filling.
+    """
+    hm = heatmap_probs[0, 0]
+    bbox = bbox_reg[0]
+
+    pooled = F.max_pool2d(hm[None, None], kernel_size=3, stride=1, padding=1).squeeze()
+    peak_mask = hm == pooled
+    peak_idx = peak_mask.nonzero(as_tuple=False)
+
+    if peak_idx.numel() == 0:
+        return [], []
+
+    scores = hm[peak_mask]
+    sorted_scores, order = torch.sort(scores, descending=True)
+    if top_k is not None and len(order) > top_k:
+        order = order[:top_k]
+
+    ys = peak_idx[order, 0].detach().cpu().numpy()
+    xs = peak_idx[order, 1].detach().cpu().numpy()
+    scores_np = sorted_scores[:len(order)].detach().cpu().numpy().tolist()
+
+    H_img, W_img = image_size
+    H_out, W_out = output_size
+    stride_h = H_img / float(H_out)
+    stride_w = W_img / float(W_out)
+    bbox_np = bbox.detach().cpu().numpy()
+
+    boxes: List[List[float]] = []
+    scs: List[float] = []
+    for y, x, sc in zip(ys, xs, scores_np):
+        dx, dy, bw, bh = bbox_np[:, y, x]
+        cx = (x + dx) * stride_w
+        cy = (y + dy) * stride_h
+        w = max(bw * stride_w, min_box_size)
+        h = max(bh * stride_h, min_box_size)
+        x1 = float(np.clip(cx - 0.5 * w, 0, W_img))
+        y1 = float(np.clip(cy - 0.5 * h, 0, H_img))
+        x2 = float(np.clip(cx + 0.5 * w, 0, W_img))
+        y2 = float(np.clip(cy + 0.5 * h, 0, H_img))
+        if x2 > x1 and y2 > y1:
+            boxes.append([x1, y1, x2, y2])
+            scs.append(float(sc))
+
+    return boxes, scs
+
+
+def fill_detection_gaps(
+    pred_boxes: List[List[float]],
+    pred_scores: List[float],
+    all_boxes: List[List[float]],
+    all_scores: List[float],
+    lower_thresh: float = 0.35,
+    gap_factor: float = 1.8,
+    col_merge_factor: float = 1.5,
+    max_fill: int = 5,
+    nms_iou: float = 0.4,
+) -> Tuple[List[List[float]], List[float]]:
+    """Fill gaps in column-structured detections using subthreshold heatmap peaks.
+
+    After NMS+density filtering, Stage 1 sometimes misses every other character in a
+    dense column (NMS suppression or merged Gaussian peaks).  This function:
+      1. Clusters detections into vertical text columns by x-centre proximity.
+      2. Within each column, finds y-gaps > gap_factor × median_height.
+      3. For each gap, searches *all_boxes* (pre-extracted subthreshold peaks) for a
+         candidate with score >= lower_thresh whose centre falls in the gap region.
+      4. Accepts top-scoring candidates and merges them in; runs NMS to avoid duplicates.
+
+    Returns augmented (boxes, scores).  If no real peak candidates are found for a gap,
+    the gap is left unfilled (no synthesis).
+    """
+    if len(pred_boxes) < 4 or not all_boxes:
+        return pred_boxes, pred_scores
+
+    pred_arr   = np.asarray(pred_boxes,  dtype=np.float32)   # (N, 4)
+    pred_sc    = np.asarray(pred_scores, dtype=np.float32)
+    all_arr    = np.asarray(all_boxes,   dtype=np.float32)   # (M, 4)
+    all_sc     = np.asarray(all_scores,  dtype=np.float32)
+
+    pred_cx = 0.5 * (pred_arr[:, 0] + pred_arr[:, 2])
+    pred_cy = 0.5 * (pred_arr[:, 1] + pred_arr[:, 3])
+    pred_w  =        pred_arr[:, 2] - pred_arr[:, 0]
+    pred_h  =        pred_arr[:, 3] - pred_arr[:, 1]
+
+    all_cx  = 0.5 * (all_arr[:, 0] + all_arr[:, 2])
+    all_cy  = 0.5 * (all_arr[:, 1] + all_arr[:, 3])
+
+    # Pre-filter all_boxes to candidates above lower_thresh
+    cand_mask = all_sc >= lower_thresh
+    if not cand_mask.any():
+        return pred_boxes, pred_scores
+    cand_arr = all_arr[cand_mask]
+    cand_sc  = all_sc[cand_mask]
+    cand_cx  = all_cx[cand_mask]
+    cand_cy  = all_cy[cand_mask]
+
+    # Column clustering: sort by x-centre, break where gap > col_merge_factor × median_width
+    w_med  = float(np.median(pred_w))
+    col_thresh = max(col_merge_factor * w_med, 5.0)
+    order_x    = np.argsort(pred_cx)
+    sorted_cx  = pred_cx[order_x]
+
+    cols: List[List[int]] = []
+    cur: List[int] = [int(order_x[0])]
+    for k in range(1, len(order_x)):
+        if sorted_cx[k] - sorted_cx[k - 1] > col_thresh:
+            cols.append(cur)
+            cur = []
+        cur.append(int(order_x[k]))
+    cols.append(cur)
+
+    extra_boxes:  List[List[float]] = []
+    extra_scores: List[float]       = []
+
+    for col_idx in cols:
+        if len(col_idx) < 2:
+            continue
+        col_cy  = pred_cy[col_idx]
+        col_h   = pred_h[col_idx]
+        col_cx  = pred_cx[col_idx]
+        h_med   = float(np.median(col_h))
+        if h_med < 2.0:
+            continue
+
+        # Column x bounds (± half median width for candidate search)
+        cx_lo = float(col_cx.min()) - w_med * 0.5
+        cx_hi = float(col_cx.max()) + w_med * 0.5
+
+        # Candidates whose x-centre is within this column
+        col_cand_mask = (cand_cx >= cx_lo) & (cand_cx <= cx_hi)
+        if not col_cand_mask.any():
+            continue
+        cc_boxes = cand_arr[col_cand_mask]
+        cc_sc    = cand_sc[col_cand_mask]
+        cc_cy    = cand_cy[col_cand_mask]
+
+        sort_y = np.argsort(col_cy)
+        sorted_y = col_cy[sort_y]
+
+        for k in range(len(sort_y) - 1):
+            gap = sorted_y[k + 1] - sorted_y[k]
+            if gap <= gap_factor * h_med:
+                continue
+            # Gap region
+            y_lo = sorted_y[k]     + h_med * 0.3
+            y_hi = sorted_y[k + 1] - h_med * 0.3
+            n_miss = min(max(1, math.floor(gap / h_med) - 1), max_fill)
+            if n_miss <= 0:
+                continue
+            # Find candidates in gap y-range, take top-scoring per slot
+            in_gap = (cc_cy >= y_lo) & (cc_cy <= y_hi)
+            if not in_gap.any():
+                continue
+            gap_boxes = cc_boxes[in_gap]
+            gap_sc    = cc_sc[in_gap]
+            gap_cy_   = cc_cy[in_gap]
+
+            # Sort by score, keep up to n_miss
+            top_order = np.argsort(gap_sc)[::-1][:n_miss]
+            for ti in top_order:
+                b = gap_boxes[ti].tolist()
+                # Skip if already very close to an existing prediction
+                existing_cx = np.abs(pred_cx - (0.5 * (b[0] + b[2])))
+                existing_cy = np.abs(pred_cy - (0.5 * (b[1] + b[3])))
+                if np.any((existing_cx < w_med * 0.5) & (existing_cy < h_med * 0.5)):
+                    continue
+                extra_boxes.append(b)
+                extra_scores.append(float(gap_sc[ti]))
+
+    if not extra_boxes:
+        return pred_boxes, pred_scores
+
+    # Merge and NMS
+    all_merged_boxes  = pred_boxes + extra_boxes
+    all_merged_scores = list(pred_scores) + extra_scores
+
+    merged_arr = np.asarray(all_merged_boxes, dtype=np.float32)
+    merged_sc  = np.asarray(all_merged_scores, dtype=np.float32)
+
+    # Simple greedy NMS
+    order_sc  = np.argsort(merged_sc)[::-1]
+    keep_mask = np.ones(len(order_sc), dtype=bool)
+    for i in range(len(order_sc)):
+        if not keep_mask[order_sc[i]]:
+            continue
+        bi = merged_arr[order_sc[i]]
+        for j in range(i + 1, len(order_sc)):
+            if not keep_mask[order_sc[j]]:
+                continue
+            bj = merged_arr[order_sc[j]]
+            ix1 = max(bi[0], bj[0]); iy1 = max(bi[1], bj[1])
+            ix2 = min(bi[2], bj[2]); iy2 = min(bi[3], bj[3])
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            ai = (bi[2] - bi[0]) * (bi[3] - bi[1])
+            aj = (bj[2] - bj[0]) * (bj[3] - bj[1])
+            union = ai + aj - inter
+            if union > 0 and inter / union >= nms_iou:
+                keep_mask[order_sc[j]] = False
+
+    kept = [order_sc[i] for i in range(len(order_sc)) if keep_mask[order_sc[i]]]
+    out_boxes  = [all_merged_boxes[i]  for i in kept]
+    out_scores = [all_merged_scores[i] for i in kept]
+    return out_boxes, out_scores
 
 
 def compute_roi_box_loss(predicted_boxes, gt_boxes, gt_lengths=None, reduction='mean', iou_weight=0.0, use_x_only=False, coord_scale=None):

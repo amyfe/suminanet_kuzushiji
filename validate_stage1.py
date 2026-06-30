@@ -27,10 +27,10 @@ import matplotlib.pyplot as plt
 from config import (DATA_DIR, DEVICE, IMAGE_SIZE, CHECKPOINT_DIR,
                     DET_SCORE_THRESH, DET_TOP_K, DET_NMS_IOU, DET_MIN_BOX_SIZE,
                     STAGE1_DENSITY_GRID, STAGE1_DENSITY_FACTOR, STAGE1_AVG_GT_PER_IMAGE,
-                    BACKBONE_BASE_FEATURES, BACKBONE_TYPE)
+                    BACKBONE_BASE_FEATURES, BACKBONE_TYPE, STAGE1_FOCAL_POS_THRESHOLD)
 from model.kuronet import DetectorHead, build_backbone
 from utils import KuzushijiDataset
-from utils.detection_utils import spatial_density_filter
+from utils.detection_utils import spatial_density_filter, _extract_all_peaks, fill_detection_gaps
 from utils.vocab import VocabManager
 
 
@@ -81,13 +81,14 @@ def non_max_suppression(boxes, scores, iou_threshold=0.5):
 def extract_boxes_from_heatmap(
     heatmap_probs,      # (1,1,H,W) already sigmoid
     bbox_reg,           # (1,4,H,W) = (dx,dy,bw,bh)
-    confidence_thresh=0.5,
+    confidence_thresh=STAGE1_FOCAL_POS_THRESHOLD,
     output_size=(64, 64),
     image_size=IMAGE_SIZE,
     top_k=200,
-    nms_iou=0.5,
-    min_box_size=4.0,
+    nms_iou=DET_NMS_IOU,
+    min_box_size=DET_MIN_BOX_SIZE,
     debug=False,
+    avg_gt_per_image=STAGE1_AVG_GT_PER_IMAGE,
 ):
     hm = heatmap_probs[0, 0]
     bbox = bbox_reg[0]      # (4,H,W)
@@ -165,69 +166,16 @@ def extract_boxes_from_heatmap(
         boxes, scores_out, image_size,
         grid_size=STAGE1_DENSITY_GRID,
         density_factor=STAGE1_DENSITY_FACTOR,
-        avg_gt_per_image=STAGE1_AVG_GT_PER_IMAGE,
+        avg_gt_per_image=avg_gt_per_image,
     )
 
     classes = [0] * len(boxes)
     return boxes, scores_out, classes
 
 
-def _extract_all_peaks(
-    heatmap_probs,
-    bbox_reg,
-    output_size,
-    image_size,
-    top_k,
-    min_box_size,
-):
-    """Extract all decoded peaks (box, score) without confidence threshold or NMS.
 
-    Used to cache raw proposals for post-hoc PR-curve threshold sweeps.
-    """
-    hm = heatmap_probs[0, 0]
-    bbox = bbox_reg[0]
-
-    pooled = F.max_pool2d(hm[None, None], kernel_size=3, stride=1, padding=1).squeeze()
-    peak_mask = hm == pooled
-    peak_idx = peak_mask.nonzero(as_tuple=False)
-
-    if peak_idx.numel() == 0:
-        return [], []
-
-    scores = hm[peak_mask]
-    sorted_scores, order = torch.sort(scores, descending=True)
-    if top_k is not None and len(order) > top_k:
-        order = order[:top_k]
-
-    ys = peak_idx[order, 0].detach().cpu().numpy()
-    xs = peak_idx[order, 1].detach().cpu().numpy()
-    scores_np = sorted_scores[:len(order)].detach().cpu().numpy().tolist()
-
-    H_img, W_img = image_size
-    H_out, W_out = output_size
-    stride_h = H_img / float(H_out)
-    stride_w = W_img / float(W_out)
-    bbox_np = bbox.detach().cpu().numpy()
-
-    boxes, scs = [], []
-    for y, x, sc in zip(ys, xs, scores_np):
-        dx, dy, bw, bh = bbox_np[:, y, x]
-        cx = (x + dx) * stride_w
-        cy = (y + dy) * stride_h
-        w = max(bw * stride_w, min_box_size)
-        h = max(bh * stride_h, min_box_size)
-        x1 = float(np.clip(cx - 0.5 * w, 0, W_img))
-        y1 = float(np.clip(cy - 0.5 * h, 0, H_img))
-        x2 = float(np.clip(cx + 0.5 * w, 0, W_img))
-        y2 = float(np.clip(cy + 0.5 * h, 0, H_img))
-        if x2 > x1 and y2 > y1:
-            boxes.append([x1, y1, x2, y2])
-            scs.append(float(sc))
-
-    return boxes, scs
-
-
-def _filter_peaks(all_boxes, all_scores, confidence_thresh, nms_iou):
+def _filter_peaks(all_boxes, all_scores, confidence_thresh, nms_iou,
+                  avg_gt_per_image=STAGE1_AVG_GT_PER_IMAGE):
     """Apply confidence threshold + NMS + density filter to pre-extracted peak candidates."""
     paired = [(b, s) for b, s in zip(all_boxes, all_scores) if s >= confidence_thresh]
     if not paired:
@@ -242,7 +190,7 @@ def _filter_peaks(all_boxes, all_scores, confidence_thresh, nms_iou):
         kept_boxes, kept_scores, IMAGE_SIZE,
         grid_size=STAGE1_DENSITY_GRID,
         density_factor=STAGE1_DENSITY_FACTOR,
-        avg_gt_per_image=STAGE1_AVG_GT_PER_IMAGE,
+        avg_gt_per_image=avg_gt_per_image,
     )
     return kept_boxes
 
@@ -532,6 +480,7 @@ def validate_stage1(
     min_box_size=DET_MIN_BOX_SIZE,
     job_id=None,
     worst_n=30,
+    gap_fill=True,
 ):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     resolved_job_id = job_id or os.environ.get("SLURM_JOB_ID") or os.environ.get("JOB_ID")
@@ -544,7 +493,7 @@ def validate_stage1(
     print(f"  split: {split}")
     print(f"  job_id: {resolved_job_id if resolved_job_id else 'n/a'}")
     print(f"  conf: {confidence_thresh} | top_k: {top_k} | nms_iou: {nms_iou} | iou_thr: {iou_threshold}")
-    print(f"  min_box_size: {min_box_size}")
+    print(f"  min_box_size: {min_box_size} | gap_fill: {gap_fill}")
     print(f"  out: {out_dir}")
 
     ann_files = sorted(list((Path(DATA_DIR) / "annotations").glob("*.json")))
@@ -574,6 +523,7 @@ def validate_stage1(
     all_gt_boxes = []
     all_pred_boxes = []
     all_raw_peaks = []   # list of (boxes, scores) per image — for PR curve sweep
+    all_avg_gt    = []   # per-image GT count for density filter in PR sweep
 
     # Buffer for worst-N FN visualization: (fn_count, img_idx, bgr_uint8, gt_boxes, pred_boxes)
     image_buffer = []
@@ -584,6 +534,7 @@ def validate_stage1(
 
     total_gt = 0
     total_pred = 0
+    total_gap_filled = 0
 
     with torch.no_grad():
         for idx, batch in enumerate(tqdm(loader, desc="Validating")):
@@ -602,6 +553,7 @@ def validate_stage1(
             _, _, Hf, Wf = features.shape
             debug_this = (idx == 0)
 
+            img_avg_gt = batch.get("avg_gt_per_image", [STAGE1_AVG_GT_PER_IMAGE])[0]
             pred_boxes, pred_scores, _ = extract_boxes_from_heatmap(
                 heatmap_probs=heatmap_probs,
                 bbox_reg=bbox_reg,
@@ -612,9 +564,10 @@ def validate_stage1(
                 nms_iou=nms_iou,
                 min_box_size=min_box_size,
                 debug=debug_this,
+                avg_gt_per_image=img_avg_gt,
             )
 
-            # Raw peaks (no threshold) for PR-curve sweep
+            # Raw peaks (no threshold) for PR-curve sweep and gap-filling
             raw_boxes, raw_scores = _extract_all_peaks(
                 heatmap_probs=heatmap_probs,
                 bbox_reg=bbox_reg,
@@ -624,9 +577,18 @@ def validate_stage1(
                 min_box_size=min_box_size,
             )
 
+            # Neighbor gap-fill: probe subthreshold peaks to recover alternating misses
+            if gap_fill:
+                n_before = len(pred_boxes)
+                pred_boxes, pred_scores = fill_detection_gaps(
+                    pred_boxes, pred_scores, raw_boxes, raw_scores
+                )
+                total_gap_filled += len(pred_boxes) - n_before
+
             all_gt_boxes.append(gt_boxes)
             all_pred_boxes.append(pred_boxes)
             all_raw_peaks.append((raw_boxes, raw_scores))
+            all_avg_gt.append(img_avg_gt)
 
             total_gt += len(gt_boxes)
             total_pred += len(pred_boxes)
@@ -673,6 +635,8 @@ def validate_stage1(
     print(f"Images evaluated: {len(all_gt_boxes)}")
     print(f"Avg GT boxes/img:   {avg_gt:.2f}")
     print(f"Avg Pred boxes/img: {avg_pred:.2f}")
+    if gap_fill:
+        print(f"Gap-filled boxes:   {total_gap_filled} ({total_gap_filled / max(1, len(all_gt_boxes)):.1f}/img)")
     print(f"TP: {metrics['tp']} | FP: {metrics['fp']} | FN: {metrics['fn']}")
     print(f"Precision: {metrics['precision']:.4f}")
     print(f"Recall:    {metrics['recall']:.4f}")
@@ -749,10 +713,12 @@ def validate_stage1(
     pr_thresholds = np.linspace(0.05, 0.90, 18).tolist()
     pr_results = []
     for thresh in pr_thresholds:
-        filtered = [
-            _filter_peaks(raw_boxes, raw_scores, thresh, nms_iou)
-            for raw_boxes, raw_scores in all_raw_peaks
-        ]
+        filtered = []
+        for (raw_boxes, raw_scores), avg_gt in zip(all_raw_peaks, all_avg_gt):
+            boxes_t = _filter_peaks(raw_boxes, raw_scores, thresh, nms_iou, avg_gt_per_image=avg_gt)
+            if gap_fill:
+                boxes_t, _ = fill_detection_gaps(boxes_t, [thresh] * len(boxes_t), raw_boxes, raw_scores)
+            filtered.append(boxes_t)
         m = compute_detection_metrics(all_gt_boxes, filtered, iou_threshold=iou_threshold)
         pr_results.append((round(thresh, 3), m["precision"], m["recall"], m["f1"]))
 
@@ -804,11 +770,290 @@ def validate_stage1(
     return metrics
 
 
+# -------------------------
+# Tiled inference
+# -------------------------
+
+def _run_tiled_inference(
+    backbone,
+    detector,
+    image_tensor: torch.Tensor,     # (1, 3, H, W) already on device, normalized
+    confidence_thresh: float,
+    image_size: tuple,              # (H, W) of image_tensor (e.g. (512, 512))
+    tile_size: int,                 # side of each tile in image_tensor pixels
+    tile_overlap: int,              # overlap between adjacent tiles in pixels
+    top_k: int,
+    nms_iou: float,
+    min_box_size: float,
+    avg_gt_per_image: float = STAGE1_AVG_GT_PER_IMAGE,
+) -> tuple:
+    """
+    Run the detector on overlapping tiles of the image, then merge results.
+
+    Each tile is upscaled to `image_size` before inference so the model sees
+    characters at a higher effective resolution — the primary purpose is to
+    test whether small/furigana characters that are missed at full resolution
+    become detectable when their tile is scaled up 2×.
+
+    Returns (boxes, scores) in full-image pixel coordinates.
+    """
+    H, W = image_size
+    stride = max(1, tile_size - tile_overlap)
+
+    # Generate tile top-left corners, clamped so tiles never exceed image bounds
+    def _tile_starts(length: int) -> list:
+        starts = list(range(0, length, stride))
+        # Ensure the last tile reaches the image edge
+        if not starts or starts[-1] + tile_size < length:
+            starts.append(max(0, length - tile_size))
+        return sorted(set(starts))
+
+    ys = _tile_starts(H)
+    xs = _tile_starts(W)
+
+    all_boxes: list = []
+    all_scores: list = []
+
+    for y0 in ys:
+        y1 = min(y0 + tile_size, H)
+        for x0 in xs:
+            x1 = min(x0 + tile_size, W)
+
+            tile = image_tensor[:, :, y0:y1, x0:x1]                           # (1,3,th,tw)
+            tile_up = F.interpolate(tile, size=image_size, mode="bilinear",
+                                    align_corners=False)                        # (1,3,H,W)
+
+            with torch.no_grad():
+                feats = backbone(tile_up)
+                out = detector(feats)
+                hm = torch.sigmoid(out["heatmap"])
+                bbox = out["bbox"]
+
+            _, _, Hf, Wf = feats.shape
+
+            # Decode peaks in tile-upscaled (image_size) space — no density filter here
+            tile_boxes, tile_scores = _extract_all_peaks(
+                heatmap_probs=hm,
+                bbox_reg=bbox,
+                output_size=(Hf, Wf),
+                image_size=image_size,
+                top_k=top_k,
+                min_box_size=min_box_size,
+            )
+
+            if not tile_boxes:
+                continue
+
+            # Filter by confidence threshold
+            paired = [(b, s) for b, s in zip(tile_boxes, tile_scores)
+                      if s >= confidence_thresh]
+            if not paired:
+                continue
+            fboxes, fscores = zip(*paired)
+
+            # Map from image_size coords → tile coords → global image coords
+            scale_x = (x1 - x0) / float(W)
+            scale_y = (y1 - y0) / float(H)
+            for (bx1, by1, bx2, by2), sc in zip(fboxes, fscores):
+                gx1 = float(np.clip(bx1 * scale_x + x0, 0, W))
+                gy1 = float(np.clip(by1 * scale_y + y0, 0, H))
+                gx2 = float(np.clip(bx2 * scale_x + x0, 0, W))
+                gy2 = float(np.clip(by2 * scale_y + y0, 0, H))
+                if gx2 > gx1 and gy2 > gy1:
+                    all_boxes.append([gx1, gy1, gx2, gy2])
+                    all_scores.append(float(sc))
+
+    if not all_boxes:
+        return [], []
+
+    # Global NMS across all tiles
+    keep = non_max_suppression(all_boxes, all_scores, iou_threshold=nms_iou)
+    all_boxes  = [all_boxes[i] for i in keep]
+    all_scores = [all_scores[i] for i in keep]
+
+    # Global density filter (same parameters as full-image run)
+    all_boxes, all_scores = spatial_density_filter(
+        all_boxes, all_scores, image_size,
+        grid_size=STAGE1_DENSITY_GRID,
+        density_factor=STAGE1_DENSITY_FACTOR,
+        avg_gt_per_image=avg_gt_per_image,
+    )
+    return all_boxes, all_scores
+
+
+def validate_stage1_tiled(
+    checkpoint_path,
+    confidence_thresh=DET_SCORE_THRESH,
+    split="val",
+    num_samples=None,
+    top_k=DET_TOP_K,
+    nms_iou=DET_NMS_IOU,
+    iou_threshold=0.2,
+    min_box_size=DET_MIN_BOX_SIZE,
+    tile_size=256,
+    tile_overlap=64,
+    job_id=None,
+):
+    """
+    Run tile-based Stage 1 validation and compare against full-image results.
+
+    Prints a side-by-side recall/precision/F1 table and a per-size-bucket
+    breakdown showing which box sizes benefit from tiling.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    resolved_job_id = job_id or os.environ.get("SLURM_JOB_ID") or os.environ.get("JOB_ID")
+    run_tag = f"{timestamp}_tiled_job{resolved_job_id}" if resolved_job_id else f"{timestamp}_tiled"
+    out_dir = Path(CHECKPOINT_DIR) / "stage1_validation" / run_tag
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n🔬 Stage1 TILED validation")
+    print(f"  ckpt: {checkpoint_path}")
+    print(f"  split: {split}  |  tile_size: {tile_size}  |  tile_overlap: {tile_overlap}")
+    print(f"  conf: {confidence_thresh} | top_k: {top_k} | nms_iou: {nms_iou} | iou_thr: {iou_threshold}")
+    print(f"  out: {out_dir}")
+
+    ann_files = sorted(list((Path(DATA_DIR) / "annotations").glob("*.json")))
+    vocab = VocabManager.from_annotations(ann_files)
+
+    dataset = KuzushijiDataset(
+        Path(DATA_DIR), vocab=vocab, use_sequences=False, resize=IMAGE_SIZE, split=split,
+    )
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+
+    ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+    backbone_type = ckpt.get("backbone_type", BACKBONE_TYPE)
+    backbone = build_backbone(backbone_type, BACKBONE_BASE_FEATURES, pretrained=False).to(DEVICE)
+    detector = DetectorHead(in_ch=BACKBONE_BASE_FEATURES, num_classes=vocab.vocab_size,
+                            predict_classes=False).to(DEVICE)
+    state_key = "backbone_state_dict" if "backbone_state_dict" in ckpt else "unet_state_dict"
+    backbone.load_state_dict(ckpt[state_key], strict=True)
+    detector.load_state_dict(ckpt["detector_state_dict"], strict=True)
+    backbone.eval()
+    detector.eval()
+
+    all_gt         = []
+    all_full_pred  = []
+    all_tiled_pred = []
+
+    # Per-size-bucket accumulators: small (<12px side), medium (12-20), large (>20)
+    SIZE_BUCKETS = [("small_<12", 0, 144), ("medium_12-20", 144, 400), ("large_>20", 400, 1e9)]
+    full_fn_by_bucket  = {name: 0 for name, *_ in SIZE_BUCKETS}
+    tiled_fn_by_bucket = {name: 0 for name, *_ in SIZE_BUCKETS}
+    gt_by_bucket       = {name: 0 for name, *_ in SIZE_BUCKETS}
+
+    with torch.no_grad():
+        for idx, batch in enumerate(tqdm(loader, desc="Tiled validation")):
+            if num_samples is not None and idx >= num_samples:
+                break
+
+            images    = batch["image"].to(DEVICE)
+            gt_boxes  = batch["boxes"][0].cpu().numpy().tolist()
+            all_gt.append(gt_boxes)
+
+            # --- Full-image prediction ---
+            feats = backbone(images)
+            out   = detector(feats)
+            hm    = torch.sigmoid(out["heatmap"])
+            bbox  = out["bbox"]
+            _, _, Hf, Wf = feats.shape
+
+            full_boxes, full_scores = _extract_all_peaks(
+                heatmap_probs=hm, bbox_reg=bbox,
+                output_size=(Hf, Wf), image_size=IMAGE_SIZE,
+                top_k=top_k, min_box_size=min_box_size,
+            )
+            tiled_avg_gt = batch.get("avg_gt_per_image", [STAGE1_AVG_GT_PER_IMAGE])[0]
+            full_pred = _filter_peaks(full_boxes, full_scores, confidence_thresh, nms_iou,
+                                      avg_gt_per_image=tiled_avg_gt)
+            all_full_pred.append(full_pred)
+
+            # --- Tiled prediction ---
+            tiled_boxes, _ = _run_tiled_inference(
+                backbone=backbone, detector=detector,
+                image_tensor=images,
+                confidence_thresh=confidence_thresh,
+                image_size=IMAGE_SIZE,
+                tile_size=tile_size, tile_overlap=tile_overlap,
+                top_k=top_k, nms_iou=nms_iou, min_box_size=min_box_size,
+                avg_gt_per_image=tiled_avg_gt,
+            )
+            all_tiled_pred.append(tiled_boxes)
+
+            # Per-size FN breakdown
+            fn_full  = _get_fn_indices(gt_boxes, full_pred,  iou_threshold)
+            fn_tiled = _get_fn_indices(gt_boxes, tiled_boxes, iou_threshold)
+            for i, (x1, y1, x2, y2) in enumerate(gt_boxes):
+                area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                for name, lo, hi in SIZE_BUCKETS:
+                    if lo <= area < hi:
+                        gt_by_bucket[name] += 1
+                        if i in fn_full:
+                            full_fn_by_bucket[name] += 1
+                        if i in fn_tiled:
+                            tiled_fn_by_bucket[name] += 1
+                        break
+
+    m_full  = compute_detection_metrics(all_gt, all_full_pred,  iou_threshold=iou_threshold)
+    m_tiled = compute_detection_metrics(all_gt, all_tiled_pred, iou_threshold=iou_threshold)
+
+    avg_full_pred  = sum(len(b) for b in all_full_pred)  / max(1, len(all_gt))
+    avg_tiled_pred = sum(len(b) for b in all_tiled_pred) / max(1, len(all_gt))
+
+    print("\n" + "=" * 70)
+    print("TILED vs FULL-IMAGE DETECTION COMPARISON")
+    print(f"  tile_size={tile_size}  overlap={tile_overlap}  "
+          f"n_tiles≈{len(_tile_starts_static(IMAGE_SIZE[0], tile_size, tile_size - tile_overlap)) ** 2}")
+    print("=" * 70)
+    print(f"{'Mode':<12} {'Recall':>8} {'Precision':>10} {'F1':>8} {'Pred/img':>10}")
+    print(f"{'Full':12} {m_full['recall']:8.4f} {m_full['precision']:10.4f} {m_full['f1']:8.4f} {avg_full_pred:10.1f}")
+    print(f"{'Tiled':12} {m_tiled['recall']:8.4f} {m_tiled['precision']:10.4f} {m_tiled['f1']:8.4f} {avg_tiled_pred:10.1f}")
+    recall_delta = m_tiled["recall"] - m_full["recall"]
+    print(f"\n  Δ Recall  = {recall_delta:+.4f}  ({recall_delta*100:+.2f} pp)")
+    print(f"  Δ Pred/img = {avg_tiled_pred - avg_full_pred:+.1f}")
+
+    print("\n  Per-size-bucket recall (area thresholds: small<144px², medium 144-400, large>400):")
+    print(f"  {'Bucket':<18} {'GT':>6} {'Full FN':>8} {'Full R':>8} {'Tiled FN':>9} {'Tiled R':>8} {'Δ R':>8}")
+    for name, lo, hi in SIZE_BUCKETS:
+        n = gt_by_bucket[name]
+        ffn, tfn = full_fn_by_bucket[name], tiled_fn_by_bucket[name]
+        fr  = 1 - ffn / max(1, n)
+        tr  = 1 - tfn / max(1, n)
+        print(f"  {name:<18} {n:>6} {ffn:>8} {fr:>8.3f} {tfn:>9} {tr:>8.3f} {tr-fr:>+8.3f}")
+
+    results = {
+        "tile_size": tile_size, "tile_overlap": tile_overlap,
+        "full_image": m_full, "tiled": m_tiled,
+        "avg_pred_per_img_full": avg_full_pred, "avg_pred_per_img_tiled": avg_tiled_pred,
+        "per_bucket": {
+            name: {
+                "gt": gt_by_bucket[name],
+                "full_fn": full_fn_by_bucket[name],
+                "tiled_fn": tiled_fn_by_bucket[name],
+                "full_recall": 1 - full_fn_by_bucket[name] / max(1, gt_by_bucket[name]),
+                "tiled_recall": 1 - tiled_fn_by_bucket[name] / max(1, gt_by_bucket[name]),
+            }
+            for name, *_ in SIZE_BUCKETS
+        },
+    }
+    with open(out_dir / "tiled_metrics.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n✅ saved: {out_dir / 'tiled_metrics.json'}")
+    return results
+
+
+def _tile_starts_static(length: int, tile_size: int, stride: int) -> list:
+    """Helper for counting tiles (mirrors _run_tiled_inference logic)."""
+    starts = list(range(0, length, stride))
+    if not starts or starts[-1] + tile_size < length:
+        starts.append(max(0, length - tile_size))
+    return sorted(set(starts))
+
+
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--split", type=str, default="val", choices=["train", "val"])
+    p.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
     p.add_argument("--confidence", type=float, default=DET_SCORE_THRESH)
     p.add_argument("--top_k", type=int, default=DET_TOP_K)
     p.add_argument("--nms_iou", type=float, default=DET_NMS_IOU)
@@ -819,6 +1064,15 @@ if __name__ == "__main__":
     p.add_argument("--num_samples", type=int, default=0, help="0 => full split")
     p.add_argument("--worst_n", type=int, default=30,
                    help="Save this many worst-FN images (sorted by FN count)")
+    p.add_argument("--tiled", action="store_true",
+                   help="Also run tiled inference and compare recall per size bucket")
+    p.add_argument("--tile_size", type=int, default=256,
+                   help="Tile side length in image pixels (default 256 = half of 512)")
+    p.add_argument("--tile_overlap", type=int, default=64,
+                   help="Overlap between adjacent tiles in pixels (default 64)")
+    p.add_argument("--no_gap_fill", action="store_true",
+                   help="Disable neighbor gap-filler (on by default). Use this to get the "
+                        "raw Stage 1 baseline without gap recovery.")
     args = p.parse_args()
 
     validate_stage1(
@@ -832,4 +1086,20 @@ if __name__ == "__main__":
         min_box_size=args.min_box_size,
         job_id=args.job_id,
         worst_n=args.worst_n,
+        gap_fill=not args.no_gap_fill,
     )
+
+    if args.tiled:
+        validate_stage1_tiled(
+            checkpoint_path=args.checkpoint,
+            confidence_thresh=args.confidence,
+            split=args.split,
+            num_samples=None if args.num_samples == 0 else args.num_samples,
+            top_k=args.top_k,
+            nms_iou=args.nms_iou,
+            iou_threshold=args.iou_thr,
+            min_box_size=args.min_box_size,
+            tile_size=args.tile_size,
+            tile_overlap=args.tile_overlap,
+            job_id=args.job_id,
+        )

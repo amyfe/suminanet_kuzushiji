@@ -2,6 +2,12 @@
 
 This script tunes the detection stage directly (UNet + DetectorHead) and keeps
 your existing training pipeline untouched.
+
+EVALUATION DISCIPLINE: The Optuna objective is val loss (assets/data/splits/val.txt).
+val.txt == test.txt, so val metrics ARE the held-out test metrics. Do not add new
+hyperparameter ranges or re-run Optuna based on what you observe in test/val numbers
+after a training run — that defeats the purpose of a held-out set. Only use Optuna
+to explore genuinely new hyperparameter hypotheses, not to overfit to the val split.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ import optuna
 from optuna.importance import get_param_importances
 from optuna.visualization.matplotlib import plot_contour, plot_parallel_coordinate, plot_param_importances, plot_slice
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -37,13 +44,18 @@ from config import (
     GRADIENT_ACCUMULATION_STEPS,
     IMAGE_SIZE,
     NUM_WORKERS,
+    SAM2_HARD_NEG_WEIGHT,
+    SAM2_PREPROCESSING,
+    STAGE1_SIGMA_FLOOR,
+    STAGE1_SIGMA_CEIL,
+    STAGE1_SIGMA_SCALE,
     USE_MIXED_PRECISION,
 )
 from model.kuronet import DetectorHead, build_backbone
 from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
-from utils.training_helpers.helper_stage1 import collate_fn, masked_bbox_smoothl1_loss
+from utils.training_helpers.helper_stage1 import collate_fn, masked_bbox_smoothl1_loss, masked_bbox_diou_loss
 from utils.vocab import VocabManager
 from validate_stage1 import compute_detection_metrics, extract_boxes_from_heatmap
 
@@ -102,6 +114,7 @@ def validate_detector(
     focal_gamma: float,
     pos_weight: float,
     bbox_weight: float,
+    diou_weight: float = 0.15,
     bbox_radius: int = 1,
     pos_threshold: float = 0.3,
 ) -> float:
@@ -124,7 +137,7 @@ def validate_detector(
             for l in batch.get("labels", [])
         ]
 
-        with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
+        with torch.amp.autocast(device_type=AUTOCAST_DEVICE, enabled=AMP_ENABLED):
             features = backbone(images)
             _, _, hf, wf = features.shape
             gt_heat, gt_bbox, gt_bbox_mask, _ = build_detection_targets(
@@ -134,8 +147,19 @@ def validate_detector(
                 image_size=tuple(images.shape[-2:]),
                 device=DEVICE,
                 sigma=heatmap_sigma,
+                sigma_floor=STAGE1_SIGMA_FLOOR,
+                sigma_ceil=STAGE1_SIGMA_CEIL,
+                sigma_scale=STAGE1_SIGMA_SCALE,
                 bbox_radius=bbox_radius,
             )
+
+            illus_mask_feat = None
+            raw_illus = batch.get("illus_mask")
+            if raw_illus is not None:
+                raw_illus = raw_illus.to(DEVICE)
+                if raw_illus.shape[-2:] != (hf, wf):
+                    raw_illus = F.interpolate(raw_illus.float(), size=(hf, wf), mode="nearest").bool()
+                illus_mask_feat = raw_illus
 
             outputs = detector(features)
             loss_heat = focal_loss_heatmap(
@@ -145,9 +169,13 @@ def validate_detector(
                 gamma=focal_gamma,
                 pos_weight=pos_weight,
                 pos_threshold=pos_threshold,
+                illus_mask=illus_mask_feat,
+                illus_neg_weight=SAM2_HARD_NEG_WEIGHT,
             )
             loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_bbox_mask)
-            loss = loss_heat + bbox_weight * loss_bbox
+            loss_diou = masked_bbox_diou_loss(outputs["bbox"], gt_bbox, gt_bbox_mask,
+                                              image_size=tuple(images.shape[-2:]))
+            loss = loss_heat + bbox_weight * loss_bbox + diou_weight * loss_diou
 
         total_loss += float(loss.item())
         num_batches += 1
@@ -165,7 +193,8 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     dropout_rate = trial.suggest_float("dropout_rate", 0.1, 0.5)
     focal_alpha = trial.suggest_float("focal_alpha", 0.15, 0.45)
     focal_gamma = trial.suggest_float("focal_gamma", 1.0, 3.0)
-    pos_weight = trial.suggest_float("pos_weight", 2.0, 12.0)
+    pos_weight  = trial.suggest_float("pos_weight",  0.5, 5.0)
+    diou_weight = trial.suggest_float("diou_weight", 0.0, 0.4)
     bbox_weight = trial.suggest_float("bbox_weight", 0.1, 1.0)
     heatmap_sigma = trial.suggest_float("heatmap_sigma", 0.5, 2.5)
     bbox_radius = trial.suggest_int("bbox_radius", 0, 2)
@@ -193,7 +222,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=AMP_ENABLED)
+    scaler = torch.amp.GradScaler(device=AUTOCAST_DEVICE) if AMP_ENABLED else None
 
     best_val = float("inf")
 
@@ -224,7 +253,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
                 for l in batch.get("labels", [])
             ]
 
-            with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
+            with torch.amp.autocast(device_type=AUTOCAST_DEVICE, enabled=AMP_ENABLED):
                 features = backbone(images)
                 _, _, hf, wf = features.shape
                 gt_heat, gt_bbox, gt_bbox_mask, _ = build_detection_targets(
@@ -234,8 +263,19 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
                     image_size=tuple(images.shape[-2:]),
                     device=DEVICE,
                     sigma=heatmap_sigma,
+                    sigma_floor=STAGE1_SIGMA_FLOOR,
+                    sigma_ceil=STAGE1_SIGMA_CEIL,
+                    sigma_scale=STAGE1_SIGMA_SCALE,
                     bbox_radius=bbox_radius,
                 )
+
+                illus_mask_feat = None
+                raw_illus = batch.get("illus_mask")
+                if raw_illus is not None:
+                    raw_illus = raw_illus.to(DEVICE)
+                    if raw_illus.shape[-2:] != (hf, wf):
+                        raw_illus = F.interpolate(raw_illus.float(), size=(hf, wf), mode="nearest").bool()
+                    illus_mask_feat = raw_illus
 
                 outputs = detector(features)
                 loss_heat = focal_loss_heatmap(
@@ -245,9 +285,13 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
                     gamma=focal_gamma,
                     pos_weight=pos_weight,
                     pos_threshold=pos_threshold,
+                    illus_mask=illus_mask_feat,
+                    illus_neg_weight=SAM2_HARD_NEG_WEIGHT,
                 )
                 loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_bbox_mask)
-                loss = loss_heat + bbox_weight * loss_bbox
+                loss_diou = masked_bbox_diou_loss(outputs["bbox"], gt_bbox, gt_bbox_mask,
+                                                  image_size=tuple(images.shape[-2:]))
+                loss = loss_heat + bbox_weight * loss_bbox + diou_weight * loss_diou
                 loss = loss / GRADIENT_ACCUMULATION_STEPS
 
             if scaler is not None:
@@ -293,6 +337,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
             focal_gamma=focal_gamma,
             pos_weight=pos_weight,
             bbox_weight=bbox_weight,
+            diou_weight=diou_weight,
             bbox_radius=bbox_radius,
             pos_threshold=pos_threshold,
         )
@@ -341,7 +386,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
                 "trial": trial.number,
                 "best_val": best_val,
                 "params": trial.params,
-                "unet_state_dict": unet.state_dict(),
+                "backbone_state_dict": backbone.state_dict(),
                 "detector_state_dict": detector.state_dict(),
             },
             checkpoint_path,
@@ -510,7 +555,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Optuna search for Stage 1 detector training/validation")
     parser.add_argument("--plot-only", action="store_true", help="Load an existing Optuna study and export PNG plots only")
     parser.add_argument("--mode", type=str, default="train", choices=["train", "val"], help="train: tune stage1 training hparams, val: tune stage1 decode/validation params")
-    parser.add_argument("--epochs", type=int, default=6, help="Epochs per trial")
+    parser.add_argument("--epochs", type=int, default=4, help="Epochs per trial")
     parser.add_argument("--n-trials", type=int, default=30, help="Number of Optuna trials")
     parser.add_argument(
         "--global-max-trials",
@@ -618,6 +663,11 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # If --storage points to a sqlite file in a different directory, create that too.
+    if args.storage and args.storage.startswith("sqlite:///"):
+        db_path = Path(args.storage[len("sqlite:///"):])
+        db_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.plot_only:
         study = load_optuna_study(args.plot_study_name, args.storage)

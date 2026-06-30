@@ -73,6 +73,7 @@ class ROIPoolEncoder(nn.Module):
         self,
         in_channels: int,
         roi_size: Tuple[int, int] = (8, 6),
+        pool_output_size: Tuple[int, int] = (4, 4),
         conv_channels: int | None = None,
         out_dim: int = 256,
         dropout: float = 0.1,
@@ -88,6 +89,7 @@ class ROIPoolEncoder(nn.Module):
             conv_channels = in_channels
 
         self.roi_size = roi_size
+        self.pool_output_size = pool_output_size
         self.out_dim = out_dim
         self.conv_channels = conv_channels
 
@@ -101,14 +103,16 @@ class ROIPoolEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # 4×4 spatial pooling gives 16 cells (vs 9 with 3×3), preserving finer
-        # stroke layout for dakuten discrimination while keeping params fixed at
-        # conv_channels*16*out_dim regardless of roi_size — enabling Phase A
-        # weight transfer between Stage 2 and KuroNet.
+        # pool_output_size collapses the roi_conv spatial output to a fixed grid for the MLP.
+        # roi_size (the tv_roi_align resolution) and pool_output_size are independent:
+        #   roi_size   = conv input resolution — controls how finely we sample the feature map
+        #   pool_output= MLP input spatial cells — controls downstream capacity and param count
+        # Default (4,4) = 16 cells: enough for coarse stroke layout, keeps Linear layer small.
+        _pool_cells = pool_output_size[0] * pool_output_size[1]
         self.proj = nn.Sequential(
-            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.AdaptiveAvgPool2d(pool_output_size),
             nn.Flatten(),
-            nn.Linear(conv_channels * 16, out_dim),
+            nn.Linear(conv_channels * _pool_cells, out_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
         )
@@ -250,11 +254,14 @@ class ROIPoolEncoder(nn.Module):
                 roi_mask[b, :cnt] = True
                 offset += cnt
             else:
+                # Empty sample: write the learnable empty_token as a stable non-zero value
+                # so downstream normalisation (LayerNorm, GRU) doesn't see NaNs from a
+                # truly zero-filled slot.  mask stays False — this position is NOT treated
+                # as a real ROI by loss functions or the context encoder.
+                # (_safe_lengths_from_mask clamps min-length to 1 so pack_padded_sequence
+                #  remains safe even when all mask entries are False.)
                 roi_feats[b, 0] = self.empty_token[0]
-                roi_mask[b, 0] = True
-                # Important caveat:
-                # this keeps tensor shapes valid, but semantically empty samples should later
-                # still be handled carefully via dedicated valid-instance logic if needed.
+                # roi_mask[b, 0] left False — slot is padding, not a valid detection
 
         return {
             "roi_feats": roi_feats,     # (B, T, D)

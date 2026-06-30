@@ -1,23 +1,40 @@
 
 import argparse
+import logging
+import sys
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
 
+import torch.nn.functional as F
+
 from config import (
-    DATA_DIR, DEVICE, BATCH_SIZE, STAGE1_BBOX_WEIGHT, STAGE1_DROPOUT_RATE, STAGE1_FOCAL_POS_THRESHOLD, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_HEATMAP_SIGMA, STAGE1_SIGMA_FLOOR, STAGE1_SIGMA_CEIL, STAGE1_POS_WEIGHT, WEIGHT_DECAY,
+    DATA_DIR, DEVICE, BATCH_SIZE, STAGE1_BBOX_WEIGHT, STAGE1_DIOU_WEIGHT, STAGE1_DROPOUT_RATE,
+    STAGE1_FOCAL_POS_THRESHOLD, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS,
+    STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_HEATMAP_SIGMA, STAGE1_SIGMA_FLOOR, STAGE1_SIGMA_CEIL, STAGE1_SIGMA_SCALE,
+    STAGE1_POS_WEIGHT, STAGE1_EARLY_STOPPING_PATIENCE, WEIGHT_DECAY,
     GRADIENT_ACCUMULATION_STEPS, CHECKPOINT_DIR, USE_MIXED_PRECISION, BACKBONE_BASE_FEATURES, BACKBONE_TYPE,
+    SAM2_HARD_NEG_WEIGHT, SAM2_PREPROCESSING,
+    SAM2_PROPOSALS_PREPROCESSING,
 )
 from model.kuronet import DetectorHead, build_backbone
 from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
+def _atomic_save(obj, path):
+    """Write checkpoint atomically: save to .tmp then rename, so crashes never leave a corrupt file."""
+    tmp = Path(str(path) + ".tmp")
+    torch.save(obj, tmp)
+    tmp.replace(path)
+
+
 from utils.training_helpers.helper_stage1 import (
     collate_fn,
     masked_bbox_smoothl1_loss,
-    prune_existing_checkpoints,
+    masked_bbox_diou_loss,
+    prune_to_keep_last_n,
     validate_detector,
 )
 from utils.vocab import VocabManager
@@ -38,6 +55,12 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         checkpoint_dir = CHECKPOINT_DIR / "stage1_detection"
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
     
+    # SAM2 illustration masking: build (or verify) the cache before loading data.
+    # On first run this takes several minutes; subsequent runs exit in <1 s.
+    if SAM2_PREPROCESSING:
+        from preprocess_sam2_illustrations import run_preprocessing
+        run_preprocessing(splits=["train", "val"] if val_split is None else ["train"])
+
     # Build or load vocab
     ann_files = sorted(list((Path(DATA_DIR) / "annotations").glob("*.json")))
     if len(ann_files) == 0:
@@ -48,7 +71,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     if resume_ckpt is None:
         # Clean up existing checkpoints only when starting fresh.
-        prune_existing_checkpoints(checkpoint_dir)
+        prune_to_keep_last_n(checkpoint_dir, keep=2)
 
     # Dataset + loader - use pre-existing splits or random split if val_split provided
     if val_split is None:
@@ -103,9 +126,17 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         lr=lr, weight_decay=WEIGHT_DECAY
     )
     
-    # Scheduler — T_max is the total intended number of epochs, not remaining epochs,
-    # so the cosine curve shape is preserved across a resume.
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    # 2-epoch linear warmup then cosine annealing.
+    # SequentialLR state_dict includes sub-scheduler states, so resume works correctly.
+    _warmup = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=2
+    )
+    _cosine = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, num_epochs - 2), eta_min=1e-6
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[_warmup, _cosine], milestones=[2]
+    )
 
     # Mixed precision (use new API to avoid deprecation warning)
     scaler = torch.amp.GradScaler(device='cuda') if USE_MIXED_PRECISION else None
@@ -120,7 +151,10 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         detector.load_state_dict(ckpt["detector_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except Exception:
+                print("Warning: scheduler state incompatible with current schedule — restarting scheduler.")
         start_epoch   = int(ckpt.get("epoch", 0))
         best_val      = ckpt.get("best_val", None)
         patience_ctr  = int(ckpt.get("patience_ctr", 0))
@@ -155,7 +189,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                 # Single forward pass
                 features = backbone(images)  # (B, 32, H/8, W/8)
                 outputs = detector(features)  # Returns dict with 'heatmap' (raw logits), 'bbox', etc.
-                
+
                 B, _, Hf, Wf = features.shape
                 gt_heat, gt_bbox, gt_bbox_mask, gt_cls = build_detection_targets(
                     boxes,
@@ -166,20 +200,36 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                     sigma=STAGE1_HEATMAP_SIGMA,
                     sigma_floor=STAGE1_SIGMA_FLOOR,
                     sigma_ceil=STAGE1_SIGMA_CEIL,
+                    sigma_scale=STAGE1_SIGMA_SCALE,
                     bbox_radius=bbox_radius,
                 )
+
+                # Downsample illustration mask to feature-map resolution if present
+                illus_mask_feat = None
+                raw_illus = batch.get("illus_mask")
+                if raw_illus is not None:
+                    raw_illus = raw_illus.to(DEVICE)
+                    if raw_illus.shape[-2:] != (Hf, Wf):
+                        raw_illus = F.interpolate(
+                            raw_illus.float(), size=(Hf, Wf), mode="nearest"
+                        ).bool()
+                    illus_mask_feat = raw_illus  # (B, 1, Hf, Wf)
+
                 # Compute losses with detailed tracking
                 loss_heatmap = focal_loss_heatmap(
                     outputs["heatmap"], gt_heat,
                     alpha=STAGE1_FOCAL_ALPHA, gamma=STAGE1_FOCAL_GAMMA,
                     pos_weight=STAGE1_POS_WEIGHT,
                     pos_threshold=STAGE1_FOCAL_POS_THRESHOLD,
+                    illus_mask=illus_mask_feat,
+                    illus_neg_weight=SAM2_HARD_NEG_WEIGHT,
                 )
-                # Lower pos_thresh for bbox (include broader region around peak) and increase bbox weight
                 loss_bbox = masked_bbox_smoothl1_loss(outputs["bbox"], gt_bbox, gt_bbox_mask)
-                                
-                # Balanced loss: heatmap for localization, bbox for accurate box dimensions
-                loss = loss_heatmap + STAGE1_BBOX_WEIGHT * loss_bbox  
+                loss_diou = masked_bbox_diou_loss(
+                    outputs["bbox"], gt_bbox, gt_bbox_mask,
+                    image_size=tuple(images.shape[-2:]),
+                )
+                loss = loss_heatmap + STAGE1_BBOX_WEIGHT * loss_bbox + STAGE1_DIOU_WEIGHT * loss_diou  
                 loss = loss / GRADIENT_ACCUMULATION_STEPS
             
             if scaler is not None:
@@ -297,22 +347,28 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         }
 
         epoch_path = checkpoint_dir / f"detector_epoch{epoch+1}.pt"
-        torch.save(ckpt, epoch_path)
+        _atomic_save(ckpt, epoch_path)
 
         if is_best:
-            torch.save(ckpt, checkpoint_dir / "detector_best.pt")
+            _atomic_save(ckpt, checkpoint_dir / "detector_best.pt")
             print(f"✅ saved best: detector_best.pt (val={val_loss:.4f})")
 
-        # DISABLED: Early stopping to collect full training curves
-        # if patience > 0 and patience_ctr >= patience:
-        #     print(f"⏹️ early stop (no val improvement for {patience} epochs). best={best_val:.4f}")
-        #     break    
+        if patience > 0 and patience_ctr >= patience:
+            print(f"Early stopping: no val improvement for {patience} epochs. best={best_val:.4f}")
+            break
     
     print(f"\n{'='*60}")
     print(f"Stage 1 training complete!")
     print(f"Best checkpoint: {checkpoint_dir / 'detector_best.pt'}")
     print(f"{'='*60}\n")
-    
+
+    if SAM2_PROPOSALS_PREPROCESSING:
+        from preprocess_sam2_proposals import run_preprocessing as _run_sam2_proposals
+        _run_sam2_proposals(
+            detector_ckpt=checkpoint_dir / "detector_best.pt",
+            splits=["train", "val"],
+        )
+
     return backbone, detector
 
 def train(args=None):
@@ -332,12 +388,42 @@ def train(args=None):
     )
     parsed = parser.parse_args(args)
 
-    print("=" * 60)
-    print("STAGE 1: TRAINING DETECTOR (Spatial Localization)")
-    print("=" * 60)
+    # Setup logging — tee stdout so every print() also lands in the log file
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True, parents=True)
+
+    class _Tee:
+        def __init__(self, *streams):
+            self._streams = streams
+        def write(self, data):
+            for s in self._streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self._streams:
+                s.flush()
+
+    _log_fh = open(log_dir / "train_stage1.log", "a")
+    sys.stdout = _Tee(sys.__stdout__, _log_fh)
+    sys.stderr = _Tee(sys.__stderr__, _log_fh)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_dir / 'train_stage1.log'),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
+
+    logger.info("=" * 60)
+    logger.info("STAGE 1: TRAINING DETECTOR (Spatial Localization)")
+    logger.info("=" * 60)
     train_detector_stage(
         num_epochs=parsed.epochs,
         lr=None,
+        patience=STAGE1_EARLY_STOPPING_PATIENCE,
         resume_ckpt=Path(parsed.resume) if parsed.resume else None,
     )
 

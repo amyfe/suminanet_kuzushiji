@@ -60,7 +60,16 @@ class FocalLoss(nn.Module):
             return loss
 
 
-def focal_loss_heatmap(pred, target, alpha=0.25, gamma=2.0, pos_weight=1.0, pos_threshold=0.3):
+def focal_loss_heatmap(
+    pred,
+    target,
+    alpha=0.25,
+    gamma=2.0,
+    pos_weight=1.0,
+    pos_threshold=0.3,
+    illus_mask=None,
+    illus_neg_weight=4.0,
+):
     """Focal loss for soft Gaussian heatmap predictions.
 
     Uses pos_threshold (default 0.3) instead of 0.5 to decide positive vs negative.
@@ -74,8 +83,12 @@ def focal_loss_heatmap(pred, target, alpha=0.25, gamma=2.0, pos_weight=1.0, pos_
         gamma: Focal exponent
         pos_weight: Additional scalar weight on positive BCE terms
         pos_threshold: Gaussian value above which a pixel is treated as positive
+        illus_mask: (B, 1, H, W) bool tensor marking illustration regions, or None.
+                    When provided, negative cells inside illustrations receive
+                    illus_neg_weight × extra loss to suppress false positives there.
+        illus_neg_weight: Multiplier for illustration false positives (default 4.0).
     """
-    pred_flat = pred.view(-1)
+    pred_flat   = pred.view(-1)
     target_flat = target.view(-1)
 
     p = torch.sigmoid(pred_flat)
@@ -93,4 +106,18 @@ def focal_loss_heatmap(pred, target, alpha=0.25, gamma=2.0, pos_weight=1.0, pos_
                           torch.full_like(target_flat, alpha),
                           torch.full_like(target_flat, 1.0 - alpha))
 
-    return (alpha_t * focal_weight * ce_loss).mean()
+    per_element = alpha_t * focal_weight * ce_loss
+
+    if illus_mask is not None:
+        # Upweight negative cells inside illustration regions only.
+        # Positive cells (annotated characters) keep weight 1 — they shouldn't
+        # be inside illustrations after the GT filter, but we never punish correct
+        # predictions.
+        illus_flat = illus_mask.view(-1)
+        hard_neg   = illus_flat & (~pos_mask)
+        weight     = torch.where(hard_neg,
+                                 torch.full_like(per_element, illus_neg_weight),
+                                 torch.ones_like(per_element))
+        per_element = per_element * weight
+
+    return per_element.mean()

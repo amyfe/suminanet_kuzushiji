@@ -8,8 +8,10 @@ Falls back to heuristic kana normalization if fugashi/unidic are not installed.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List
 
 # ---------------------------------------------------------------------------
@@ -82,18 +84,41 @@ class HistoricalJapaneseNormalizer:
 
     def _try_load_mecab(self) -> None:
         try:
-            import fugashi  # noqa: F401 – just testing import
-            # Prefer full unidic, fall back to unidic-lite
+            import fugashi
+
+            # 0. Bundled Edo dict — always try first
+            _project_root = Path(__file__).resolve().parent.parent.parent
+            _zip = _project_root / "assets" / "translation_dict" / "unidic-kinsei-edo-v202512.zip"
+            _edo = _zip.with_suffix("")  # …/unidic-kinsei-edo-v202512/
+            if _zip.exists() and not _edo.exists():
+                import zipfile
+                with zipfile.ZipFile(_zip) as zf:
+                    zf.extractall(_edo)
+            if _edo.exists():
+                self._tagger = fugashi.Tagger(f'-d "{_edo}"')
+                self._method = "mecab+unidic-kinsei-edo"
+                return
+
+            # 1. UNIDIC_EDO_DIR env var — custom/override Edo dict path
+            edo_dir = os.environ.get("UNIDIC_EDO_DIR", "")
+            if edo_dir:
+                self._tagger = fugashi.Tagger(f'-d "{edo_dir}"')
+                self._method = "mecab+unidic-kinsei-edo"
+                return
+
+            # 2. Full modern UniDic (pip install unidic && python -m unidic download)
             try:
                 import unidic
-                import fugashi
                 self._tagger = fugashi.Tagger(f'-d "{unidic.DICDIR}"')
                 self._method = "mecab+unidic"
+                return
             except Exception:
-                import unidic_lite
-                import fugashi
-                self._tagger = fugashi.Tagger(f'-d "{unidic_lite.DICDIR}"')
-                self._method = "mecab+unidic-lite"
+                pass
+
+            # 3. unidic-lite (pip install unidic-lite, self-contained)
+            import unidic_lite
+            self._tagger = fugashi.Tagger(f'-d "{unidic_lite.DICDIR}"')
+            self._method = "mecab+unidic-lite"
         except Exception:
             pass  # heuristic fallback
 
@@ -116,8 +141,13 @@ class HistoricalJapaneseNormalizer:
 
         for word in self._tagger(text):
             surface = word.surface
-            normalized_form = self._extract_orth_base(word) or surface
             pos = self._extract_pos(word)
+            # orthBase returns the dictionary/lemma form for verbs, which breaks conjugations
+            # (e.g. 登り → 登る produces 登るけり). Keep surface for verbs to preserve tense.
+            if pos == "動詞":
+                normalized_form = surface
+            else:
+                normalized_form = self._extract_orth_base(word) or surface
             tokens.append({"surface": surface, "normalized": normalized_form, "pos": pos})
             parts.append(normalized_form)
 

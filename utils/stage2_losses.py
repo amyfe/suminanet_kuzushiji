@@ -1,60 +1,3 @@
-"""Funktionen
-compute_refinement_loss(...)
-compute_refine_score_loss(...)
-compute_aux_classification_loss(...)
-compute_decoder_ce_loss(...)
-compute_stage2_total_loss(...)
-Aufgabe
-
-Saubere Loss-Zerlegung.
-
-Empfohlene Losses für Option C v1
-L_refine_box
-L_refine_score
-L_aux_cls optional
-L_decoder_ce
-
-Später optional:
-
-coverage loss
-ambiguity loss
-
-
-ToDos:
-1. Box-Loss und Delta-Loss gleichzeitig
-
-Ich habe beide drin gelassen. Das ist als Start okay, aber nicht zwingend dauerhaft optimal.
-
-Warum?
-
-loss_delta passt direkt zur Parametrisierung des RefinementHeads
-loss_box kontrolliert die tatsächlichen Endboxen
-
-Das kann am Anfang stabilisieren.
-Aber wenn du merkst, dass einer der beiden dominiert, dann würde ich mittelfristig eher delta loss priorisieren und den direkten box loss schwächer machen.
-
-2. refine_score_bce_loss ist nur Positiv/Negativ, keine feinere Qualitätsregression
-
-Das ist bewusst simpel.
-Später könntest du stattdessen:
-
-IoU als kontinuierliches Target
-oder Quality Focal Loss
-
-verwenden. Aber zuerst sollte das System überhaupt stabil lernen.
-
-3. Aux-Klassifikation nur auf positiven ROIs
-
-Das ist methodisch sauberer als auf allen ROIs.
-Negative oder unklare Kandidaten dort zu klassifizieren wäre eher Rauschen.
-
-4. Decoder-CE ist aktuell “plain”
-
-Kein EOS-Bias, kein curriculum, kein scheduled weirdness.
-Das ist Absicht. Altcode-Fallen vermeiden.
-"""
-
-
 # utils/stage2_losses.py
 
 from __future__ import annotations
@@ -64,6 +7,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from config import STAGE2_CONTINUATION_ALPHA, STAGE2_CONTINUATION_WEIGHT
 
 
 def smooth_l1_box_loss(
@@ -172,6 +117,7 @@ def focal_classification_loss(
     pos_mask: torch.Tensor,              # (B, T)
     gamma: float = 2.0,
     ignore_index: int = -1,
+    vocab_weights: Optional[torch.Tensor] = None,  # (V,) per-class multiplier, e.g. kanji boost
 ) -> torch.Tensor:
     """
     Focal-loss variant of aux_classification_loss.
@@ -181,6 +127,12 @@ def focal_classification_loss(
     detached so gradients flow only through the cross-entropy term.
 
     gamma=0 recovers plain cross-entropy; gamma=2 is the standard choice.
+
+    vocab_weights: optional per-class weight tensor of shape (V,).  When provided,
+        each token's loss is multiplied by vocab_weights[label].  Use this to
+        up-weight script types that are harder to classify — e.g. kanji (1.5×)
+        relative to hiragana (1.0×), following Clanuwat's observation that kanji
+        need proportionally more gradient due to high visual ambiguity and sparsity.
     """
     if aux_logits is None:
         return torch.tensor(0.0, device=target_labels.device)
@@ -195,6 +147,14 @@ def focal_classification_loss(
     ce = F.cross_entropy(logits_valid, labels_valid, reduction="none")  # (N_pos,)
     p_t = torch.exp(-ce.detach())                                        # (N_pos,)
     focal_weight = (1.0 - p_t) ** gamma
+
+    if vocab_weights is not None:
+        # Per-token class weight: look up each token's label in the weight tensor.
+        # Clamp label indices to valid range in case of rare -1 leakage.
+        safe_labels = labels_valid.clamp(min=0, max=vocab_weights.size(0) - 1)
+        token_w = vocab_weights[safe_labels].to(ce.dtype)
+        return (focal_weight * ce * token_w).mean()
+
     return (focal_weight * ce).mean()
 
 
@@ -964,8 +924,8 @@ def compute_free_decoder_prefix_losses(
         & ~tgt_tokens_cut.eq(int(eos_id))
     )
     if post_prefix_mask.any():
-        continuation_weight = 0.3
-        continuation_alpha = 0.5
+        continuation_weight = STAGE2_CONTINUATION_WEIGHT
+        continuation_alpha = STAGE2_CONTINUATION_ALPHA
         continuation_weights = torch.where(
             post_prefix_mask,
             torch.full_like(decoder_weights_free, float(continuation_weight)),

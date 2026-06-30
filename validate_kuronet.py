@@ -38,6 +38,7 @@ from config import (
     KURONET_PREDICTION_SAMPLES,
     STAGE2_REFINE_NEG_IOU,
     STAGE2_REFINE_POS_IOU,
+    STAGE2_USE_HUNGARIAN,
 )
 from train_stage2_kuronet import (
     _compute_assembled_cer,
@@ -402,6 +403,7 @@ def run_validation(
                 gt_labels_list=gt_labels_list,
                 pos_iou_thresh=STAGE2_REFINE_POS_IOU,
                 neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
+                use_hungarian=STAGE2_USE_HUNGARIAN,
             )
 
             loss, parts = compute_kuronet_loss(outputs, refine_targets, bg_id=bg_id)

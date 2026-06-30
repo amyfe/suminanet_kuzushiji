@@ -124,6 +124,7 @@ class ROIContextEncoder(nn.Module):
         mask: torch.Tensor,                            # (B, T) bool
         spatial_coords: Optional[torch.Tensor] = None, # (B, T, 2) normalized (cx, cy)
         refine_scores: Optional[torch.Tensor] = None,  # (B, T) logits from ROIRefinementHead
+        block_ids: Optional[torch.Tensor] = None,      # (B, T) long — per-block GRU reset; -1=invalid
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if seq.dim() != 3:
             raise ValueError(f"seq must have shape (B, T, D), got {tuple(seq.shape)}")
@@ -143,28 +144,53 @@ class ROIContextEncoder(nn.Module):
             seq_in = seq_in + self.pos_proj(spatial_coords)
 
         # Soft-gate token embeddings by detection confidence before the GRU.
-        # FP proposals get near-zero weight so they don't corrupt the recurrent state.
-        # The gate is differentiable: gradients flow back to improve refine_scores.
+        # FP proposals (low refine_score) get near-zero weight so they don't corrupt the
+        # recurrent state.  Scores are detached so BiGRU gradients don't flow back into
+        # the refinement head — that head is already supervised by its own BCE loss and
+        # mixing in BiGRU signal created conflicting objectives (IoU quality vs. contextual
+        # usefulness).
         if refine_scores is not None:
-            gate = torch.sigmoid(refine_scores).unsqueeze(-1)  # (B, T, 1)
+            gate = torch.sigmoid(refine_scores.detach()).unsqueeze(-1)  # (B, T, 1)
             seq_in = seq_in * gate
 
-        lengths = self._safe_lengths_from_mask(mask)
-
-        packed = nn.utils.rnn.pack_padded_sequence(
-            seq_in,
-            lengths,
-            batch_first=True,
-            enforce_sorted=False,
-        )
-
-        packed_out, _ = self.rnn(packed)
-
-        out, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_out,
-            batch_first=True,
-            total_length=seq.size(1),
-        )  # (B, T, rnn_out_dim)
+        if block_ids is not None:
+            # Per-block GRU: reset hidden state at text-block boundaries so that
+            # characters from unrelated blocks (main text, marginal annotations,
+            # header cartouches) do not pollute each other's context vectors.
+            out = torch.zeros(
+                seq_in.size(0), seq_in.size(1),
+                self.hidden_dim * (2 if self.mode == "bigru" else 1),
+                device=seq_in.device, dtype=seq_in.dtype,
+            )
+            B = seq_in.size(0)
+            for b in range(B):
+                valid_b = mask[b]        # (T,) bool
+                bids_b  = block_ids[b]   # (T,) long; -1 = padded
+                max_bid = int(bids_b[valid_b].max().item()) if valid_b.any() else -1
+                for bid in range(max_bid + 1):
+                    pos = (bids_b == bid)   # (T,) bool — valid positions in this block
+                    n_pos = int(pos.sum().item())
+                    if n_pos == 0:
+                        continue
+                    block_seq = seq_in[b, pos].unsqueeze(0)   # (1, n_pos, D)
+                    block_len = torch.tensor([n_pos], dtype=torch.long)
+                    packed_b  = nn.utils.rnn.pack_padded_sequence(
+                        block_seq, block_len, batch_first=True, enforce_sorted=False
+                    )
+                    packed_out_b, _ = self.rnn(packed_b)     # fresh h_0=None per block
+                    block_out, _ = nn.utils.rnn.pad_packed_sequence(
+                        packed_out_b, batch_first=True, total_length=n_pos
+                    )                                         # (1, n_pos, rnn_out_dim)
+                    out[b, pos] = block_out[0]
+        else:
+            lengths = self._safe_lengths_from_mask(mask)
+            packed = nn.utils.rnn.pack_padded_sequence(
+                seq_in, lengths, batch_first=True, enforce_sorted=False,
+            )
+            packed_out, _ = self.rnn(packed)
+            out, _ = nn.utils.rnn.pad_packed_sequence(
+                packed_out, batch_first=True, total_length=seq.size(1),
+            )   # (B, T, rnn_out_dim)
 
         out = self.out_proj(out)  # (B, T, out_dim)
 

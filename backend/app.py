@@ -23,6 +23,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from dotenv import load_dotenv
+load_dotenv(ROOT / ".env")
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
@@ -47,18 +50,25 @@ def _get_translation_pipeline():
     global _translation_pipeline
     if _translation_pipeline is None:
         try:
-            from model.translation.anthropic import EdoPeriodTranslationPipeline
+            from model.translation.translation import EdoPeriodTranslationPipeline
             _translation_pipeline = EdoPeriodTranslationPipeline()
         except Exception as exc:
             raise HTTPException(503, detail=f"Translation pipeline unavailable: {exc}")
     return _translation_pipeline
 
 
-_DEFAULT_CKPT = CHECKPOINT_DIR / "stage2" / "kuronet_epoch44.pt"
+_DEFAULT_CKPT = CHECKPOINT_DIR / "kuronet_recognizer" / "kuronet_best.pt"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import os
+    if not os.environ.get("OPENROUTER_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
+        print(
+            "[WARNING] Neither OPENROUTER_API_KEY nor ANTHROPIC_API_KEY is set. "
+            "/api/translate will return 503. Copy .env.example to .env and fill in a key.",
+            flush=True,
+        )
     print("Loading vocab...", flush=True)
     try:
         vocab = load_vocab()

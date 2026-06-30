@@ -103,6 +103,56 @@ def _compute_neighbor_features(
     )  # (B, T, 6)
 
 
+def _compute_block_ids(
+    ordered_boxes: torch.Tensor,  # (B, T, 4) xyxy, sorted by reading order
+    ordered_mask: torch.Tensor,   # (B, T) bool
+    gap_factor: float = 2.5,
+) -> torch.Tensor:
+    """
+    Assign monotonically increasing block IDs per image in the batch.
+
+    Returns (B, T) LongTensor. Each valid position gets an integer ≥ 0 indicating
+    which independent text block it belongs to. Invalid (padded) positions get -1.
+
+    A block boundary is detected wherever the Euclidean distance between consecutive
+    sorted box centres exceeds gap_factor × median inter-box distance. This catches
+    transitions from main text to marginal annotations, headers, or column labels
+    without requiring explicit layout analysis.
+    """
+    B, T, _ = ordered_boxes.shape
+    block_ids = torch.full((B, T), -1, dtype=torch.long, device=ordered_boxes.device)
+
+    cx = (ordered_boxes[..., 0] + ordered_boxes[..., 2]) * 0.5  # (B, T)
+    cy = (ordered_boxes[..., 1] + ordered_boxes[..., 3]) * 0.5
+
+    for b in range(B):
+        mask_b = ordered_mask[b]   # (T,) bool
+        if not mask_b.any():
+            continue
+        valid_idx = mask_b.nonzero(as_tuple=True)[0]   # indices of valid positions
+        n = len(valid_idx)
+        if n == 1:
+            block_ids[b, valid_idx[0]] = 0
+            continue
+
+        vcx = cx[b, valid_idx]   # (N,)
+        vcy = cy[b, valid_idx]
+        dx  = vcx[1:] - vcx[:-1]
+        dy  = vcy[1:] - vcy[:-1]
+        dist = (dx * dx + dy * dy).sqrt()   # (N-1,)
+
+        med = dist.median().clamp(min=1e-6)
+        is_boundary = dist > gap_factor * med   # (N-1,) bool
+
+        bid = 0
+        for i in range(n):
+            block_ids[b, valid_idx[i]] = bid
+            if i < n - 1 and is_boundary[i]:
+                bid += 1
+
+    return block_ids
+
+
 class KuroNetRecognizer(nn.Module):
     """
     KuroNet-style character recognizer.
@@ -129,20 +179,24 @@ class KuroNetRecognizer(nn.Module):
 
         # ROI pooling
         roi_size: tuple[int, int] = (8, 8),
+        roi_pool_output_size: tuple[int, int] = (4, 4),
         roi_feat_dim: int = 384,
 
         # ROI refinement
         refine_hidden_dim: int = 256,
+        residual_scale_init: float = 0.5,
 
         # ROI token projection
         token_dim: int = 256,
         token_hidden_dim: int = 512,
         token_use_score_branch: bool = True,
 
-        # Context encoder (optional BiGRU)
+        # Context encoder (optional GRU/BiGRU)
         use_context: bool = True,
         context_hidden_dim: int = 384,
         context_num_layers: int = 2,
+        context_mode: str = "gru",
+        context_block_gap_factor: float = 2.5,
 
         # Classifier head
         classifier_hidden_dim: int = 512,
@@ -179,6 +233,7 @@ class KuroNetRecognizer(nn.Module):
 
         self.vocab_size = vocab_size
         self.use_context = bool(use_context)
+        self.context_block_gap_factor = float(context_block_gap_factor)
 
         # --- ROI pipeline (identical to HybridKuroNetRecognizer) ---
 
@@ -192,6 +247,7 @@ class KuroNetRecognizer(nn.Module):
         self.roi_pool = ROIPoolEncoder(
             in_channels=proj_dim,
             roi_size=roi_size,
+            pool_output_size=roi_pool_output_size,
             conv_channels=proj_dim,
             out_dim=roi_feat_dim,
             dropout=dropout,
@@ -203,6 +259,7 @@ class KuroNetRecognizer(nn.Module):
             feat_dim=roi_feat_dim,
             hidden_dim=refine_hidden_dim,
             dropout=dropout,
+            residual_scale=residual_scale_init,
         )
 
         self.roi_order = ROIReadingOrder(line_merge_thresh_ratio=0.6)
@@ -256,7 +313,7 @@ class KuroNetRecognizer(nn.Module):
                 out_dim=context_hidden_dim,
                 num_layers=int(context_num_layers),
                 dropout=dropout,
-                mode="bigru",
+                mode=context_mode,
                 use_layernorm=True,
                 use_residual=True,
             )
@@ -273,6 +330,16 @@ class KuroNetRecognizer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(classifier_hidden_dim, vocab_size),
         )
+
+        # --- Script-type auxiliary head ---
+        # Predicts one of 4 script classes per ROI: hiragana / katakana / kanji / other.
+        # Forces context features to encode script boundaries, directly targeting
+        # hiragana↔katakana confusions (は↔ハ, み↔ミ).
+        # Linear only — shares no parameters with the main classifier so the
+        # signal is injected at the representation level, not the output level.
+        self.script_classifier: nn.Linear = nn.Linear(classifier_in_dim, 4, bias=True)
+        nn.init.normal_(self.script_classifier.weight, std=0.01)
+        nn.init.zeros_(self.script_classifier.bias)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -338,7 +405,43 @@ class KuroNetRecognizer(nn.Module):
         # --- Feature projection ---
         proj_feats = self.feature_projector(shared_feats)
 
-        # --- ROI pooling ---
+        # --- ROI pooling + crop encoder in parallel on separate CUDA streams ---
+        # Both branches only need (coarse_boxes_list, images) which are already
+        # available. ROI pool reads proj_feats; crop encoder reads raw images.
+        # They are data-independent until the fusion step.
+        _crop_stream: Optional[torch.cuda.Stream] = None
+        _crop_feats: Optional[torch.Tensor] = None
+
+        if self.roi_crop_encoder is not None and self.crop_fusion is not None:
+            # Pre-pad proposal boxes into (B, T, 4) / roi_mask so the crop encoder
+            # can start before roi_pool finishes (roi_pool produces the same layout).
+            _t_max = max((b.size(0) for b in coarse_boxes_list), default=0)
+            _bsz   = len(coarse_boxes_list)
+            _pre_boxes = images.new_zeros((_bsz, _t_max, 4))
+            _pre_mask  = torch.zeros((_bsz, _t_max), dtype=torch.bool, device=images.device)
+            for _b, _boxes_b in enumerate(coarse_boxes_list):
+                _n = _boxes_b.size(0)
+                if _n > 0:
+                    _pre_boxes[_b, :_n] = _boxes_b.to(images.dtype)
+                    _pre_mask[_b, :_n]  = True
+
+            if torch.cuda.is_available():
+                _crop_stream = torch.cuda.Stream()
+                _crop_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(_crop_stream):
+                    _crop_feats = self.roi_crop_encoder(
+                        images=images,
+                        roi_boxes=_pre_boxes,
+                        roi_mask=_pre_mask,
+                    )
+            else:
+                # CPU: no streams needed, run sequentially
+                _crop_feats = self.roi_crop_encoder(
+                    images=images,
+                    roi_boxes=_pre_boxes,
+                    roi_mask=_pre_mask,
+                )
+
         roi_out = self.roi_pool(
             feat_2d=proj_feats,
             proposal_boxes_list=coarse_boxes_list,
@@ -346,18 +449,24 @@ class KuroNetRecognizer(nn.Module):
             image_size=image_size,
         )
 
-        # --- Pretrained crop features (EfficientNet-B0 on raw image crops) ---
-        # Concat-project fusion: [roi_feats || crop_feats] -> roi_feat_dim.
-        # Gives the network independent control over how much to trust each source.
         roi_feats_for_refine = roi_out["roi_feats"]
-        if self.roi_crop_encoder is not None and self.crop_fusion is not None:
-            crop_feats = self.roi_crop_encoder(
-                images=images,
-                roi_boxes=roi_out["roi_boxes"],
-                roi_mask=roi_out["roi_mask"],
-            )
+        if _crop_stream is not None and _crop_feats is not None:
+            # Wait for crop encoder stream before fusing (CUDA only)
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().wait_stream(_crop_stream)
+            # Align T dimension if roi_pool used a different cap (safety, rarely fires)
+            T_out = roi_out["roi_feats"].size(1)
+            T_pre = _crop_feats.size(1)
+            if T_out < T_pre:
+                _crop_feats = _crop_feats[:, :T_out, :]
+            elif T_out > T_pre:
+                _crop_feats = torch.cat(
+                    [_crop_feats,
+                     _crop_feats.new_zeros((_crop_feats.size(0), T_out - T_pre, _crop_feats.size(2)))],
+                    dim=1,
+                )
             roi_feats_for_refine = self.crop_fusion(
-                torch.cat([roi_feats_for_refine, crop_feats], dim=-1)
+                torch.cat([roi_feats_for_refine, _crop_feats], dim=-1)
             )
 
         # --- ROI refinement ---
@@ -402,7 +511,7 @@ class KuroNetRecognizer(nn.Module):
         nbr_feats = _compute_neighbor_features(ordered["boxes"], ordered["mask"])
         token_feats = token_feats + self.neighbor_proj(nbr_feats)
 
-        # --- Context encoder (optional BiGRU) ---
+        # --- Context encoder (optional GRU, per-block) ---
         if self.use_context and self.context_encoder is not None:
             # Normalized (cx, cy) from refined boxes in sorted order.
             # ordered["boxes"] is (B, T, 4) in image xyxy coordinates.
@@ -411,11 +520,19 @@ class KuroNetRecognizer(nn.Module):
             cy = (sorted_boxes[..., 1] + sorted_boxes[..., 3]) * 0.5 / float(h_img)
             spatial_coords = torch.stack([cx, cy], dim=-1)  # (B, T, 2)
 
+            # Compute block IDs so the GRU resets at text-block boundaries.
+            # Characters from unrelated blocks (main text vs. marginal annotations)
+            # should not share context — the GRU hidden state is reset per block.
+            block_ids = _compute_block_ids(
+                ordered["boxes"], ordered["mask"], self.context_block_gap_factor
+            )
+
             context_feats, context_mask = self.context_encoder(
                 seq=token_feats,
                 mask=token_mask,
                 spatial_coords=spatial_coords,
                 refine_scores=ordered["refine_scores"],
+                block_ids=block_ids,
             )
         else:
             context_feats = token_feats
@@ -445,6 +562,7 @@ class KuroNetRecognizer(nn.Module):
             "ordered_mask": ordered["mask"],
             "sort_indices": ordered["sort_indices"],
             "isolation_mask": ordered.get("isolation_mask", None),
+            "furigana_mask":  ordered.get("furigana_mask",  None),
             "ordering_diagnostics": ordered.get("ordering_diagnostics", None),
 
             # Token and context features (sorted order)
@@ -474,9 +592,10 @@ class KuroNetRecognizer(nn.Module):
             coarse_scores_list=coarse_scores_list,
         )
 
-        char_logits = self.classifier(encoded["context_feats"])  # (B, T, V)
+        char_logits   = self.classifier(encoded["context_feats"])         # (B, T, V)
+        script_logits = self.script_classifier(encoded["context_feats"])   # (B, T, 4)
 
-        return {**encoded, "char_logits": char_logits}
+        return {**encoded, "char_logits": char_logits, "script_logits": script_logits}
 
     @torch.no_grad()
     def transcribe(

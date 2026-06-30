@@ -39,7 +39,6 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     token_hidden_dim = trial.suggest_categorical("token_hidden_dim", [256, 384, 512])
     context_hidden_dim = trial.suggest_categorical("context_hidden_dim", [256, 384, 512])
     context_num_layers = trial.suggest_categorical("context_num_layers", [1, 2])
-    phase_a_tf_end = trial.suggest_float("phase_a_tf_end", 0.90, 1.00)
 
     model_overrides = {
         "det_score_thresh": det_score_thresh,
@@ -50,9 +49,6 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
         "context_hidden_dim": context_hidden_dim,
         "context_num_layers": context_num_layers,
     }
-
-    # Make A TF-end searchable without changing config.py.
-    train_stage2_warmup.STAGE2_PHASE_A_TF_END = float(phase_a_tf_end)
 
     trial_ckpt_dir = Path(args.output_dir) / f"trial_{trial.number}"
     trial_ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -134,6 +130,9 @@ def main() -> None:
 
     if not args.storage:
         args.storage = f"sqlite:///{(out_dir / 'optuna_stage2_a.db').as_posix()}"
+
+    if args.storage.startswith("sqlite:///"):
+        Path(args.storage[len("sqlite:///"):]).parent.mkdir(parents=True, exist_ok=True)
 
     if args.val_max_batches <= 0:
         args.val_max_batches = None

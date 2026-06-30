@@ -60,6 +60,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+import numpy as np
 import torch
 
 
@@ -154,6 +155,40 @@ def greedy_match_iou(
     )
 
 
+def hungarian_match_iou(
+    iou_mat: torch.Tensor,   # (N, M)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Optimal one-to-one assignment via Hungarian algorithm.
+
+    Each GT box is matched to at most one proposal. Surplus proposals (N > M)
+    fall back to their argmax GT for threshold classification — they will
+    typically score below pos_iou_thresh and become negatives.
+
+    Returns:
+        best_gt:   (N,) long — GT index each proposal is matched to
+        max_iou:   (N,) float — IoU of the match
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    # Start with argmax fallback for every proposal
+    max_iou_fallback, best_gt_fallback = iou_mat.max(dim=1)
+    best_gt = best_gt_fallback.clone()
+    max_iou = max_iou_fallback.clone()
+
+    # Optimal assignment on CPU numpy
+    cost = -iou_mat.cpu().numpy()
+    row_ind, col_ind = linear_sum_assignment(cost)
+
+    row_t = torch.tensor(row_ind, dtype=torch.long, device=iou_mat.device)
+    col_t = torch.tensor(col_ind, dtype=torch.long, device=iou_mat.device)
+
+    best_gt[row_t] = col_t
+    max_iou[row_t] = iou_mat[row_t, col_t]
+
+    return best_gt, max_iou
+
+
 def boxes_to_deltas(
     src_boxes: torch.Tensor,   # (N, 4) coarse boxes
     tgt_boxes: torch.Tensor,   # (N, 4) GT boxes
@@ -200,6 +235,7 @@ def build_refinement_targets(
     pos_iou_thresh: float = 0.5,
     neg_iou_thresh: float = 0.2,
     ignore_label_ids: Optional[List[int]] = None,
+    use_hungarian: bool = True,
 ) -> dict:
     """
     Build supervision targets for ROI refinement stage.
@@ -266,12 +302,14 @@ def build_refinement_targets(
             refine_neg_mask[b, :valid_t] = True
             continue
 
-        # Vectorized max-IoU assignment (Faster R-CNN style).
-        # Each proposal independently picks its best-matching GT — no one-to-one constraint.
-        # For Kuzushiji (non-overlapping characters, ~300 props / ~236 GT), this gives
-        # the same training signal as greedy matching at a fraction of the CPU cost.
-        iou_mat           = box_iou(boxes_b, gt_boxes_b)   # (valid_t, M)
-        max_iou, best_gt  = iou_mat.max(dim=1)             # (valid_t,)
+        iou_mat = box_iou(boxes_b, gt_boxes_b)   # (valid_t, M)
+        if use_hungarian:
+            # One-to-one: each GT matched to at most one proposal.
+            # Surplus proposals fall back to argmax (typically become negatives).
+            best_gt, max_iou = hungarian_match_iou(iou_mat)
+        else:
+            # Many-to-one: each proposal independently picks its best GT.
+            max_iou, best_gt = iou_mat.max(dim=1)
 
         best_gt_boxes = gt_boxes_b[best_gt]                # (valid_t, 4)
         matched_gt_boxes[b, :valid_t]  = best_gt_boxes

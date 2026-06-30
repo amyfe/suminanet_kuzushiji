@@ -14,9 +14,18 @@ class DetectorHead(nn.Module):
         self.predict_boxes = predict_boxes
         self.predict_classes = predict_classes
 
-        # 3-layer shared head: larger RF and richer features for thin/small characters
+        # 5-layer shared head: RF=11×11 at stride 2 → ~22px in image space,
+        # covers full character body for shape discrimination
         self.shared = nn.Sequential(
             nn.Conv2d(in_ch, extra_channels, kernel_size=3, padding=1),
+            make_gn(extra_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_rate),
+            nn.Conv2d(extra_channels, extra_channels, kernel_size=3, padding=1),
+            make_gn(extra_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_rate),
+            nn.Conv2d(extra_channels, extra_channels, kernel_size=3, padding=1),
             make_gn(extra_channels),
             nn.ReLU(inplace=True),
             nn.Dropout2d(dropout_rate),

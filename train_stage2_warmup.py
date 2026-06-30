@@ -47,6 +47,7 @@ from config import (
     STAGE2_REFINE_POS_IOU,
     STAGE2_REFINE_NEG_IOU,
     STAGE2_REFINE_POS_WEIGHT,
+    STAGE2_USE_HUNGARIAN,
     VALIDATION_BATCHES,
     STAGE2_DEBUG_BATCH_STATS,
     STAGE2_DEBUG_AUX_ALIGNMENT,
@@ -526,6 +527,7 @@ def validate_stage2(
             gt_labels_list=gt_labels_list,
             pos_iou_thresh=STAGE2_REFINE_POS_IOU,
             neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
+            use_hungarian=STAGE2_USE_HUNGARIAN,
         )
 
         if STAGE2_DEBUG_BATCH_STATS:

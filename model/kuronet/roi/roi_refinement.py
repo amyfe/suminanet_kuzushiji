@@ -65,9 +65,13 @@ Split/Merge wäre der nächste Forschungs-Schritt, nicht der erste.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from config import KURONET_DELTA_SCALE_XY, KURONET_DELTA_SCALE_WH
 
 
 class ROIRefinementHead(nn.Module):
@@ -103,8 +107,16 @@ class ROIRefinementHead(nn.Module):
             raise ValueError("If predict_aux_logits=True, vocab_size must be a positive integer.")
         
         self.predict_aux_logits = predict_aux_logits
-        self.residual_scale = float(residual_scale)
         self.vocab_size = vocab_size
+
+        # Learnable residual scale: sigmoid-constrained to (0, 1).
+        # Initialised to logit(residual_scale) so sigmoid gives back the requested value.
+        # sigmoid(0) = 0.5 by default — same as the old hardcoded constant.
+        # The network can push this toward 1.0 as the refinement head matures,
+        # or keep it low early in training when deltas are noisy.
+        # Checkpoint-safe: missing key loads cleanly with strict=False (initialised correctly).
+        _logit_init = math.log(residual_scale / (1.0 - residual_scale + 1e-6) + 1e-6)
+        self._res_scale_logit = nn.Parameter(torch.tensor(_logit_init))
 
         # geometry: cx, cy, bw, bh (normalized)
         self.geom_proj = nn.Sequential(
@@ -267,13 +279,15 @@ class ROIRefinementHead(nn.Module):
 
         fused_in = torch.cat([roi_feats, geom_feat, score_feat], dim=-1)    # (B, T, D+H+H)
         refined_delta = self.fuse(fused_in)
-        refined_feats = roi_feats + self.residual_scale * refined_delta                          # (B, T, D)
+        refined_feats = roi_feats + torch.sigmoid(self._res_scale_logit) * refined_delta  # (B, T, D)
 
         box_deltas = self.box_delta_head(refined_feats)                     # (B, T, 4)
         refined_boxes = self._apply_box_deltas(
             boxes=roi_boxes,
             deltas=box_deltas,
             image_size=image_size,
+            delta_scale_xy=KURONET_DELTA_SCALE_XY,
+            delta_scale_wh=KURONET_DELTA_SCALE_WH,
         )                                                                   # (B, T, 4)
 
         refine_scores = self.refine_score_head(refined_feats).squeeze(-1)   # (B, T)

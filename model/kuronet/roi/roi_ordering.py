@@ -56,6 +56,8 @@ from typing import List
 
 import torch
 
+from config import STAGE2_READING_ORDER_LINE_THRESH_RATIO
+
 
 def infer_reading_orientation_from_boxes(boxes, debug: bool = False) -> str:
     """Infer reading direction from nearest-neighbor center distances."""
@@ -113,7 +115,7 @@ class ROIReadingOrder:
     This is a heuristic ordering module, not a learned layout model.
     """
 
-    def __init__(self, line_merge_thresh_ratio: float = 0.6):
+    def __init__(self, line_merge_thresh_ratio: float = STAGE2_READING_ORDER_LINE_THRESH_RATIO):
         """
         Args:
             line_merge_thresh_ratio:
@@ -165,12 +167,60 @@ class ROIReadingOrder:
         k = max(1, min(n, int(p * n + 0.5)))
         return float(sizes.kthvalue(k).values.item())
 
+    def _snap_small_to_columns(
+        self,
+        x_center: torch.Tensor,    # (n,)
+        col_ids_orig: torch.Tensor, # (n,) long — column assignment for all chars
+        is_main: torch.Tensor,     # (n,) bool — True = main-text char
+        num_cols: int,
+    ) -> torch.Tensor:
+        """
+        Reassign small/furigana characters to the nearest main-text column.
+
+        Uses the mean x-center of main-text chars per column as the column anchor.
+        Small chars that landed in a single-char isolated column get snapped to the
+        nearest main-text column so they no longer create spurious column boundaries.
+
+        Returns updated col_ids_orig (same shape, only small-char entries changed).
+        """
+        if not is_main.any() or is_main.all():
+            return col_ids_orig
+
+        # Per-column mean x-center from main-text chars only
+        main_pos = is_main.nonzero(as_tuple=True)[0]
+        main_col = col_ids_orig[main_pos]
+        main_xc  = x_center[main_pos]
+
+        col_sum   = x_center.new_zeros(num_cols)
+        col_count = torch.zeros(num_cols, dtype=torch.long, device=x_center.device)
+        col_sum.scatter_add_(0, main_col, main_xc)
+        col_count.scatter_add_(0, main_col, torch.ones_like(main_col))
+
+        valid_col = col_count > 0
+        col_mean_xc = col_sum.clone()
+        col_mean_xc[valid_col] = (
+            col_sum[valid_col] / col_count[valid_col].to(x_center.dtype)
+        )
+        # Mark columns with no main-text chars as infinitely far
+        col_mean_xc[~valid_col] = float("inf")
+
+        # Reassign small chars to nearest main-text column by x-distance
+        small_pos = (~is_main).nonzero(as_tuple=True)[0]
+        furi_xc   = x_center[small_pos].unsqueeze(1)   # (N_small, 1)
+        col_xc    = col_mean_xc.unsqueeze(0)            # (1, num_cols)
+        nearest   = (furi_xc - col_xc).abs().argmin(dim=1)  # (N_small,)
+
+        col_ids_out = col_ids_orig.clone()
+        col_ids_out[small_pos] = nearest
+        return col_ids_out
+
     def _horizontal_sort_indices(self, boxes: torch.Tensor) -> torch.Tensor:
         """
         Horizontal reading order: rows top-to-bottom, within each row left-to-right.
 
-        Uses a compound sort key (row_rank * scale + x_left) instead of a Python
-        for-loop, eliminating GPU–CPU sync points from repeated .tolist() calls.
+        Gap threshold is derived from main-text character heights only so that small
+        ruby/furigana characters above main text don't create spurious extra rows.
+        Small characters are snapped to the nearest main-text row after row detection.
         """
         if boxes.numel() == 0:
             return torch.zeros((0,), dtype=torch.long, device=boxes.device)
@@ -178,7 +228,14 @@ class ROIReadingOrder:
         y_center = (boxes[:, 1] + boxes[:, 3]) * 0.5
         heights  = (boxes[:, 3] - boxes[:, 1]).clamp_min(1.0)
 
-        h75        = self._percentile_size(heights, 0.75)
+        # Separate main-text chars from small (ruby/furigana) chars
+        h_median = heights.median()
+        is_main  = heights >= (0.5 * h_median)
+
+        if is_main.sum() >= 3:
+            h75 = self._percentile_size(heights[is_main], 0.75)
+        else:
+            h75 = self._percentile_size(heights, 0.75)
         gap_thresh = 1.5 * h75
 
         sorted_yc, sorted_idx = y_center.sort(descending=False)
@@ -194,12 +251,19 @@ class ROIReadingOrder:
 
         row_ids = is_break.long().cumsum(0) - 1   # (n,) in sorted order
 
-        # Map row IDs back to original box indices (scatter reverse of sort)
         row_ids_orig = torch.zeros(boxes.size(0), dtype=torch.long, device=boxes.device)
         row_ids_orig.scatter_(0, sorted_idx, row_ids)
+        num_rows = int(row_ids_orig.max().item()) + 1
+
+        # Snap small/ruby chars to the nearest main-text row
+        row_ids_orig = self._snap_small_to_columns(
+            x_center=y_center,
+            col_ids_orig=row_ids_orig,
+            is_main=is_main,
+            num_cols=num_rows,
+        )
 
         # Compound key: row_rank * scale + x_left
-        # Row rank is row_ids_orig (top row = 0), scale > max(x_right) so row dominates.
         scale    = float(boxes[:, 2].max().item()) + 1.0
         sort_key = row_ids_orig.to(boxes.dtype) * scale + boxes[:, 0]
 
@@ -209,9 +273,11 @@ class ROIReadingOrder:
         """
         Vertical reading order: columns right-to-left (Edo), within each column top-to-bottom.
 
-        Uses a compound sort key (col_rank * scale + y_top) instead of a Python
-        for-loop, eliminating GPU–CPU sync points from repeated .tolist() calls.
-        col_rank = (num_cols - 1 - col_id) so the rightmost column gets rank 0.
+        Gap threshold is derived from main-text character widths only so that narrow
+        furigana columns don't cause adjacent main-text columns to merge (the root
+        cause of the ~38% ordering-violation rate in dense Kuzushiji pages).
+        Furigana/small chars are snapped to the nearest main-text column after
+        column detection, preventing them from creating spurious isolated columns.
         """
         if boxes.numel() == 0:
             return torch.zeros((0,), dtype=torch.long, device=boxes.device)
@@ -219,7 +285,15 @@ class ROIReadingOrder:
         x_center = (boxes[:, 0] + boxes[:, 2]) * 0.5
         widths   = (boxes[:, 2] - boxes[:, 0]).clamp_min(1.0)
 
-        w75        = self._percentile_size(widths, 0.75)
+        # Separate main-text chars from small (furigana) chars.
+        # Chars narrower than 50% of the median width are treated as furigana/ruby.
+        w_median = widths.median()
+        is_main  = widths >= (0.5 * w_median)
+
+        if is_main.sum() >= 3:
+            w75 = self._percentile_size(widths[is_main], 0.75)
+        else:
+            w75 = self._percentile_size(widths, 0.75)
         gap_thresh = 1.5 * w75
 
         sorted_xc, sorted_idx = x_center.sort(descending=False)   # left → right
@@ -236,13 +310,20 @@ class ROIReadingOrder:
         col_ids  = is_break.long().cumsum(0) - 1   # (n,) in sorted order
         num_cols = int(col_ids.max().item()) + 1
 
-        # Map col IDs back to original box indices (scatter reverse of sort)
         col_ids_orig = torch.zeros(boxes.size(0), dtype=torch.long, device=boxes.device)
         col_ids_orig.scatter_(0, sorted_idx, col_ids)
 
+        # Snap furigana/small chars to the nearest main-text column center.
+        # Without this, a furigana column between two main columns creates an
+        # extra col_id that gets interleaved, producing x-center violations.
+        col_ids_orig = self._snap_small_to_columns(
+            x_center=x_center,
+            col_ids_orig=col_ids_orig,
+            is_main=is_main,
+            num_cols=num_cols,
+        )
+
         # Compound key: col_rank * scale + y_top
-        # col_rank reverses col order so rightmost column (highest col_id) gets rank 0.
-        # scale > max(y_bottom) guarantees column rank dominates over y_top.
         col_rank = (num_cols - 1 - col_ids_orig).to(boxes.dtype)
         scale    = float(boxes[:, 3].max().item()) + 1.0
         sort_key = col_rank * scale + boxes[:, 1]
@@ -256,21 +337,20 @@ class ROIReadingOrder:
         min_col_size: int = 3,
         size_ratio: float = 3.0,
         furi_ratio: float = 2.5,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Mark boxes that are likely illustration false-positives or furigana sub-columns.
+        Returns two boolean masks (isolated, furigana) for valid sorted boxes.
 
-        A box is isolated (True) when:
-          - its column/row has fewer than min_col_size members, OR
-          - its area exceeds size_ratio × the column median area (illustration/oversized), OR
-          - it belongs to a group whose median area is furi_ratio× smaller than an adjacent
-            group and the two groups are close (gap < 3 × gap_thresh) — furigana sub-columns.
-
-        Uses the same gap-based grouping as the sort methods.
+        isolated: small group (< min_col_size) OR oversized (area > size_ratio × median).
+                  These are likely illustration FPs — get strong BG supervision.
+        furigana: sub-columns whose median area is furi_ratio× smaller than an adjacent
+                  close group.  These are likely real kana gloss characters — no BG
+                  supervision so the classifier can learn them as real characters.
         """
         n = boxes.size(0)
         if n == 0:
-            return torch.zeros((0,), dtype=torch.bool, device=boxes.device)
+            empty = torch.zeros((0,), dtype=torch.bool, device=boxes.device)
+            return empty, empty.clone()
 
         areas = ((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])).clamp_min(1.0)
 
@@ -326,7 +406,10 @@ class ROIReadingOrder:
 
         # --- Second pass: furigana-like sub-column detection ---
         # For adjacent group pairs (g, g+1): if they are close and one group's median
-        # area is furi_ratio× smaller, that group is furigana → mark it isolated.
+        # area is furi_ratio× smaller, that group is furigana.
+        # Returned as a *separate* mask — furigana is likely real kana and should
+        # not receive BG supervision.
+        furigana = torch.zeros(n, dtype=torch.bool, device=boxes.device)
         if num_groups > 1:
             gaps_g = group_centers_t[1:] - group_centers_t[:-1]           # (G-1,)
             close  = gaps_g < 3.0 * gap_thresh                             # (G-1,)
@@ -335,13 +418,13 @@ class ROIReadingOrder:
             # ratio = area(g+1)/area(g):
             #   ratio > furi_ratio  → g+1 much bigger → g is the furigana (flag g)
             #   ratio < 1/furi_ratio → g much bigger  → g+1 is the furigana (flag g+1)
-            furi_isolated = torch.zeros(num_groups, dtype=torch.bool, device=boxes.device)
-            furi_isolated[:num_groups - 1].logical_or_(close & (ratios > furi_ratio))
-            furi_isolated[1:].logical_or_(close & (ratios < (1.0 / furi_ratio)))
+            furi_groups = torch.zeros(num_groups, dtype=torch.bool, device=boxes.device)
+            furi_groups[:num_groups - 1].logical_or_(close & (ratios > furi_ratio))
+            furi_groups[1:].logical_or_(close & (ratios < (1.0 / furi_ratio)))
 
-            isolated = isolated | furi_isolated[group_ids]
+            furigana = furi_groups[group_ids]
 
-        return isolated
+        return isolated, furigana
 
     def sort_single(
         self,
@@ -427,6 +510,7 @@ class ROIReadingOrder:
         sorted_mask = torch.zeros_like(mask)
         sort_indices = torch.zeros((bsz, t_max), device=boxes.device, dtype=torch.long)
         isolation_masks = torch.zeros((bsz, t_max), dtype=torch.bool, device=boxes.device)
+        furigana_masks  = torch.zeros((bsz, t_max), dtype=torch.bool, device=boxes.device)
         ordering_primary_mono = torch.ones((bsz,), device=boxes.device, dtype=boxes.dtype)
         ordering_primary_viol = torch.zeros((bsz,), device=boxes.device, dtype=boxes.dtype)
         ordering_valid_counts = mask.to(dtype=torch.long).sum(dim=1)
@@ -457,8 +541,9 @@ class ROIReadingOrder:
                 ordering_primary_mono[b] = mono
                 ordering_primary_viol[b] = viol
 
-                iso = self._compute_isolation_mask(sorted_boxes[b, :valid_t], orientations[b])
+                iso, furi = self._compute_isolation_mask(sorted_boxes[b, :valid_t], orientations[b])
                 isolation_masks[b, :valid_t] = iso
+                furigana_masks[b, :valid_t]  = furi
 
             offset = 2
             for i, name in enumerate(named_tensors.keys()):
@@ -471,6 +556,7 @@ class ROIReadingOrder:
             "mask": sorted_mask,
             "sort_indices": sort_indices,
             "isolation_mask": isolation_masks,
+            "furigana_mask":  furigana_masks,
             "ordering_diagnostics": {
                 "primary_monotonic_fraction": ordering_primary_mono,
                 "primary_violation_fraction": ordering_primary_viol,
