@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 from torchvision.ops import roi_align as tv_roi_align
 
 
@@ -39,6 +40,14 @@ class ROICropEncoder(nn.Module):
         crop_size:      spatial size fed into EfficientNet (height, width)
         freeze_encoder: if True, EfficientNet weights are not updated during training
         pretrained:     if True, load ImageNet weights via timm
+        chunk_size:     max crops per encoder forward call. A dense page can
+                        produce 1000+ ROIs per batch; running them all through
+                        EfficientNet at once (with gradients, while unfrozen)
+                        can exceed GPU memory. Chunking bounds peak memory
+                        independent of how many ROIs a batch contains, at the
+                        cost of BatchNorm statistics being computed per-chunk
+                        rather than over all crops (training mode only —
+                        eval-mode BN uses running stats, unaffected).
     """
 
     # EfficientNet-B0 last-stage channel count (after MBConv stage 7)
@@ -50,6 +59,7 @@ class ROICropEncoder(nn.Module):
         crop_size: Tuple[int, int] = (48, 48),
         freeze_encoder: bool = True,
         pretrained: bool = True,
+        chunk_size: int = 256,
     ):
         super().__init__()
 
@@ -62,6 +72,7 @@ class ROICropEncoder(nn.Module):
 
         self.crop_size = crop_size
         self.freeze_encoder = bool(freeze_encoder)
+        self.chunk_size = int(chunk_size)
 
         # EfficientNet-B0 as a feature extractor — strip classifier head
         self.encoder = timm.create_model(
@@ -140,6 +151,44 @@ class ROICropEncoder(nn.Module):
             self.encoder.eval()
         return self
 
+    def _encode_in_chunks(self, crops_norm: torch.Tensor) -> torch.Tensor:
+        """Run crops_norm through self.encoder in chunks of self.chunk_size.
+
+        When frozen (no_grad), plain looping already bounds peak memory to
+        O(chunk_size): nothing is retained for backward, so each chunk's
+        activations are freed as soon as that chunk finishes.
+
+        When trainable, plain looping does NOT help — every chunk's full
+        activation graph would still need to stay alive simultaneously for
+        the eventual single backward() call, so total memory would be no
+        better than running all N_valid crops through in one shot. Instead,
+        wrap each chunk in torch.utils.checkpoint: only the chunk's input/
+        output are kept, and its internal activations are recomputed
+        on-the-fly during backward, trading compute for the memory bound.
+        """
+        n_valid = crops_norm.size(0)
+
+        if self.freeze_encoder:
+            with torch.no_grad():
+                if n_valid <= self.chunk_size:
+                    return self.encoder(crops_norm)
+                return torch.cat(
+                    [
+                        self.encoder(crops_norm[start:start + self.chunk_size])
+                        for start in range(0, n_valid, self.chunk_size)
+                    ],
+                    dim=0,
+                )
+
+        if n_valid <= self.chunk_size:
+            return self.encoder(crops_norm)
+
+        chunks = [
+            checkpoint.checkpoint(self.encoder, crops_norm[start:start + self.chunk_size], use_reentrant=False)
+            for start in range(0, n_valid, self.chunk_size)
+        ]
+        return torch.cat(chunks, dim=0)
+
     def forward(
         self,
         images: torch.Tensor,    # (B, 3, H, W)
@@ -170,11 +219,7 @@ class ROICropEncoder(nn.Module):
         # RoIAlign on normalized images produces normalized crops — pass directly.
         crops_norm = crops
 
-        if self.freeze_encoder:
-            with torch.no_grad():
-                enc_feats = self.encoder(crops_norm)  # (N_valid, 1280)
-        else:
-            enc_feats = self.encoder(crops_norm)
+        enc_feats = self._encode_in_chunks(crops_norm)  # (N_valid, 1280)
 
         proj_feats = self.out_proj(enc_feats)  # (N_valid, out_dim)
 

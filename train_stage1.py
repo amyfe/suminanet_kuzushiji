@@ -5,6 +5,7 @@ import sys
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from functools import partial
 from pathlib import Path
 from tqdm import tqdm
 
@@ -23,6 +24,8 @@ from model.kuronet import DetectorHead, build_backbone
 from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
+from utils.sam2.preprocess_sam2_illustrations import run_preprocessing
+
 def _atomic_save(obj, path):
     """Write checkpoint atomically: save to .tmp then rename, so crashes never leave a corrupt file."""
     tmp = Path(str(path) + ".tmp")
@@ -31,7 +34,9 @@ def _atomic_save(obj, path):
 
 
 from utils.training_helpers.helper_stage1 import (
+    check_backbone_type,
     collate_fn,
+    data_info_startup,
     masked_bbox_smoothl1_loss,
     masked_bbox_diou_loss,
     prune_to_keep_last_n,
@@ -58,7 +63,6 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     # SAM2 illustration masking: build (or verify) the cache before loading data.
     # On first run this takes several minutes; subsequent runs exit in <1 s.
     if SAM2_PREPROCESSING:
-        from preprocess_sam2_illustrations import run_preprocessing
         run_preprocessing(splits=["train", "val"] if val_split is None else ["train"])
 
     # Build or load vocab
@@ -95,27 +99,15 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         )
     
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
-                            collate_fn=lambda b: collate_fn(b, pad_id), pin_memory=True,
+                            collate_fn=partial(collate_fn, pad_id=pad_id), pin_memory=True,
                             prefetch_factor=2, persistent_workers=NUM_WORKERS > 0)
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
-                            collate_fn=lambda b: collate_fn(b, pad_id), pin_memory=True,
+                            collate_fn=partial(collate_fn, pad_id=pad_id), pin_memory=True,
                             prefetch_factor=2, persistent_workers=NUM_WORKERS > 0)
     
-    # When resuming, honour the backbone type that was used when the checkpoint was saved.
-    # Checkpoints store 'backbone_type'; if it differs from config, build accordingly.
     effective_backbone_type = BACKBONE_TYPE
-    if resume_ckpt is not None:
-        _peek = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
-        ckpt_backbone_type = _peek.get("backbone_type", None)
-        if ckpt_backbone_type is not None and ckpt_backbone_type != BACKBONE_TYPE:
-            print(
-                f"⚠  Checkpoint backbone_type='{ckpt_backbone_type}' differs from "
-                f"config BACKBONE_TYPE='{BACKBONE_TYPE}'. "
-                f"Building '{ckpt_backbone_type}' to match the checkpoint."
-            )
-            effective_backbone_type = ckpt_backbone_type
-        del _peek
-
+    if not check_backbone_type(resume_ckpt, effective_backbone_type):
+        raise ValueError("Backbone type mismatch between checkpoint and current configuration. Please adjust BACKBONE_TYPE in config.py to match the checkpoint or use a different checkpoint.")
     # Build model
     backbone = build_backbone(effective_backbone_type, BACKBONE_BASE_FEATURES).to(DEVICE)
     detector = DetectorHead(in_ch=BACKBONE_BASE_FEATURES, num_classes=vocab.vocab_size, dropout_rate=STAGE1_DROPOUT_RATE, predict_classes=False).to(DEVICE)  # Disable class head to save memory
@@ -127,7 +119,6 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     )
     
     # 2-epoch linear warmup then cosine annealing.
-    # SequentialLR state_dict includes sub-scheduler states, so resume works correctly.
     _warmup = optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=2
     )
@@ -165,7 +156,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
 
     print(f"Stage 1: Training DetectorHead for {num_epochs} epochs (early stopping patience={patience})...")
     print(f"Training set: {len(train_dataset)} images | Validation set: {len(val_dataset)} images")
-    bbox_radius = 1
+    bbox_radius = 2
     for epoch in range(start_epoch, num_epochs):
         # Training
         backbone.train()
@@ -190,8 +181,8 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                 features = backbone(images)  # (B, 32, H/8, W/8)
                 outputs = detector(features)  # Returns dict with 'heatmap' (raw logits), 'bbox', etc.
 
-                B, _, Hf, Wf = features.shape
-                gt_heat, gt_bbox, gt_bbox_mask, gt_cls = build_detection_targets(
+                _, _, Hf, Wf = features.shape
+                gt_heat, gt_bbox, gt_bbox_mask, _ = build_detection_targets(
                     boxes,
                     labels,
                     output_size=(Hf, Wf),
@@ -264,34 +255,8 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
             })
             
             if epoch == 0 and step == 0:
-                print("\n[TRAIN DEBUG]")
-                print("images.shape:", tuple(images.shape))
-                print("features.shape:", tuple(features.shape))
-                print("output_size:", (Hf, Wf))
-                print("image_size:", tuple(images.shape[-2:]))
-                print("gt_heat min/max/mean:",
-                    gt_heat.min().item(),
-                    gt_heat.max().item(),
-                    gt_heat.mean().item())
-                print("num bbox supervised cells:", int(gt_bbox_mask.sum().item()))
-
-                if gt_bbox_mask.sum() > 0:
-                    gt_bbox_pos = gt_bbox.permute(0, 2, 3, 1)[gt_bbox_mask]
-                    pred_bbox_pos = outputs["bbox"].permute(0, 2, 3, 1)[gt_bbox_mask]
-
-                    print("gt_bbox mean [dx,dy,bw,bh]:",
-                        gt_bbox_pos.mean(dim=0).detach().cpu().tolist())
-                    print("gt_bbox min  [dx,dy,bw,bh]:",
-                        gt_bbox_pos.min(dim=0).values.detach().cpu().tolist())
-                    print("gt_bbox max  [dx,dy,bw,bh]:",
-                        gt_bbox_pos.max(dim=0).values.detach().cpu().tolist())
-
-                    print("pred_bbox mean [dx,dy,bw,bh]:",
-                        pred_bbox_pos.mean(dim=0).detach().cpu().tolist())
-                    print("pred_bbox min  [dx,dy,bw,bh]:",
-                        pred_bbox_pos.min(dim=0).values.detach().cpu().tolist())
-                    print("pred_bbox max  [dx,dy,bw,bh]:",
-                        pred_bbox_pos.max(dim=0).values.detach().cpu().tolist())
+                # Print data info for debugging on first batch of first epoch
+                data_info_startup(images, features, outputs, gt_heat, gt_bbox, gt_bbox_mask, Hf, Wf)
 
         
         if n_batches > 0 and (n_batches % GRADIENT_ACCUMULATION_STEPS) != 0:

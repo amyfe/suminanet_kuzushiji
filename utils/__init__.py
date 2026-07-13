@@ -252,7 +252,7 @@ class KuzushijiDataset(Dataset):
                     boxes=boxes,
                     labels=labels,
                     crop_db=self.copy_paste_db,
-                    rare_chars=self.rare_chars,
+                    rare_chars=self.rare_chars if self.rare_chars is not None else frozenset(),
                     n_paste=2,
                 )
                 image = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))

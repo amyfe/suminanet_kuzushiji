@@ -20,6 +20,7 @@ import logging
 import sys
 import time
 from collections import Counter
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -63,13 +64,14 @@ from config import (
     KURONET_LR_ETA_MIN,
     KURONET_PREDICTION_SAMPLES,
     KURONET_PROGRESS_POSTFIX_N,
-    KURONET_ROI_SIZE,
+    STAGE2_ROI_SIZE,
     KURONET_ROI_POOL_OUTPUT_SIZE,
     KURONET_RESIDUAL_SCALE_INIT,
     KURONET_USE_CONTEXT,
     KURONET_CONTEXT_BLOCK_GAP_FACTOR,
     KURONET_USE_CROP_ENCODER,
     KURONET_CROP_ENCODER_SIZE,
+    KURONET_CROP_ENCODER_CHUNK_SIZE,
     KURONET_FREEZE_CROP_ENCODER,
     KURONET_FREEZE_CROP_ENCODER_AFTER,
     KURONET_VALIDATION_BATCHES,
@@ -197,7 +199,7 @@ def build_dataloaders(vocab: VocabManager):
         batch_size=BATCH_SIZE,
         sampler=sampler,         # replaces shuffle=True
         num_workers=NUM_WORKERS,
-        collate_fn=lambda b: collate_fn(b, pad_id),
+        collate_fn=partial(collate_fn, pad_id=pad_id),
         pin_memory=True,
         prefetch_factor=4,
         persistent_workers=NUM_WORKERS > 0,
@@ -207,7 +209,7 @@ def build_dataloaders(vocab: VocabManager):
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
-        collate_fn=lambda b: collate_fn(b, pad_id),
+        collate_fn=partial(collate_fn, pad_id=pad_id),
         pin_memory=True,
         prefetch_factor=4,
         persistent_workers=NUM_WORKERS > 0,
@@ -261,7 +263,7 @@ def build_kuronet_model(
         vocab_size=vocab_size,
 
         proj_dim=STAGE2_PROJ_DIM,
-        roi_size=KURONET_ROI_SIZE,
+        roi_size=STAGE2_ROI_SIZE,
         roi_pool_output_size=KURONET_ROI_POOL_OUTPUT_SIZE,
         roi_feat_dim=STAGE2_ROI_FEAT_DIM,
         refine_hidden_dim=STAGE2_REFINE_HIDDEN_DIM,
@@ -289,6 +291,7 @@ def build_kuronet_model(
         use_crop_encoder=KURONET_USE_CROP_ENCODER,
         crop_encoder_size=KURONET_CROP_ENCODER_SIZE,
         freeze_crop_encoder=KURONET_FREEZE_CROP_ENCODER,
+        crop_encoder_chunk_size=KURONET_CROP_ENCODER_CHUNK_SIZE,
     ).to(DEVICE)
 
     if FREEZE_BACKBONE:
@@ -669,7 +672,7 @@ def _compute_assembled_cer(
     ordered_mask  = outputs["ordered_mask"]   # (B, T) sorted order
     refine_scores = outputs.get("refine_scores")   # (B, T) original order
     sort_indices  = outputs.get("sort_indices")    # (B, T)
-    bsz = char_logits.size(0)
+    bsz = char_logits.size(0) if char_logits.size(0) > 0 else 1
 
     total_cer = 0.0
     count = 0
@@ -716,6 +719,7 @@ def validate_kuronet(
     max_batches: Optional[int] = None,
     vocab_weights: Optional[torch.Tensor] = None,
     sam2_dir: Optional[Path] = None,
+    return_detailed: bool = False,
 ) -> dict:
     """
     Validation loop for KuroNetRecognizer.
@@ -745,6 +749,10 @@ def validate_kuronet(
     error_counter: Counter = Counter()
     pred_counter: Counter = Counter()
     gt_total_counter: Counter = Counter()
+
+    # Detailed analysis accumulators (only used when return_detailed=True)
+    per_image_cer_list: list[float] = []
+    topk_in_gt_list: list[list[bool]] = []
 
     # Per-script accuracy (main classifier evaluated on GT-matched ROIs)
     # Keys: "hiragana", "katakana", "kanji", "other"
@@ -831,8 +839,32 @@ def validate_kuronet(
             cer_sum  += _compute_assembled_cer(outputs, gt_labels_s, pos_mask_s, vocab,
                                               score_thresh=KURONET_CER_SCORE_THRESH)
 
-            # Coverage: proportion of GT chars matched by a positive ROI
             bsz = images.size(0)
+
+            # Per-image CER (detailed mode only) — mirrors _compute_assembled_cer logic
+            if return_detailed:
+                _cl   = outputs["char_logits"]
+                _om   = outputs["ordered_mask"]
+                _rs   = outputs.get("refine_scores")
+                _si   = outputs.get("sort_indices")
+                for b in range(bsz):
+                    _valid_b = pos_mask_s[b] & gt_labels_s[b].ne(-1)
+                    _gt_text = _ids_to_text(gt_labels_s[b][_valid_b].tolist(), vocab)
+                    if not _gt_text:
+                        continue
+                    if KURONET_CER_SCORE_THRESH > 0.0 and _rs is not None and _si is not None:
+                        _sorted_pos = _om[b].nonzero(as_tuple=True)[0]
+                        _orig_pos   = _si[b][_sorted_pos]
+                        _scores     = torch.sigmoid(_rs[b][_orig_pos])
+                        _sorted_pos = _sorted_pos[_scores >= KURONET_CER_SCORE_THRESH]
+                    else:
+                        _sorted_pos = _om[b].nonzero(as_tuple=True)[0]
+                    _pred_text = _ids_to_text(_cl[b, _sorted_pos].argmax(dim=-1).tolist(), vocab)
+                    per_image_cer_list.append(
+                        _edit_distance(_pred_text, _gt_text) / max(1, len(_gt_text))
+                    )
+
+            # Coverage: proportion of GT chars matched by a positive ROI
             n_images_tot += bsz
             for b in range(bsz):
                 n_gt   = boxes_list[b].size(0)
@@ -935,13 +967,21 @@ def validate_kuronet(
             for b in range(bsz):
                 valid_b = pos_mask_s[b] & gt_labels_s[b].ne(-1)
                 if valid_b.any():
-                    pred_ids = outputs["char_logits"][b, valid_b].argmax(dim=-1).tolist()
+                    logits_valid = outputs["char_logits"][b, valid_b]  # (N, V)
+                    pred_ids = logits_valid.argmax(dim=-1).tolist()
                     true_ids = gt_labels_s[b][valid_b].tolist()
-                    for pid, tid in zip(pred_ids, true_ids):
+                    topk_ids_b = None
+                    if return_detailed:
+                        k5 = min(5, logits_valid.size(-1))
+                        topk_ids_b = logits_valid.topk(k5, dim=-1).indices.tolist()  # (N, k5)
+                    for i, (pid, tid) in enumerate(zip(pred_ids, true_ids)):
                         pred_counter[pid] += 1
                         gt_total_counter[tid] += 1
                         if pid != tid:
                             error_counter[(tid, pid)] += 1
+                            if return_detailed and topk_ids_b is not None:
+                                top5 = topk_ids_b[i]
+                                topk_in_gt_list.append([tid in top5[:k] for k in range(1, 6)])
                         # Per-script accuracy bucket
                         ch = vocab.id2char.get(tid, "")
                         stype = _char_to_script_type(ch)
@@ -1091,6 +1131,13 @@ def validate_kuronet(
         for i, ex in enumerate(examples):
             print(f"[VAL PRED] sample={i} | PRED: {ex['pred']} | GT: {ex['gt']}")
 
+    # Optional detailed fields for thesis analysis scripts
+    if return_detailed:
+        metrics["error_counter"]    = dict(error_counter)
+        metrics["gt_total_counter"] = dict(gt_total_counter)
+        metrics["per_image_cer"]    = per_image_cer_list
+        metrics["topk_in_gt"]       = topk_in_gt_list
+
     # Top-K confusion pairs for hard negative mining in the next epoch.
     # Excluded pair types (mining these destabilises training):
     #   1. pred == bg_id  → BG-escape pairs trigger a cascade into voiced/unvoiced errors
@@ -1225,7 +1272,7 @@ def train_epoch(
     model: KuroNetRecognizer,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
+    scaler: torch.cuda.amp.GradScaler,
     vocab: VocabManager,
     epoch: int,
     grad_accum_steps: int,
@@ -1273,7 +1320,7 @@ def train_epoch(
         t1 = _sync()
         t_transfer += t1 - t0
 
-        with torch.amp.autocast("cuda", enabled=USE_MIXED_PRECISION):
+        with torch.cuda.amp.autocast(enabled=USE_MIXED_PRECISION):
             # If SAM2 proposals are available for this batch, bypass the frozen detector.
             sam2_boxes, sam2_scores = None, None
             if sam2_dir is not None:
@@ -1295,6 +1342,14 @@ def train_epoch(
             )
             t3 = _sync()
             t_targets += t3 - t2
+
+            # No ROI proposals survived for any sample in this batch (e.g. an
+            # aggressive det_score_thresh filtered everything out) -> every loss
+            # term below would fall back to a disconnected zero tensor with no
+            # grad_fn, crashing backward(). Nothing to supervise, so skip it.
+            if not refine_targets["refine_pos_mask"].any() and not refine_targets["refine_neg_mask"].any():
+                t_batch_start = _sync()
+                continue
 
             loss, parts = compute_kuronet_loss(
                 outputs, refine_targets, bg_id=bg_id, hn_keys=hn_keys, vocab=vocab,
@@ -1514,7 +1569,7 @@ def main():
         eta_min=KURONET_LR_ETA_MIN,
         last_epoch=start_epoch - 2,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=USE_MIXED_PRECISION)
+    scaler = torch.cuda.amp.GradScaler(enabled=USE_MIXED_PRECISION)
 
     hard_neg_path = KURONET_CHECKPOINT_DIR / "hard_neg_pairs.json"
 
@@ -1568,21 +1623,21 @@ def main():
 
         # Two-phase crop encoder freeze: unfreeze for domain adaptation, then freeze to save compute.
         # Triggered once when epoch crosses KURONET_FREEZE_CROP_ENCODER_AFTER.
-        # if (
-        #     KURONET_FREEZE_CROP_ENCODER_AFTER > 0
-        #     and epoch == KURONET_FREEZE_CROP_ENCODER_AFTER
-        #     and model.roi_crop_encoder is not None
-        #     and not model.roi_crop_encoder.freeze_encoder
-        # ):
-        #     for p in model.roi_crop_encoder.encoder.parameters():
-        #         p.requires_grad_(False)
-        #     model.roi_crop_encoder.encoder.eval()
-        #     model.roi_crop_encoder.freeze_encoder = True
-        #     n_frozen = sum(p.numel() for p in model.roi_crop_encoder.encoder.parameters())
-        #     print(
-        #         f"[Epoch {epoch}] Crop encoder frozen "
-        #         f"({n_frozen:,} EfficientNet-B0 params removed from backprop)"
-        #    )
+        if (
+            KURONET_FREEZE_CROP_ENCODER_AFTER > 0
+            and epoch == KURONET_FREEZE_CROP_ENCODER_AFTER
+            and model.roi_crop_encoder is not None
+            and not model.roi_crop_encoder.freeze_encoder
+        ):
+            for p in model.roi_crop_encoder.encoder.parameters():
+                p.requires_grad_(False)
+            model.roi_crop_encoder.encoder.eval()
+            model.roi_crop_encoder.freeze_encoder = True
+            n_frozen = sum(p.numel() for p in model.roi_crop_encoder.encoder.parameters())
+            print(
+                f"[Epoch {epoch}] Crop encoder frozen "
+                f"({n_frozen:,} EfficientNet-B0 params removed from backprop)"
+           )
 
         score   = select_model_score(val_metrics)
         is_best = score > best_score

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from collections import Counter
 from typing import Optional
@@ -228,7 +229,7 @@ def build_stage2_dataloaders(vocab: VocabManager):
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
-        collate_fn=lambda b: collate_fn(b, pad_id),
+        collate_fn=partial(collate_fn, pad_id=pad_id),
         pin_memory=True,
         prefetch_factor=2,
         persistent_workers=NUM_WORKERS > 0,
@@ -239,7 +240,7 @@ def build_stage2_dataloaders(vocab: VocabManager):
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
-        collate_fn=lambda b: collate_fn(b, pad_id),
+        collate_fn=partial(collate_fn, pad_id=pad_id),
         pin_memory=True,
         prefetch_factor=2,
         persistent_workers=NUM_WORKERS > 0,
@@ -628,7 +629,7 @@ def train_stage2_hybrid(
         eta_min=1e-6,
     )
 
-    scaler = torch.amp.GradScaler("cuda") if USE_MIXED_PRECISION and str(DEVICE).startswith("cuda") else None
+    scaler = torch.cuda.amp.GradScaler(enabled=USE_MIXED_PRECISION) if USE_MIXED_PRECISION and str(DEVICE).startswith("cuda") else None
 
     best_val = None
     best_val_metrics = None
@@ -679,7 +680,7 @@ def train_stage2_hybrid(
             gt_boxes_list = move_gt_lists_to_device(batch["boxes"], dtype=torch.float32)
             gt_labels_list = move_gt_lists_to_device(batch["labels"], dtype=torch.long)
 
-            with torch.amp.autocast("cuda", enabled=USE_MIXED_PRECISION and str(DEVICE).startswith("cuda")):
+            with torch.cuda.amp.autocast(enabled=USE_MIXED_PRECISION and str(DEVICE).startswith("cuda")):
                 outputs = model.encode_images(images=images, orientations=orientations)
 
                 refine_targets = build_refinement_targets(
@@ -689,6 +690,7 @@ def train_stage2_hybrid(
                     gt_labels_list=gt_labels_list,
                     pos_iou_thresh=STAGE2_REFINE_POS_IOU,
                     neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
+                    use_hungarian=STAGE2_USE_HUNGARIAN,
                 )
 
                 if STAGE2_DEBUG_BATCH_STATS:

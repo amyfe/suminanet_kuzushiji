@@ -106,9 +106,9 @@ class EdoPeriodTranslationPipeline:
         score_thresh: float = 0.0,
         bg_score_gate: float = 0.5,
     ) -> str:
-        from infer import load_image, run_inference
+        from model.translation.infer import load_image, run_inference
 
-        image_tensor, _ = load_image(image_path)
+        image_tensor, _, _, _ = load_image(image_path)
         result = run_inference(
             kuronet_model,
             image_tensor,

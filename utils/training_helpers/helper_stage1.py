@@ -54,6 +54,52 @@ def prune_to_keep_last_n(ckpt_dir: Path, keep: int = 2, exclude: str = "checkpoi
         except Exception as exc:
             print(f"Warning: could not delete old checkpoint {p}: {exc}")
 
+def check_backbone_type(resume_ckpt: str | None, backbone_type: str) -> bool:
+    """We have (for now) 2 different backbone types (ResNet18 and EfficientNet-B0). 
+    If resuming from a checkpoint, we must ensure the backbone type matches the checkpoint. 
+    If it doesn't, we rebuild the model with the checkpoint's backbone type to avoid shape mismatches."""
+    if resume_ckpt is not None:
+        _peek = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+        ckpt_backbone_type = _peek.get("backbone_type", None)
+        if ckpt_backbone_type is not None and ckpt_backbone_type != backbone_type:
+            print(
+                f"⚠  Checkpoint backbone_type='{ckpt_backbone_type}' differs from "
+                f"config BACKBONE_TYPE='{backbone_type}'. "
+                f"Building '{ckpt_backbone_type}' to match the checkpoint."
+            )
+            return False
+        del _peek
+    return True
+
+def data_info_startup(images, features, outputs, gt_heat, gt_bbox, gt_bbox_mask, Hf, Wf):
+    print("\n[TRAIN DEBUG]")
+    print("images.shape:", tuple(images.shape))
+    print("features.shape:", tuple(features.shape))
+    print("output_size:", (Hf, Wf))
+    print("image_size:", tuple(images.shape[-2:]))
+    print("gt_heat min/max/mean:",
+        gt_heat.min().item(),
+        gt_heat.max().item(),
+        gt_heat.mean().item())
+    print("num bbox supervised cells:", int(gt_bbox_mask.sum().item()))
+
+    if gt_bbox_mask.sum() > 0:
+        gt_bbox_pos = gt_bbox.permute(0, 2, 3, 1)[gt_bbox_mask]
+        pred_bbox_pos = outputs["bbox"].permute(0, 2, 3, 1)[gt_bbox_mask]
+
+        print("gt_bbox mean [dx,dy,bw,bh]:",
+            gt_bbox_pos.mean(dim=0).detach().cpu().tolist())
+        print("gt_bbox min  [dx,dy,bw,bh]:",
+            gt_bbox_pos.min(dim=0).values.detach().cpu().tolist())
+        print("gt_bbox max  [dx,dy,bw,bh]:",
+            gt_bbox_pos.max(dim=0).values.detach().cpu().tolist())
+
+        print("pred_bbox mean [dx,dy,bw,bh]:",
+            pred_bbox_pos.mean(dim=0).detach().cpu().tolist())
+        print("pred_bbox min  [dx,dy,bw,bh]:",
+            pred_bbox_pos.min(dim=0).values.detach().cpu().tolist())
+        print("pred_bbox max  [dx,dy,bw,bh]:",
+            pred_bbox_pos.max(dim=0).values.detach().cpu().tolist())
 
 def collate_fn(batch, pad_id):
     """

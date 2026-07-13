@@ -52,11 +52,11 @@ Das passt zu deiner aktuellen Padding-Logik. Wenn du später irgendwo Löcher in
 from __future__ import annotations
 
 from math import isfinite
-from typing import List
+from typing import List, Optional
 
 import torch
 
-from config import STAGE2_READING_ORDER_LINE_THRESH_RATIO
+from config import KURONET_READING_ORDER_CONFIDENCE, STAGE2_READING_ORDER_LINE_THRESH_RATIO
 
 
 def infer_reading_orientation_from_boxes(boxes, debug: bool = False) -> str:
@@ -167,45 +167,154 @@ class ROIReadingOrder:
         k = max(1, min(n, int(p * n + 0.5)))
         return float(sizes.kthvalue(k).values.item())
 
+    @staticmethod
+    def _robust_gap_threshold(
+        gaps: torch.Tensor,
+        fallback: float,
+        min_jump_ratio: float = 2.5,
+    ) -> float:
+        """
+        Separate within-column/row jitter gaps from real column/row-boundary
+        gaps by finding the largest relative jump in the *sorted gap
+        distribution* itself, instead of assuming spacing tracks character
+        size (width/height).
+
+        Character-size-based thresholds (the previous `1.5 * p75(size)`
+        heuristic) collapse on dense pages where character size approaches
+        true column/row pitch: real inter-column gaps end up close to or
+        below the size-derived threshold, merging many columns into one and
+        degenerating the reading-order sort into a near-global scan by the
+        secondary axis. This was the root cause of the ~38% ordering-
+        violation rate on dense Kuzushiji pages noted in the sort functions'
+        docstrings.
+
+        Column/row gaps are naturally bimodal (many small jitter gaps within
+        a column, a handful of large gaps between columns), so the boundary
+        between the two populations shows up as a sharp ratio jump in the
+        sorted gap array. Falls back to `fallback` when there are too few
+        gaps to detect a reliable elbow, or when no jump stands out clearly
+        (e.g. a single column with uniform jitter — nothing should be
+        treated as a boundary).
+        """
+        positive = gaps[gaps > 1e-6]
+        if positive.numel() < 3:
+            return fallback
+        sorted_gaps, _ = positive.sort()
+        ratios = sorted_gaps[1:] / sorted_gaps[:-1].clamp_min(1e-6)
+        elbow_idx = int(ratios.argmax().item())
+        if float(ratios[elbow_idx].item()) < min_jump_ratio:
+            return fallback
+        # Geometric mean of the two gap values straddling the elbow.
+        return float((sorted_gaps[elbow_idx] * sorted_gaps[elbow_idx + 1]).sqrt().item())
+
+    @staticmethod
+    def _confidence_anchor_mask(
+        scores: Optional[torch.Tensor],
+        n: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        True = trust this box's own position when establishing column/row
+        geometry. Falls back to trusting every box (today's behavior --
+        restricting to "all boxes" is a no-op) when no scores are given (e.g.
+        the ground-truth box path in KuzushijiDataset) or when fewer than 3
+        boxes clear the confidence bar (too little signal to cluster from).
+        """
+        if scores is None:
+            return torch.ones(n, dtype=torch.bool, device=device)
+        anchor = torch.sigmoid(scores.detach()) >= KURONET_READING_ORDER_CONFIDENCE
+        if int(anchor.sum().item()) < 3:
+            return torch.ones(n, dtype=torch.bool, device=device)
+        return anchor
+
+    @staticmethod
+    def _establish_groups(
+        center: torch.Tensor,
+        anchor: torch.Tensor,
+        fallback_gap_thresh: float,
+    ) -> tuple[torch.Tensor, int]:
+        """
+        Cluster `center` values (x-centers for columns, y-centers for rows)
+        into contiguous groups using only anchor-flagged entries to detect
+        group boundaries -- see _confidence_anchor_mask / _robust_gap_threshold
+        for why: unfiltered, noisy low-confidence entries smear the gaps
+        between real groups and collapse detection on dense pages.
+
+        Returns (group_ids_full, num_groups). group_ids_full has one entry per
+        input position; only anchor positions are meaningful until the caller
+        follows up with _snap_small_to_columns(..., is_anchor=anchor, ...) to
+        assign non-anchor positions to their nearest anchor-derived group.
+        """
+        anchor_pos = anchor.nonzero(as_tuple=True)[0]
+        anchor_center = center[anchor_pos]
+        sorted_c, local_order = anchor_center.sort(descending=False)
+
+        if sorted_c.numel() > 1:
+            gaps = sorted_c[1:] - sorted_c[:-1]
+            gap_thresh = ROIReadingOrder._robust_gap_threshold(gaps, fallback_gap_thresh)
+            is_break = torch.cat([
+                torch.ones(1, dtype=torch.bool, device=center.device),
+                gaps > gap_thresh,
+            ])
+        else:
+            is_break = torch.ones(1, dtype=torch.bool, device=center.device)
+
+        local_group_ids = is_break.long().cumsum(0) - 1   # (n_anchor,) in local sorted order
+        num_groups = int(local_group_ids.max().item()) + 1
+
+        # Translate local (within-anchor-subset) sorted positions back to
+        # original indices before writing into the full-length array -- these
+        # are NOT the same index space, so a direct scatter with local_order
+        # would silently write to the wrong original positions.
+        orig_positions_sorted = anchor_pos[local_order]
+        group_ids_full = torch.zeros(center.size(0), dtype=torch.long, device=center.device)
+        group_ids_full[orig_positions_sorted] = local_group_ids
+
+        return group_ids_full, num_groups
+
     def _snap_small_to_columns(
         self,
         x_center: torch.Tensor,    # (n,)
         col_ids_orig: torch.Tensor, # (n,) long — column assignment for all chars
-        is_main: torch.Tensor,     # (n,) bool — True = main-text char
+        is_anchor: torch.Tensor,   # (n,) bool — True = trust this char's own column id
         num_cols: int,
     ) -> torch.Tensor:
         """
-        Reassign small/furigana characters to the nearest main-text column.
+        Reassign non-anchor characters to the nearest anchor-established column.
 
-        Uses the mean x-center of main-text chars per column as the column anchor.
-        Small chars that landed in a single-char isolated column get snapped to the
-        nearest main-text column so they no longer create spurious column boundaries.
+        Uses the mean x-center of anchor chars per column as the column center.
+        Non-anchor chars that landed in a single-char isolated column get snapped to
+        the nearest anchor column so they no longer create spurious column boundaries.
 
-        Returns updated col_ids_orig (same shape, only small-char entries changed).
+        `is_anchor` serves two purposes across this function's two call sites:
+        confidence-based (trustworthy detection) in the geometry-establishment pass,
+        and width/height-based (main-text vs. furigana) in the furigana-snap pass.
+
+        Returns updated col_ids_orig (same shape, only non-anchor entries changed).
         """
-        if not is_main.any() or is_main.all():
+        if not is_anchor.any() or is_anchor.all():
             return col_ids_orig
 
-        # Per-column mean x-center from main-text chars only
-        main_pos = is_main.nonzero(as_tuple=True)[0]
-        main_col = col_ids_orig[main_pos]
-        main_xc  = x_center[main_pos]
+        # Per-column mean x-center from anchor chars only
+        anchor_pos = is_anchor.nonzero(as_tuple=True)[0]
+        anchor_col = col_ids_orig[anchor_pos]
+        anchor_xc  = x_center[anchor_pos]
 
         col_sum   = x_center.new_zeros(num_cols)
         col_count = torch.zeros(num_cols, dtype=torch.long, device=x_center.device)
-        col_sum.scatter_add_(0, main_col, main_xc)
-        col_count.scatter_add_(0, main_col, torch.ones_like(main_col))
+        col_sum.scatter_add_(0, anchor_col, anchor_xc)
+        col_count.scatter_add_(0, anchor_col, torch.ones_like(anchor_col))
 
         valid_col = col_count > 0
         col_mean_xc = col_sum.clone()
         col_mean_xc[valid_col] = (
             col_sum[valid_col] / col_count[valid_col].to(x_center.dtype)
         )
-        # Mark columns with no main-text chars as infinitely far
+        # Mark columns with no anchor chars as infinitely far
         col_mean_xc[~valid_col] = float("inf")
 
-        # Reassign small chars to nearest main-text column by x-distance
-        small_pos = (~is_main).nonzero(as_tuple=True)[0]
+        # Reassign non-anchor chars to nearest anchor column by x-distance
+        small_pos = (~is_anchor).nonzero(as_tuple=True)[0]
         furi_xc   = x_center[small_pos].unsqueeze(1)   # (N_small, 1)
         col_xc    = col_mean_xc.unsqueeze(0)            # (1, num_cols)
         nearest   = (furi_xc - col_xc).abs().argmin(dim=1)  # (N_small,)
@@ -214,13 +323,22 @@ class ROIReadingOrder:
         col_ids_out[small_pos] = nearest
         return col_ids_out
 
-    def _horizontal_sort_indices(self, boxes: torch.Tensor) -> torch.Tensor:
+    def _horizontal_sort_indices(
+        self,
+        boxes: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Horizontal reading order: rows top-to-bottom, within each row left-to-right.
 
-        Gap threshold is derived from main-text character heights only so that small
-        ruby/furigana characters above main text don't create spurious extra rows.
-        Small characters are snapped to the nearest main-text row after row detection.
+        Row geometry is established from high-confidence boxes only (see
+        _confidence_anchor_mask / _robust_gap_threshold): low-confidence boxes
+        in the raw candidate pool would otherwise smear the gaps between real
+        rows and collapse row detection on dense pages. Non-confident boxes
+        are then snapped to their nearest anchor-established row. Small
+        ruby/furigana characters are additionally snapped to the nearest
+        main-text row by height after that, preventing them from creating
+        spurious extra rows.
         """
         if boxes.numel() == 0:
             return torch.zeros((0,), dtype=torch.long, device=boxes.device)
@@ -236,30 +354,22 @@ class ROIReadingOrder:
             h75 = self._percentile_size(heights[is_main], 0.75)
         else:
             h75 = self._percentile_size(heights, 0.75)
-        gap_thresh = 1.5 * h75
+        fallback_gap_thresh = 1.5 * h75
 
-        sorted_yc, sorted_idx = y_center.sort(descending=False)
-
-        if sorted_yc.numel() > 1:
-            gaps = sorted_yc[1:] - sorted_yc[:-1]
-            is_break = torch.cat([
-                torch.ones(1, dtype=torch.bool, device=boxes.device),
-                gaps > gap_thresh,
-            ])
-        else:
-            is_break = torch.ones(1, dtype=torch.bool, device=boxes.device)
-
-        row_ids = is_break.long().cumsum(0) - 1   # (n,) in sorted order
-
-        row_ids_orig = torch.zeros(boxes.size(0), dtype=torch.long, device=boxes.device)
-        row_ids_orig.scatter_(0, sorted_idx, row_ids)
-        num_rows = int(row_ids_orig.max().item()) + 1
+        anchor = self._confidence_anchor_mask(scores, boxes.size(0), boxes.device)
+        row_ids_orig, num_rows = self._establish_groups(y_center, anchor, fallback_gap_thresh)
+        row_ids_orig = self._snap_small_to_columns(
+            x_center=y_center,
+            col_ids_orig=row_ids_orig,
+            is_anchor=anchor,
+            num_cols=num_rows,
+        )
 
         # Snap small/ruby chars to the nearest main-text row
         row_ids_orig = self._snap_small_to_columns(
             x_center=y_center,
             col_ids_orig=row_ids_orig,
-            is_main=is_main,
+            is_anchor=is_main,
             num_cols=num_rows,
         )
 
@@ -269,15 +379,25 @@ class ROIReadingOrder:
 
         return sort_key.argsort()
 
-    def _vertical_sort_indices(self, boxes: torch.Tensor) -> torch.Tensor:
+    def _vertical_sort_indices(
+        self,
+        boxes: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Vertical reading order: columns right-to-left (Edo), within each column top-to-bottom.
 
-        Gap threshold is derived from main-text character widths only so that narrow
-        furigana columns don't cause adjacent main-text columns to merge (the root
-        cause of the ~38% ordering-violation rate in dense Kuzushiji pages).
-        Furigana/small chars are snapped to the nearest main-text column after
-        column detection, preventing them from creating spurious isolated columns.
+        Column geometry is established from high-confidence boxes only (see
+        _confidence_anchor_mask / _robust_gap_threshold): low-confidence boxes
+        in the raw candidate pool (weak/duplicate detections, gap-filled
+        synthetic proposals) have x-centers that fall in the gutters between
+        real columns, which -- left unfiltered -- smear away the gap
+        separation between columns and collapse column detection on dense
+        pages (the root cause of the ~38% ordering-violation rate in dense
+        Kuzushiji pages). Non-confident boxes are then snapped to their
+        nearest anchor-established column. Furigana/small chars are
+        additionally snapped to the nearest main-text column by width after
+        that, preventing them from creating spurious isolated columns.
         """
         if boxes.numel() == 0:
             return torch.zeros((0,), dtype=torch.long, device=boxes.device)
@@ -294,24 +414,16 @@ class ROIReadingOrder:
             w75 = self._percentile_size(widths[is_main], 0.75)
         else:
             w75 = self._percentile_size(widths, 0.75)
-        gap_thresh = 1.5 * w75
+        fallback_gap_thresh = 1.5 * w75
 
-        sorted_xc, sorted_idx = x_center.sort(descending=False)   # left → right
-
-        if sorted_xc.numel() > 1:
-            gaps = sorted_xc[1:] - sorted_xc[:-1]
-            is_break = torch.cat([
-                torch.ones(1, dtype=torch.bool, device=boxes.device),
-                gaps > gap_thresh,
-            ])
-        else:
-            is_break = torch.ones(1, dtype=torch.bool, device=boxes.device)
-
-        col_ids  = is_break.long().cumsum(0) - 1   # (n,) in sorted order
-        num_cols = int(col_ids.max().item()) + 1
-
-        col_ids_orig = torch.zeros(boxes.size(0), dtype=torch.long, device=boxes.device)
-        col_ids_orig.scatter_(0, sorted_idx, col_ids)
+        anchor = self._confidence_anchor_mask(scores, boxes.size(0), boxes.device)
+        col_ids_orig, num_cols = self._establish_groups(x_center, anchor, fallback_gap_thresh)
+        col_ids_orig = self._snap_small_to_columns(
+            x_center=x_center,
+            col_ids_orig=col_ids_orig,
+            is_anchor=anchor,
+            num_cols=num_cols,
+        )
 
         # Snap furigana/small chars to the nearest main-text column center.
         # Without this, a furigana column between two main columns creates an
@@ -319,7 +431,7 @@ class ROIReadingOrder:
         col_ids_orig = self._snap_small_to_columns(
             x_center=x_center,
             col_ids_orig=col_ids_orig,
-            is_main=is_main,
+            is_anchor=is_main,
             num_cols=num_cols,
         )
 
@@ -432,6 +544,7 @@ class ROIReadingOrder:
         mask: torch.Tensor,         # (T,)
         orientation: str,
         *extra_tensors: torch.Tensor,
+        refine_scores: Optional[torch.Tensor] = None,
     ):
         """
         Sort one sample and reorder any extra tensors consistently.
@@ -441,6 +554,12 @@ class ROIReadingOrder:
             mask: (T,)
             orientation: "horizontal" or "vertical"
             extra_tensors: tensors with leading dimension T
+            refine_scores: (T,) optional per-ROI quality logits, used only to
+                gate which boxes anchor column/row geometry detection (see
+                _confidence_anchor_mask) -- guidance input, not reordered as
+                an output in its own right (callers that need it reordered
+                should also pass it among extra_tensors, as existing callers
+                already do).
 
         Returns:
             sorted_boxes, sorted_mask, *sorted_extras, sort_idx
@@ -454,11 +573,12 @@ class ROIReadingOrder:
             return tuple(outputs)
 
         valid_boxes = boxes[:valid_t]
+        valid_scores = refine_scores[:valid_t] if refine_scores is not None else None
 
         if orientation == "horizontal":
-            valid_sort_idx = self._horizontal_sort_indices(valid_boxes)
+            valid_sort_idx = self._horizontal_sort_indices(valid_boxes, valid_scores)
         elif orientation == "vertical":
-            valid_sort_idx = self._vertical_sort_indices(valid_boxes)
+            valid_sort_idx = self._vertical_sort_indices(valid_boxes, valid_scores)
         else:
             raise ValueError(f"Unsupported orientation='{orientation}'. Use 'horizontal' or 'vertical'.")
 
@@ -520,13 +640,17 @@ class ROIReadingOrder:
             for name, tensor in named_tensors.items()
         }
 
+        refine_scores_all = named_tensors.get("refine_scores")
+
         for b in range(bsz):
             extras = [named_tensors[name][b] for name in named_tensors.keys()]
+            refine_scores_b = refine_scores_all[b] if refine_scores_all is not None else None
             result = self.sort_single(
                 boxes[b],
                 mask[b],
                 orientations[b],
                 *extras,
+                refine_scores=refine_scores_b,
             )
 
             sorted_boxes[b] = result[0]

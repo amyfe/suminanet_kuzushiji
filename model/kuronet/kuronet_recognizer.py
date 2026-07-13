@@ -26,7 +26,7 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
-from config import KURONET_BG_SCORE_GATE, KURONET_CROP_ENCODER_SIZE
+from config import KURONET_BG_SCORE_GATE, KURONET_CROP_ENCODER_CHUNK_SIZE, KURONET_CROP_ENCODER_SIZE
 from model.kuronet.backbone.feature_projector import FeatureProjector
 from model.kuronet.backbone.roi_crop_encoder import ROICropEncoder
 from model.kuronet.context.roi_context import ROIContextEncoder
@@ -219,6 +219,7 @@ class KuroNetRecognizer(nn.Module):
         use_crop_encoder: bool = True,
         crop_encoder_size: tuple[int, int] = KURONET_CROP_ENCODER_SIZE,
         freeze_crop_encoder: bool = True,
+        crop_encoder_chunk_size: int = KURONET_CROP_ENCODER_CHUNK_SIZE,
     ):
         super().__init__()
 
@@ -273,6 +274,7 @@ class KuroNetRecognizer(nn.Module):
                 crop_size=crop_encoder_size,
                 freeze_encoder=freeze_crop_encoder,
                 pretrained=True,
+                chunk_size=crop_encoder_chunk_size,
             )
             # Projects [roi_feats || crop_feats] -> roi_feat_dim
             _fusion = nn.Linear(roi_feat_dim * 2, roi_feat_dim, bias=True)

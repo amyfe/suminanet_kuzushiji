@@ -38,19 +38,19 @@ IMAGE_SIZE = (512, 512)
 USE_MIXED_PRECISION = True
 NUM_WORKERS = 8
 
-BATCH_SIZE = 8
-GRADIENT_ACCUMULATION_STEPS = 2
+BATCH_SIZE = 32
+GRADIENT_ACCUMULATION_STEPS = 1
 GRAD_CLIP = 1.0
 
-NUM_EPOCHS = 25
+NUM_EPOCHS = 30
 
 
 # ============================================================
 # Optimizer
 # ============================================================
 
-LR =  0.0019040586163242641
-WEIGHT_DECAY = 9.431774935513243e-5
+LR =  0.00055
+WEIGHT_DECAY = 3.0827509590757714e-06
 
 
 # ============================================================
@@ -64,13 +64,7 @@ IN_CHANNELS = 3
 # 'efficientnet_b2' -- EfficientNet-B2 + FPN decoder, ImageNet pretrained,
 #                      outputs at stride=2 (H//2, W//2). Requires timm.
 BACKBONE_TYPE = "efficientnet_b2"
-
-# Output channel count for both backbone types.
-# Changing this requires Stage 1 retraining.
 BACKBONE_BASE_FEATURES = 64
-
-# Upper bound / placeholder only.
-# Real vocabulary size is created dynamically from annotations.
 NUM_CLASSES = 3000
 
 
@@ -80,19 +74,19 @@ NUM_CLASSES = 3000
 
 STAGE1_CHECKPOINT_DIR = CHECKPOINT_DIR / "stage1_detection"
 
-STAGE1_DROPOUT_RATE = 0.22
+STAGE1_DROPOUT_RATE = 0.3510765163667262
 
-STAGE1_FOCAL_ALPHA = 0.3519203997395026
-STAGE1_FOCAL_GAMMA = 1.881061777549089
-STAGE1_POS_WEIGHT = 1.0
+STAGE1_FOCAL_ALPHA = 0.25658617128945466
+STAGE1_FOCAL_GAMMA = 1.5881990201080256
+STAGE1_POS_WEIGHT = 1.536665269500476
 
-STAGE1_BBOX_WEIGHT = 0.5587297156424271
+STAGE1_BBOX_WEIGHT = 0.13048169580424154
 # DIoU loss added alongside SmoothL1: directly optimises IoU (which validation measures at ≥0.5)
 # plus a centre-distance penalty that keeps predictions anchored near GT centres.
 # Weight kept equal to BBOX_WEIGHT so both objectives carry similar gradient magnitude.
-STAGE1_DIOU_WEIGHT = 0.15
-STAGE1_HEATMAP_SIGMA = 0.7249217915919892         
-STAGE1_FOCAL_POS_THRESHOLD = 0.3      
+STAGE1_DIOU_WEIGHT = 0.1345315263632802
+STAGE1_HEATMAP_SIGMA = 1.7545869700715266         
+STAGE1_FOCAL_POS_THRESHOLD = 0.479126803723303     
 
 STAGE1_EARLY_STOPPING_PATIENCE = 5   
 STAGE1_SIGMA_FLOOR = 1.5
@@ -147,8 +141,6 @@ STAGE2_ROI_POOL_DROPOUT = 0.10
 
 STAGE2_REFINE_HIDDEN_DIM = 512
 STAGE2_REFINE_DROPOUT = 0.10
-
-# Whether to add an auxiliary ROI classification head
 STAGE2_USE_AUX_HEAD = True
 
 # -------------------------
@@ -175,7 +167,7 @@ STAGE2_CONTEXT_NUM_LAYERS = 2
 # Unidirectional GRU: the sequence is already in reading order (right→left columns, top→bottom).
 # The backward GRU pass of a BiGRU only learns reversed reading order — trivial and wastes 50%
 # of context capacity. "gru" = forward only; "bigru" = bidirectional.
-STAGE2_CONTEXT_MODE = "gru"
+STAGE2_CONTEXT_MODE = "bigru"
 
 # -------------------------
 # Loss Functions
@@ -191,9 +183,6 @@ STAGE2_CONTINUATION_ALPHA = 0.5
 STAGE2_REFINE_POS_IOU = 0.45
 STAGE2_REFINE_NEG_IOU = 0.20
 STAGE2_REFINE_POS_WEIGHT = 1.0
-# Use Hungarian (one-to-one) instead of max-IoU (many-to-one) matching for
-# ROI-to-GT assignment. Hungarian prevents multiple proposals from sharing the
-# same GT target, which eliminates redundant/competing gradients on dense pages.
 STAGE2_USE_HUNGARIAN = True
 
 
@@ -227,26 +216,11 @@ WARMUP_LAMBDA_DELTA = 1.0
 WARMUP_LAMBDA_SCORE = 0.3
 WARMUP_LAMBDA_AUX = 1.0
 
-
-# ============================================================
-# KuroNet Recognizer (simplified per-ROI classifier)
-# ============================================================
-# Replaces the seq2seq decoder with a direct per-ROI character
-# classifier: detect → refine → sort by reading order → classify.
-# All ROI pipeline components (pool, refine, ordering, tokens)
-# are reused unchanged from Stage 2 hybrid.
-# ============================================================
-
 KURONET_CHECKPOINT_DIR       = CHECKPOINT_DIR / "kuronet_recognizer"
 KURONET_CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 KURONET_USE_CONTEXT          = True
-# Gap factor for per-block GRU context: a reading-order distance above
-# gap_factor × median inter-box distance triggers a hidden-state reset.
-# Increase if annotations/headers are incorrectly split from main text.
 KURONET_CONTEXT_BLOCK_GAP_FACTOR = 2.5
-
-# Fraction of training steps where copy-paste rare-character augmentation is applied.
 KURONET_COPY_PASTE_PROB      = 0.4
 
 KURONET_CLASSIFIER_HIDDEN    = 512
@@ -260,10 +234,17 @@ KURONET_CROP_ENCODER_SIZE    = (112, 112)
 #   Drops ~5.3M params from backprop → no longer bottleneck at 112px.
 KURONET_FREEZE_CROP_ENCODER       = False  # start unfrozen
 KURONET_FREEZE_CROP_ENCODER_AFTER = 5      # freeze EfficientNet-B0 weights after this epoch
-
-KURONET_ROI_SIZE             = STAGE2_ROI_SIZE
+# A dense page of Kuzushiji can yield hundreds of ROIs per image; with
+# BATCH_SIZE=4 and DET_TOP_K up to 500, a single training batch can produce
+# ~1500+ crops. Running all of them through EfficientNet-B0 in one unchunked
+# forward call (with gradients, while unfrozen) can exceed a 16GB GPU. Process
+# crops through the encoder in chunks of this size instead — bounds peak
+# memory independent of how many ROIs a batch happens to contain. Note this
+# changes BatchNorm statistics from "computed over all N crops" to "computed
+# per chunk" during training (eval-mode BN uses running stats, unaffected).
+KURONET_CROP_ENCODER_CHUNK_SIZE   = 256
 # Pool output size: the AdaptiveAvgPool2d target after the conv layers, before the MLP.
-# This is DISTINCT from KURONET_ROI_SIZE:
+# This is DISTINCT from STAGE2_ROI_SIZE:
 #   ROI_SIZE    = how finely tv_roi_align samples from the feature map (conv input resolution)
 #   POOL_OUTPUT = how many spatial cells the downstream MLP receives
 # 4×4=16 cells captures coarse stroke layout (enough for character discrimination) while
@@ -296,7 +277,15 @@ KURONET_LAMBDA_DELTA         = 0.75
 KURONET_LAMBDA_SCORE         = 0.20        
 KURONET_BG_WEIGHT            = 0.1         
 KURONET_STRONG_BG_WEIGHT     = 0.45        
-KURONET_BG_SCORE_GATE        = 0.55        
+KURONET_BG_SCORE_GATE        = 0.55
+
+# Minimum sigmoid(refine_score) for a box to "anchor" column/row geometry in
+# ROIReadingOrder's reading-order clustering. Low-confidence boxes (weak/
+# duplicate detections, gap-filled synthetic proposals) are excluded from
+# establishing column positions, then snapped to the nearest anchor-derived
+# column afterward -- otherwise their x-centers smear the gaps between real
+# columns on dense pages, collapsing column detection.
+KURONET_READING_ORDER_CONFIDENCE = 0.5
 
 # Initial value for the learnable residual scale in ROIRefinementHead.
 # Stored as a sigmoid-constrained nn.Parameter (logit-parameterised).
@@ -330,48 +319,18 @@ KURONET_VALIDATION_BATCHES   = None   # None = full validation set each epoch
 # ============================================================
 # SAM2 Illustration Hard-Negative Weighting
 # ============================================================
-
-# Set True to upweight the focal loss inside illustration regions during training.
-# The model trains on full unmodified images but receives stronger gradient
-# push to suppress false positives in illustration areas.
-# Run preprocess_sam2_illustrations.py once to build the mask cache first.
 SAM2_PREPROCESSING = True
-
-# Where per-image illustration masks are cached (.npy files at IMAGE_SIZE).
 SAM2_MASKS_DIR = ROOT / "assets/data_sam2_masks"
-
-# SAM2 model checkpoint path.
 SAM2_CHECKPOINT = ROOT / "checkpoints/sam2/sam2.1_hiera_large.pt"
-
-# Loss multiplier for negative heatmap cells inside illustration regions.
-# Illustration brush-strokes look like character strokes, so the model keeps
-# firing there. 4× extra gradient on those false positives teaches suppression
-# without distorting the overall loss scale.
 SAM2_HARD_NEG_WEIGHT = 4.0
-
 # Masks whose area is between these two fractions are treated as illustrations.
 # Lower bound: individual characters are small — a region above 10 % is not a character.
 # Upper bound: anything above 60 % is the page background (parchment), not an illustration.
-SAM2_ILLUS_AREA_THRESH     = 0.10   # min fraction
-SAM2_ILLUS_AREA_MAX_THRESH = 0.60   # max fraction — background excluded
-# Sigmoid ramp width at each area boundary. Masks near the threshold get
-# intermediate weight instead of a hard binary skip. E.g. with margin=0.02:
-#   frac=0.10 → weight≈0.5, frac=0.12 → weight≈0.88, frac=0.08 → weight≈0.12
-# Requires re-running preprocess_sam2_illustrations.py --overwrite after changing.
+SAM2_ILLUS_AREA_THRESH     = 0.10 
+SAM2_ILLUS_AREA_MAX_THRESH = 0.60  
 SAM2_ILLUS_AREA_SOFT_MARGIN = 0.02
-
-# Masks smaller than this many pixels are ignored (SAM2 noise).
 SAM2_ILLUS_MIN_AREA = 1_000     # px²
-
-# SAM2 AutomaticMaskGenerator quality thresholds.
 SAM2_ILLUS_PRED_IOU_THRESH  = 0.85
 SAM2_ILLUS_STABILITY_THRESH = 0.90
-
-# If True, preprocess_sam2_proposals.run_preprocessing() is called automatically
-# at the end of Stage 1 training (after the best checkpoint is saved).
-# The refined proposal cache is then available for Stage 2 KuroNet training via
-# --sam2_proposals. Set False to run the script manually with custom flags.
 SAM2_PROPOSALS_PREPROCESSING = True
-
-# Where per-image SAM2-refined proposal boxes are cached (.pt files).
 SAM2_PROPOSALS_DIR = ROOT / "assets/sam2_proposals"

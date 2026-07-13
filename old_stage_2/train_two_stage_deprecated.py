@@ -60,7 +60,7 @@ from utils.training_helpers.helper_stage1 import (
     validate_detector,
 )
 from utils.vocab import VocabManager
-from validate_stage1 import extract_boxes_from_heatmap
+from utils.validation.validate_stage1 import extract_boxes_from_heatmap
 
 
 def _sort_boxes_and_labels_reading_order(boxes, labels, orientation):

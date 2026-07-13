@@ -46,7 +46,7 @@ def main() -> None:
         "Do not use these numbers to tune further hyperparameters.\n"
     )
 
-    from validate_stage1 import validate_stage1
+    from utils.validation.validate_stage1 import validate_stage1
     validate_stage1(
         checkpoint_path=args.checkpoint,
         split="test",
