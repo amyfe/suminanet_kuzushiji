@@ -173,6 +173,9 @@ submit_script.sh
 submit_optuna.sh
 CLUSTER_QUICK_REFERENCE.md
 assets/data_cached/
+debug_vis/
+old_stage_2/
+results/
 # mypy
 .mypy_cache/
 .dmypy.json

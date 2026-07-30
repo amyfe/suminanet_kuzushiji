@@ -296,25 +296,39 @@ def _recover_with_point_prompts(
     if not centers:
         return torch.zeros((0, 4)), torch.zeros((0,))
 
+    n = len(centers)
+    # (N, 1, 2) / (N, 1): one foreground point per candidate, batched into a
+    # single predict() call — mirrors the batched (N, 4) box prompts used in
+    # _refine_boxes_with_sam2.
+    point_coords = np.array(
+        [[[cx, cy]] for (cx, cy, _w, _h) in centers], dtype=np.float32
+    )
+    point_labels = np.ones((n, 1), dtype=np.int32)
+
+    try:
+        masks, sam_scores, _ = predictor.predict(
+            point_coords=point_coords,
+            point_labels=point_labels,
+            box=None,
+            multimask_output=True,
+        )
+    except Exception:
+        return torch.zeros((0, 4)), torch.zeros((0,))
+
+    # SAM2ImagePredictor.predict() does masks.squeeze(0) internally, so a
+    # single-candidate batch collapses (1, 3, H, W) -> (3, H, W). Restore the
+    # per-candidate dimension so indexing below is uniform for any N.
+    if masks.ndim == 3:
+        masks = masks[None, ...]
+        sam_scores = sam_scores[None, ...]
+    # masks: (N, 3, H, W) bool, sam_scores: (N, 3)
+
     recovered_boxes: List[List[float]] = []
     recovered_scores: List[float] = []
 
-    for (cx, cy, w, h) in centers:
-        point = np.array([[cx, cy]], dtype=np.float32)
-        label = np.array([1], dtype=np.int32)
-
-        try:
-            masks, sam_scores, _ = predictor.predict(
-                point_coords=point,
-                point_labels=label,
-                box=None,
-                multimask_output=True,
-            )
-        except Exception:
-            continue
-
-        best_idx = int(np.argmax(sam_scores))
-        mask = masks[best_idx]  # (H, W) bool
+    for i in range(n):
+        best_idx = int(np.argmax(sam_scores[i]))
+        mask = masks[i, best_idx]  # (H, W) bool
 
         bbox = _mask_to_tight_box(mask)
         if bbox is None:
@@ -489,7 +503,8 @@ def _recover_framed_text(
     Detect rectangular frames (cartouches, seals, title boxes) using SAM2 auto-segmentation,
     then re-run the detector at higher resolution inside frames that have too few proposals.
     """
-    masks_data = mask_generator.generate(image_rgb)
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        masks_data = mask_generator.generate(image_rgb)
     if not masks_data:
         return torch.zeros((0, 4)), torch.zeros((0,))
 
@@ -692,41 +707,28 @@ def _run_processing_loop(
             detector.cpu()
             torch.cuda.empty_cache()
 
-        # --- Set SAM2 image features once (reused by all passes) ---
-        predictor.set_image(img_rgb)
-
-        # --- Pass 1: Box-prompt refinement ---
-        if coarse_boxes.size(0) == 0:
-            refined_boxes = coarse_boxes
-        else:
-            refined_boxes = _refine_boxes_with_sam2(predictor, coarse_boxes)
-        refined_scores = coarse_scores
-
         fn_boxes_all:  List[torch.Tensor] = []
         fn_scores_all: List[torch.Tensor] = []
 
-        # --- Pass 2: Column-gap filling (with second pass for newly recovered chars) ---
-        if args.fill_gaps and refined_boxes.size(0) > 0:
-            gap_boxes, gap_scores = _fill_column_gaps(
-                predictor,
-                refined_boxes,
-                gap_factor=args.gap_factor,
-                col_gap_factor=args.col_gap_factor,
-                fn_col_score=args.fn_col_score,
-                fn_min_area=args.fn_min_area,
-                fn_max_area=args.fn_max_area,
-                fn_max_aspect=args.fn_max_aspect,
-            )
-            if gap_boxes.size(0) > 0:
-                fn_boxes_all.append(gap_boxes)
-                fn_scores_all.append(gap_scores)
-                # Second pass: re-check gaps in the augmented column (catches cases where
-                # SAM2 only partially fills a multi-char gap, leaving a new gap between
-                # the recovered positions that was not visible in the first pass).
-                combined = torch.cat([refined_boxes, gap_boxes], dim=0)
-                gap_boxes2, gap_scores2 = _fill_column_gaps(
+        # --- SAM2 image encoding + Pass 1-3 (every predictor.predict() call for
+        # this image shares one inference_mode/autocast scope, per SAM2 docs).
+        # Stage 1 backbone/detector forward passes stay outside — they don't need
+        # SAM2's autocast dtype and already ran (or, for Pass 4, run separately below).
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            predictor.set_image(img_rgb)
+
+            # --- Pass 1: Box-prompt refinement ---
+            if coarse_boxes.size(0) == 0:
+                refined_boxes = coarse_boxes
+            else:
+                refined_boxes = _refine_boxes_with_sam2(predictor, coarse_boxes)
+            refined_scores = coarse_scores
+
+            # --- Pass 2: Column-gap filling (with second pass for newly recovered chars) ---
+            if args.fill_gaps and refined_boxes.size(0) > 0:
+                gap_boxes, gap_scores = _fill_column_gaps(
                     predictor,
-                    combined,
+                    refined_boxes,
                     gap_factor=args.gap_factor,
                     col_gap_factor=args.col_gap_factor,
                     fn_col_score=args.fn_col_score,
@@ -734,27 +736,44 @@ def _run_processing_loop(
                     fn_max_area=args.fn_max_area,
                     fn_max_aspect=args.fn_max_aspect,
                 )
-                if gap_boxes2.size(0) > 0:
-                    fn_boxes_all.append(gap_boxes2)
-                    fn_scores_all.append(gap_scores2)
+                if gap_boxes.size(0) > 0:
+                    fn_boxes_all.append(gap_boxes)
+                    fn_scores_all.append(gap_scores)
+                    # Second pass: re-check gaps in the augmented column (catches cases where
+                    # SAM2 only partially fills a multi-char gap, leaving a new gap between
+                    # the recovered positions that was not visible in the first pass).
+                    combined = torch.cat([refined_boxes, gap_boxes], dim=0)
+                    gap_boxes2, gap_scores2 = _fill_column_gaps(
+                        predictor,
+                        combined,
+                        gap_factor=args.gap_factor,
+                        col_gap_factor=args.col_gap_factor,
+                        fn_col_score=args.fn_col_score,
+                        fn_min_area=args.fn_min_area,
+                        fn_max_area=args.fn_max_area,
+                        fn_max_aspect=args.fn_max_aspect,
+                    )
+                    if gap_boxes2.size(0) > 0:
+                        fn_boxes_all.append(gap_boxes2)
+                        fn_scores_all.append(gap_scores2)
 
-        # --- Pass 3: Sub-threshold peaks ---
-        if args.sub_thresh:
-            sub_boxes, sub_scores = _recover_subthreshold(
-                predictor,
-                det_out,
-                h_img, w_img,
-                fn_score_low=args.fn_score_low,
-                fn_score_high=args.score_thresh,
-                fn_top_k=args.fn_top_k,
-                pass1_boxes=refined_boxes,
-                fn_min_area=args.fn_min_area,
-                fn_max_area=args.fn_max_area,
-                fn_max_aspect=args.fn_max_aspect,
-            )
-            if sub_boxes.size(0) > 0:
-                fn_boxes_all.append(sub_boxes)
-                fn_scores_all.append(sub_scores)
+            # --- Pass 3: Sub-threshold peaks ---
+            if args.sub_thresh:
+                sub_boxes, sub_scores = _recover_subthreshold(
+                    predictor,
+                    det_out,
+                    h_img, w_img,
+                    fn_score_low=args.fn_score_low,
+                    fn_score_high=args.score_thresh,
+                    fn_top_k=args.fn_top_k,
+                    pass1_boxes=refined_boxes,
+                    fn_min_area=args.fn_min_area,
+                    fn_max_area=args.fn_max_area,
+                    fn_max_aspect=args.fn_max_aspect,
+                )
+                if sub_boxes.size(0) > 0:
+                    fn_boxes_all.append(sub_boxes)
+                    fn_scores_all.append(sub_scores)
 
         # --- Pass 4: Frame/cartouche recovery ---
         if args.recover_frames and mask_generator is not None:

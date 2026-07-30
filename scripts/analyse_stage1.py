@@ -179,7 +179,7 @@ def parse_args() -> argparse.Namespace:
                    help="IoU threshold for NMS")
     p.add_argument("--min_box_size", type=float, default=1.0539268301125129,
                    help="Minimum box size to keep")
-    p.add_argument("--confidence", type=float, default=0.05833181975183368,
+    p.add_argument("--confidence", type=float, default=0.65,
                    help="Confidence threshold for predictions")
     return p.parse_args()
     # Optuna {'confidence': 0.05833181975183368, 'top_k': 700, 'nms_iou': 0.6454054005824295, 'min_box_size': 1.0539268301125129}

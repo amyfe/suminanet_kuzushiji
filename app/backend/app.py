@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import io
 import sys
+import time
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 # Make project root importable regardless of working directory
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -27,12 +29,19 @@ if str(ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
 
-from config import CHECKPOINT_DIR, DEVICE, IMAGE_SIZE, KURONET_CER_SCORE_THRESH
+from config import (
+    CHECKPOINT_DIR,
+    DEVICE,
+    IMAGE_SIZE,
+    KURONET_CER_SCORE_THRESH,
+    TRANSLATE_RATE_LIMIT_MAX_REQUESTS,
+    TRANSLATE_RATE_LIMIT_WINDOW_SECONDS,
+)
 from model.translation.infer import _TRANSFORM, _align_compile_keys, load_kuronet, run_inference, _unletterbox_boxes
 from train_stage2_kuronet import build_kuronet_model, load_vocab
 
@@ -183,10 +192,36 @@ class TranslateRequest(BaseModel):
     text: str
     strip_furigana: bool = True
     normalize_historical: bool = True
+    chars: Optional[List[Dict[str, Any]]] = None
+
+
+# Per-IP sliding-window limit on /api/translate — this endpoint spends paid
+# Claude API quota, unlike /api/transcribe (GPU-cost only). In-memory state
+# is fine here: single-process demo app (see INSTALL.md).
+_translate_request_log: dict[str, deque] = defaultdict(deque)
+
+
+def _check_translate_rate_limit(client_ip: str) -> None:
+    now = time.monotonic()
+    window = TRANSLATE_RATE_LIMIT_WINDOW_SECONDS
+    log = _translate_request_log[client_ip]
+    while log and now - log[0] > window:
+        log.popleft()
+    if len(log) >= TRANSLATE_RATE_LIMIT_MAX_REQUESTS:
+        retry_after = int(window - (now - log[0])) + 1
+        raise HTTPException(
+            429,
+            detail=(
+                f"Rate limit exceeded: max {TRANSLATE_RATE_LIMIT_MAX_REQUESTS} "
+                f"requests per {window}s. Try again in {retry_after}s."
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+    log.append(now)
 
 
 @app.post("/api/translate")
-async def translate(request: TranslateRequest):
+async def translate(payload: TranslateRequest, http_request: Request):
     """
     Run the full translation pipeline on classical Japanese text:
       MeCab+UniDic normalization → modern Japanese → English (via Claude).
@@ -194,16 +229,22 @@ async def translate(request: TranslateRequest):
     Requires ANTHROPIC_API_KEY in the server environment.
     Returns translation result including per-step token usage.
     """
-    if not request.text.strip():
+    if not payload.text.strip():
         raise HTTPException(400, detail="text must not be empty.")
+
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    _check_translate_rate_limit(client_ip)
 
     pipeline = _get_translation_pipeline()
     try:
         result = pipeline.translate_text(
-            request.text,
-            strip_furigana=request.strip_furigana,
-            normalize_historical=request.normalize_historical,
+            payload.text,
+            strip_furigana=payload.strip_furigana,
+            normalize_historical=payload.normalize_historical,
+            chars=payload.chars,
         )
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(500, detail=str(exc))
 

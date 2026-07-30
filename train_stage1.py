@@ -12,7 +12,7 @@ from tqdm import tqdm
 import torch.nn.functional as F
 
 from config import (
-    DATA_DIR, DEVICE, BATCH_SIZE, STAGE1_BBOX_WEIGHT, STAGE1_DIOU_WEIGHT, STAGE1_DROPOUT_RATE,
+    DATA_DIR, DEVICE, STAGE1_BATCH_SIZE, STAGE1_BBOX_WEIGHT, STAGE1_DIOU_WEIGHT, STAGE1_DROPOUT_RATE,
     STAGE1_FOCAL_POS_THRESHOLD, IMAGE_SIZE, NUM_EPOCHS, LR, NUM_WORKERS,
     STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_HEATMAP_SIGMA, STAGE1_SIGMA_FLOOR, STAGE1_SIGMA_CEIL, STAGE1_SIGMA_SCALE,
     STAGE1_POS_WEIGHT, STAGE1_EARLY_STOPPING_PATIENCE, WEIGHT_DECAY,
@@ -25,6 +25,7 @@ from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
 from utils.sam2.preprocess_sam2_illustrations import run_preprocessing
+from utils.sam2.preprocess_sam2_proposals import run_preprocessing as _run_sam2_proposals
 
 def _atomic_save(obj, path):
     """Write checkpoint atomically: save to .tmp then rename, so crashes never leave a corrupt file."""
@@ -98,19 +99,20 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
             full_dataset, [train_size, val_size]
         )
     
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
+    train_dataloader = DataLoader(train_dataset, batch_size=STAGE1_BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
                             collate_fn=partial(collate_fn, pad_id=pad_id), pin_memory=True,
                             prefetch_factor=2, persistent_workers=NUM_WORKERS > 0)
-    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
+    val_dataloader = DataLoader(val_dataset, batch_size=STAGE1_BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
                             collate_fn=partial(collate_fn, pad_id=pad_id), pin_memory=True,
                             prefetch_factor=2, persistent_workers=NUM_WORKERS > 0)
     
     effective_backbone_type = BACKBONE_TYPE
     if not check_backbone_type(resume_ckpt, effective_backbone_type):
         raise ValueError("Backbone type mismatch between checkpoint and current configuration. Please adjust BACKBONE_TYPE in config.py to match the checkpoint or use a different checkpoint.")
-    # Build model
-    backbone = build_backbone(effective_backbone_type, BACKBONE_BASE_FEATURES).to(DEVICE)
-    detector = DetectorHead(in_ch=BACKBONE_BASE_FEATURES, num_classes=vocab.vocab_size, dropout_rate=STAGE1_DROPOUT_RATE, predict_classes=False).to(DEVICE)  # Disable class head to save memory
+    # Build model. channels_last speeds up conv-heavy models on Ampere+/Blackwell/H200
+    # tensor cores under AMP with no effect on training dynamics (layout only).
+    backbone = build_backbone(effective_backbone_type, BACKBONE_BASE_FEATURES).to(DEVICE, memory_format=torch.channels_last)
+    detector = DetectorHead(in_ch=BACKBONE_BASE_FEATURES, num_classes=vocab.vocab_size, dropout_rate=STAGE1_DROPOUT_RATE, predict_classes=False).to(DEVICE, memory_format=torch.channels_last)  # Disable class head to save memory
     print(f"✅ Model initialized: backbone={effective_backbone_type}, features={BACKBONE_BASE_FEATURES}, vocab={vocab.vocab_size} classes")
     # Optimizer
     optimizer = optim.Adam(
@@ -129,8 +131,9 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         optimizer, schedulers=[_warmup, _cosine], milestones=[2]
     )
 
-    # Mixed precision (use new API to avoid deprecation warning)
-    scaler = torch.amp.GradScaler(device='cuda') if USE_MIXED_PRECISION else None
+    # fp16 mixed precision (Turing GPUs have no bf16 tensor core path); GradScaler
+    # guards against fp16 underflow during backward.
+    scaler = torch.amp.GradScaler(device="cuda", enabled=USE_MIXED_PRECISION)
 
     best_val = None
     patience_ctr = 0
@@ -172,11 +175,11 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", 
                    mininterval=30.0)  
         for step, batch in enumerate(pbar):
-            images = batch['image'].to(DEVICE)
+            images = batch['image'].to(DEVICE, memory_format=torch.channels_last)
             boxes = [b.to(DEVICE) if b.numel() > 0 else torch.empty((0, 4), device=DEVICE) for b in batch.get('boxes', [])]
             labels = [l.to(DEVICE) if l.numel() > 0 else torch.empty((0,), dtype=torch.long, device=DEVICE) for l in batch.get('labels', [])]
-            
-            with torch.amp.autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
+
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=USE_MIXED_PRECISION):
                 # Single forward pass
                 features = backbone(images)  # (B, 32, H/8, W/8)
                 outputs = detector(features)  # Returns dict with 'heatmap' (raw logits), 'bbox', etc.
@@ -327,13 +330,6 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
     print(f"Best checkpoint: {checkpoint_dir / 'detector_best.pt'}")
     print(f"{'='*60}\n")
 
-    if SAM2_PROPOSALS_PREPROCESSING:
-        from preprocess_sam2_proposals import run_preprocessing as _run_sam2_proposals
-        _run_sam2_proposals(
-            detector_ckpt=checkpoint_dir / "detector_best.pt",
-            splits=["train", "val"],
-        )
-
     return backbone, detector
 
 def train(args=None):
@@ -391,6 +387,11 @@ def train(args=None):
         patience=STAGE1_EARLY_STOPPING_PATIENCE,
         resume_ckpt=Path(parsed.resume) if parsed.resume else None,
     )
+    if SAM2_PROPOSALS_PREPROCESSING:
+        _run_sam2_proposals(
+            detector_ckpt=CHECKPOINT_DIR / "stage1_detection" / "detector_best.pt",
+            splits=["train", "val"],
+        )
 
 if __name__ == "__main__":
     train()

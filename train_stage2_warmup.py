@@ -16,7 +16,7 @@ from config import (
     BACKBONE_BASE_FEATURES,
     DATA_DIR,
     DEVICE,
-    BATCH_SIZE,
+    STAGE2_BATCH_SIZE,
     FREEZE_BACKBONE,
     FREEZE_DETECTOR,
     NUM_WORKERS,
@@ -226,7 +226,7 @@ def build_stage2_dataloaders(vocab: VocabManager):
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=STAGE2_BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
         collate_fn=partial(collate_fn, pad_id=pad_id),
@@ -237,7 +237,7 @@ def build_stage2_dataloaders(vocab: VocabManager):
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=STAGE2_BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
         collate_fn=partial(collate_fn, pad_id=pad_id),
@@ -307,7 +307,7 @@ def build_stage2_model(
 
         use_aux_head=STAGE2_USE_AUX_HEAD,
         dropout=STAGE2_DROPOUT_RATE,
-    ).to(DEVICE)
+    ).to(DEVICE, memory_format=torch.channels_last) # type: ignore
 
     if FREEZE_BACKBONE:
         for p in model.backbone.parameters():
@@ -508,7 +508,7 @@ def validate_stage2(
     ):
         if max_batches is not None and batch_idx >= int(max_batches):
             break
-        images = batch["image"].to(DEVICE, non_blocking=True)
+        images = batch["image"].to(DEVICE, non_blocking=True, memory_format=torch.channels_last)
         text_ids = batch["text_ids"]
         if text_ids is None:
             continue
@@ -519,28 +519,29 @@ def validate_stage2(
         gt_boxes_list = move_gt_lists_to_device(batch["boxes"], dtype=torch.float32)
         gt_labels_list = move_gt_lists_to_device(batch["labels"], dtype=torch.long)
 
-        outputs = model.encode_images(images=images, orientations=orientations)
+        with torch.cuda.amp.autocast(enabled=USE_MIXED_PRECISION and str(DEVICE).startswith("cuda"), dtype=torch.float16):
+            outputs = model.encode_images(images=images, orientations=orientations)
 
-        refine_targets = build_refinement_targets(
-            coarse_boxes=outputs["roi_boxes"],
-            roi_mask=outputs["roi_mask"],
-            gt_boxes_list=gt_boxes_list,
-            gt_labels_list=gt_labels_list,
-            pos_iou_thresh=STAGE2_REFINE_POS_IOU,
-            neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
-            use_hungarian=STAGE2_USE_HUNGARIAN,
-        )
-
-        if STAGE2_DEBUG_BATCH_STATS:
-            log_stage2_batch_debug(
-                phase="val",
-                epoch=None,
-                batch_idx=batch_idx,
+            refine_targets = build_refinement_targets(
+                coarse_boxes=outputs["roi_boxes"],
                 roi_mask=outputs["roi_mask"],
-                refine_targets=refine_targets,
+                gt_boxes_list=gt_boxes_list,
+                gt_labels_list=gt_labels_list,
+                pos_iou_thresh=STAGE2_REFINE_POS_IOU,
+                neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
+                use_hungarian=STAGE2_USE_HUNGARIAN,
             )
 
-        losses = _compute_losses(outputs, refine_targets, phase_settings)
+            if STAGE2_DEBUG_BATCH_STATS:
+                log_stage2_batch_debug(
+                    phase="val",
+                    epoch=None,
+                    batch_idx=batch_idx,
+                    roi_mask=outputs["roi_mask"],
+                    refine_targets=refine_targets,
+                )
+
+            losses = _compute_losses(outputs, refine_targets, phase_settings)
 
         if STAGE2_DEBUG_AUX_ALIGNMENT and batch_idx == 0:
             _debug_aux_alignment(
@@ -629,7 +630,9 @@ def train_stage2_hybrid(
         eta_min=1e-6,
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=USE_MIXED_PRECISION) if USE_MIXED_PRECISION and str(DEVICE).startswith("cuda") else None
+    # fp16 mixed precision (Turing GPUs have no bf16 tensor core path); GradScaler
+    # guards against fp16 underflow during backward.
+    scaler = torch.cuda.amp.GradScaler(enabled=USE_MIXED_PRECISION and str(DEVICE).startswith("cuda"))
 
     best_val = None
     best_val_metrics = None
@@ -670,7 +673,7 @@ def train_stage2_hybrid(
         )
 
         for step, batch in enumerate(pbar):
-            images = batch["image"].to(DEVICE, non_blocking=True)
+            images = batch["image"].to(DEVICE, non_blocking=True, memory_format=torch.channels_last)
             text_ids = batch["text_ids"]
             if text_ids is None:
                 continue
@@ -680,7 +683,7 @@ def train_stage2_hybrid(
             gt_boxes_list = move_gt_lists_to_device(batch["boxes"], dtype=torch.float32)
             gt_labels_list = move_gt_lists_to_device(batch["labels"], dtype=torch.long)
 
-            with torch.cuda.amp.autocast(enabled=USE_MIXED_PRECISION and str(DEVICE).startswith("cuda")):
+            with torch.cuda.amp.autocast(enabled=USE_MIXED_PRECISION and str(DEVICE).startswith("cuda"), dtype=torch.float16):
                 outputs = model.encode_images(images=images, orientations=orientations)
 
                 refine_targets = build_refinement_targets(

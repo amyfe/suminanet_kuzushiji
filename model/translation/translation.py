@@ -22,20 +22,31 @@ Usage
 Result dict keys
 ----------------
   classical_japanese, normalized_japanese, normalization_method,
-  normalization_notes, modern_japanese, conversion_notes,
-  english_translation, translation_notes,
+  normalization_notes, modern_japanese, conversion_notes, conversion_truncated,
+  english_translation, translation_notes, translation_truncated,
   usage: {input_tokens, output_tokens, total_tokens}
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import math
 import re
+import statistics
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
+from config import (
+    FURIGANA_MIN_RUN_LENGTH,
+    KURONET_CONTEXT_BLOCK_GAP_FACTOR,
+    TRANSLATION_MAX_INPUT_CHARS,
+    TRANSLATION_UNCERTAIN_SCORE_THRESH,
+)
 from model.translation.anthropic import ClaudeTranslator
 from model.translation.mecab_normalizer import HistoricalJapaneseNormalizer
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -45,14 +56,71 @@ from model.translation.mecab_normalizer import HistoricalJapaneseNormalizer
 _HIRAGANA = "ぁ-ゖ"
 _KATAKANA = "ァ-ヶ"
 
+_FURIGANA_RUN_RE = re.compile(
+    r"(?<=[一-鿿㐀-䶿])([" + _HIRAGANA + _KATAKANA + r"]{" + str(FURIGANA_MIN_RUN_LENGTH) + r",})(?=[一-鿿㐀-䶿])"
+)
+
 
 def _strip_furigana_heuristic(text: str) -> str:
-    """Remove isolated kana sandwiched between kanji (likely OCR furigana noise)."""
-    return re.sub(
-        r"(?<=[一-鿿㐀-䶿])([" + _HIRAGANA + _KATAKANA + r"])(?=[一-鿿㐀-䶿])",
-        "",
-        text,
-    )
+    """Flag runs of FURIGANA_MIN_RUN_LENGTH+ kana sandwiched between kanji as
+    possible furigana (likely OCR noise), rather than silently deleting them.
+
+    A single kana between kanji is left untouched — it's more likely a
+    grammatical particle/okurigana than a furigana gloss. Every match is
+    logged and replaced with a "[furigana?:...]" marker instead of being
+    removed, so nothing is silently lost from the text; the Claude prompt
+    explains the marker so it can use judgement on flagged spans.
+    """
+    def _mark(m: "re.Match[str]") -> str:
+        run = m.group(1)
+        logger.info("Possible furigana run marked: %r at offset %d", run, m.start(1))
+        return f"[furigana?:{run}]"
+
+    return _FURIGANA_RUN_RE.sub(_mark, text)
+
+
+def _detect_block_breaks(chars: List[Dict], gap_factor: float) -> set:
+    """Indices into chars/classical_text where a new independent text block
+    starts. Reimplements the median-gap heuristic from _compute_block_ids()
+    in model/kuronet/kuronet_recognizer.py in plain Python (this module
+    stays torch-free) — keep the two in sync if the heuristic changes.
+    """
+    if len(chars) < 2:
+        return set()
+    centres = [
+        ((c["box"][0] + c["box"][2]) / 2.0, (c["box"][1] + c["box"][3]) / 2.0)
+        for c in chars
+    ]
+    dists = [
+        math.hypot(centres[i + 1][0] - centres[i][0], centres[i + 1][1] - centres[i][1])
+        for i in range(len(centres) - 1)
+    ]
+    median = statistics.median(dists)
+    if median <= 1e-6:
+        return set()
+    return {i + 1 for i, d in enumerate(dists) if d > gap_factor * median}
+
+
+def _build_llm_text(text: str, chars: List[Dict], uncertain_threshold: float, block_gap_factor: float) -> str:
+    """Build the LLM-facing text: insert "｜" at detected text-block
+    boundaries and wrap OCR-uncertain characters as "[char:NN%]".
+
+    `chars` must be positionally 1:1 with `text` (guaranteed by
+    run_inference()'s chars_out). The two transforms are combined into a
+    single pass since inserting either kind of token would break the index
+    alignment the other one needs.
+    """
+    breaks = _detect_block_breaks(chars, block_gap_factor)
+    out = []
+    for i, (ch, c) in enumerate(zip(text, chars)):
+        if i in breaks:
+            out.append("｜")
+        score = c.get("score", 1.0)
+        if score < uncertain_threshold:
+            out.append(f"[{ch}:{score * 100:.0f}%]")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _preprocess(text: str, strip_furigana: bool = True) -> str:
@@ -132,16 +200,52 @@ class EdoPeriodTranslationPipeline:
         classical_text: str,
         strip_furigana: bool = True,
         normalize_historical: bool = True,
+        chars: Optional[List[Dict]] = None,
     ) -> Dict:
+        if chars:
+            actual = "".join(c.get("char", "") for c in chars)
+            if actual != classical_text:
+                logger.warning(
+                    "chars misaligned with classical_text (len %d vs %d); "
+                    "ignoring chars for this request.",
+                    len(actual), len(classical_text),
+                )
+                chars = None
+
+        # Plain track: always derived from the raw, un-annotated text.
+        # Feeds classical_japanese/normalized_japanese (display fields) and
+        # the classical_text= reference context for the English-translation
+        # call. Unaffected by confidence annotation.
         cleaned = _preprocess(classical_text, strip_furigana=strip_furigana)
+
+        if len(cleaned) > TRANSLATION_MAX_INPUT_CHARS:
+            raise ValueError(
+                f"Input text too long ({len(cleaned)} chars, max "
+                f"{TRANSLATION_MAX_INPUT_CHARS}). Split into smaller sections "
+                "and translate separately."
+            )
 
         # Step 0: MeCab + UniDic normalization
         if normalize_historical:
             norm = self._normalizer.normalize(cleaned)
-            text_for_llm = norm.normalized
         else:
             norm = None
-            text_for_llm = cleaned
+
+        # LLM-input track: only for the classical_to_modern call. When chars
+        # are available, annotate uncertain characters onto the raw text
+        # first (preserves strict 1:1 alignment with chars), then apply
+        # furigana-marking on top. MeCab normalization is intentionally
+        # skipped for this call — its orthBase substitution can change
+        # character identity, and its behavior on injected ASCII/bracket
+        # annotations is unvalidated. The plain `norm` above still populates
+        # normalized_japanese/normalization_method for display.
+        if chars:
+            annotated = _build_llm_text(
+                classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, KURONET_CONTEXT_BLOCK_GAP_FACTOR
+            )
+            text_for_llm = _preprocess(annotated, strip_furigana=strip_furigana)
+        else:
+            text_for_llm = norm.normalized if norm else cleaned
 
         # Step 1: classical → modern Japanese
         modern, modern_usage = self._translator.classical_to_modern(text_for_llm)
@@ -158,8 +262,10 @@ class EdoPeriodTranslationPipeline:
             "normalization_notes":  norm.notes if norm else "",
             "modern_japanese":      modern["modern_japanese"],
             "conversion_notes":     modern.get("notes", ""),
+            "conversion_truncated": modern.get("truncated", False),
             "english_translation":  translation["english_translation"],
             "translation_notes":    translation.get("translation_notes", ""),
+            "translation_truncated": translation.get("truncated", False),
             "usage":                _sum_usage(modern_usage, english_usage),
         }
 

@@ -35,6 +35,7 @@ const Home = ({ intent, onIntentHandled }) => {
   const [translation, setTranslation] = useState('')
   const [modernJapanese, setModernJapanese] = useState('')
   const [translationNotes, setTranslationNotes] = useState('')
+  const [normalizationMethod, setNormalizationMethod] = useState('')
   const [transcribing, setTranscribing] = useState(false)
   const [translating, setTranslating] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -54,12 +55,18 @@ const Home = ({ intent, onIntentHandled }) => {
     onIntentHandled()
   }, [intent])
 
+  function handleTranscriptionChange(value) {
+    setTranscription(value)
+    setChars([])
+  }
+
   function resetResults() {
     setChars([])
     setTranscription('')
     setTranslation('')
     setModernJapanese('')
     setTranslationNotes('')
+    setNormalizationMethod('')
   }
 
   function handleFile(file) {
@@ -78,6 +85,7 @@ const Home = ({ intent, onIntentHandled }) => {
     setTranslation('')
     setModernJapanese('')
     setTranslationNotes('')
+    setNormalizationMethod('')
     setView('workspace')
     window.scrollTo({ top: 0 })
   }
@@ -107,16 +115,18 @@ const Home = ({ intent, onIntentHandled }) => {
     setTranslation('')
     setModernJapanese('')
     setTranslationNotes('')
+    setNormalizationMethod('')
     try {
       const res = await fetch('/api/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: transcription }),
+        body: JSON.stringify({ text: transcription, chars }),
       })
       const data = await res.json()
       setTranslation(data.english_translation)
       setModernJapanese(data.modern_japanese || '')
       setTranslationNotes(data.translation_notes || '')
+      setNormalizationMethod(data.normalization_method || '')
     } catch {
       setTranslation('Error: could not reach translation API.')
     } finally {
@@ -283,12 +293,13 @@ const Home = ({ intent, onIntentHandled }) => {
           <TranscriptionPanel
             transcription={transcription}
             chars={chars}
-            onTranscriptionChange={setTranscription}
+            onTranscriptionChange={handleTranscriptionChange}
             onTranslate={translate}
             translating={translating}
             translation={translation}
             modernJapanese={modernJapanese}
             translationNotes={translationNotes}
+            normalizationMethod={normalizationMethod}
             onCopy={copyResult}
             onDownload={downloadTxt}
             copyLabel={copied ? 'Copied ✓' : 'Copy text'}

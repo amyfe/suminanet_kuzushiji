@@ -260,7 +260,7 @@ def validate_detector(unet, detector, dataloader, device, use_mixed_precision, b
     num_batches = 0
 
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validating", leave=False)):
-        images = batch["image"].to(device)
+        images = batch["image"].to(device, memory_format=torch.channels_last)
         boxes = [
             b.to(device) if b.numel() > 0 else torch.empty((0, 4), device=device)
             for b in batch.get("boxes", [])
@@ -272,7 +272,7 @@ def validate_detector(unet, detector, dataloader, device, use_mixed_precision, b
             for l in batch.get("labels", [])
         ]
 
-        with torch.amp.autocast(device_type="cuda", enabled=use_mixed_precision):
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_mixed_precision):
             features = unet(images)
             _, _, hf, wf = features.shape
             gt_heat, gt_bbox, gt_bbox_mask, _ = build_detection_targets(

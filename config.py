@@ -38,7 +38,8 @@ IMAGE_SIZE = (512, 512)
 USE_MIXED_PRECISION = True
 NUM_WORKERS = 8
 
-BATCH_SIZE = 32
+STAGE1_BATCH_SIZE = 32
+STAGE2_BATCH_SIZE = 8
 GRADIENT_ACCUMULATION_STEPS = 1
 GRAD_CLIP = 1.0
 
@@ -116,9 +117,9 @@ STAGE2_DROPOUT_RATE = 0.15
 # -------------------------
 
 DET_SCORE_THRESH = 0.65
-DET_TOP_K = 500
-DET_NMS_IOU = 0.6
-DET_MIN_BOX_SIZE = 2.0
+DET_TOP_K = 700
+DET_NMS_IOU = 0.6454054005824295
+DET_MIN_BOX_SIZE = 1.0539268301125129
 
 # -------------------------
 # Shared feature projection
@@ -167,7 +168,7 @@ STAGE2_CONTEXT_NUM_LAYERS = 2
 # Unidirectional GRU: the sequence is already in reading order (right→left columns, top→bottom).
 # The backward GRU pass of a BiGRU only learns reversed reading order — trivial and wastes 50%
 # of context capacity. "gru" = forward only; "bigru" = bidirectional.
-STAGE2_CONTEXT_MODE = "bigru"
+STAGE2_CONTEXT_MODE = "gru"
 
 # -------------------------
 # Loss Functions
@@ -235,14 +236,20 @@ KURONET_CROP_ENCODER_SIZE    = (112, 112)
 KURONET_FREEZE_CROP_ENCODER       = False  # start unfrozen
 KURONET_FREEZE_CROP_ENCODER_AFTER = 5      # freeze EfficientNet-B0 weights after this epoch
 # A dense page of Kuzushiji can yield hundreds of ROIs per image; with
-# BATCH_SIZE=4 and DET_TOP_K up to 500, a single training batch can produce
-# ~1500+ crops. Running all of them through EfficientNet-B0 in one unchunked
-# forward call (with gradients, while unfrozen) can exceed a 16GB GPU. Process
-# crops through the encoder in chunks of this size instead — bounds peak
-# memory independent of how many ROIs a batch happens to contain. Note this
-# changes BatchNorm statistics from "computed over all N crops" to "computed
-# per chunk" during training (eval-mode BN uses running stats, unaffected).
-KURONET_CROP_ENCODER_CHUNK_SIZE   = 256
+# STAGE2_BATCH_SIZE=8 and DET_TOP_K up to 500, a single training batch can
+# produce ~4000 crops. When unfrozen (gradients flowing through EfficientNet-
+# B0), ROICropEncoder only avoids exceeding this value by wrapping each chunk
+# in torch.utils.checkpoint -- trading recompute (redoing each chunk's
+# forward pass during backward) for staying under it. That tradeoff was
+# tuned for a 16GB GPU; on larger GPUs, set this high enough to comfortably
+# exceed a batch's typical ROI count (n_valid <= chunk_size) so the *frozen*
+# no_grad path also stays a single unchunked call, and more importantly the
+# *unfrozen* path skips checkpointing's recompute overhead entirely -- pure
+# memory-for-speed trade once memory isn't the binding constraint. Note this
+# still changes BatchNorm statistics from "computed over all N crops" to
+# "computed per chunk" whenever a batch's ROI count does exceed this value
+# (eval-mode BN uses running stats, unaffected either way).
+KURONET_CROP_ENCODER_CHUNK_SIZE   = 4096
 # Pool output size: the AdaptiveAvgPool2d target after the conv layers, before the MLP.
 # This is DISTINCT from STAGE2_ROI_SIZE:
 #   ROI_SIZE    = how finely tv_roi_align samples from the feature map (conv input resolution)
@@ -256,7 +263,7 @@ KURONET_ROI_POOL_OUTPUT_SIZE = (4, 4)
 # Intentionally lower than DET_SCORE_THRESH (Stage 1 validation threshold):
 # KuroNet's classifier filters the expanded candidate set, so casting a wider
 # net here trades a few extra FP proposals for better GT recall.
-KURONET_DET_SCORE_THRESH     = 0.26
+KURONET_DET_SCORE_THRESH     = 0.33821750481132784
 
 # Box delta smoothing: tanh-scaled dx/dy and dw/dh in ROIRefinementHead.
 # Larger values allow bigger shifts per step but destabilize early training.
@@ -273,10 +280,10 @@ KURONET_FURIGANA_MIN_SAMPLES = 5
 
 KURONET_LAMBDA_CHAR          = 1.0         
 KURONET_LAMBDA_BOX           = 0.0         
-KURONET_LAMBDA_DELTA         = 0.75        
-KURONET_LAMBDA_SCORE         = 0.20        
-KURONET_BG_WEIGHT            = 0.1         
-KURONET_STRONG_BG_WEIGHT     = 0.45        
+KURONET_LAMBDA_DELTA         = 0.3391212189425109       
+KURONET_LAMBDA_SCORE         = 0.25001127318731137        
+KURONET_BG_WEIGHT            = 0.06213050022661147         
+KURONET_STRONG_BG_WEIGHT     = 0.185146        
 KURONET_BG_SCORE_GATE        = 0.55
 
 # Minimum sigmoid(refine_score) for a box to "anchor" column/row geometry in
@@ -292,18 +299,18 @@ KURONET_READING_ORDER_CONFIDENCE = 0.5
 # sigmoid(logit(0.5)) = 0.5 — identical to the old hardcoded constant at init time.
 KURONET_RESIDUAL_SCALE_INIT  = 0.5
 
-KURONET_FOCAL_GAMMA          = 1.0
+KURONET_FOCAL_GAMMA          = 1.203618254887657
 
 KURONET_RARE_CHAR_THRESH     = 50
 
-KURONET_HARD_NEG_WEIGHT      = 1.5   
+KURONET_HARD_NEG_WEIGHT      = 1.231901422995889   
 KURONET_HARD_NEG_TOP_K       = 20    
-KURONET_LAMBDA_SCRIPT        = 0.15
+KURONET_LAMBDA_SCRIPT        = 0.2627635863899684
 
 # Optimizer
-KURONET_LR                   = 1.5e-4
+KURONET_LR                   = 0.0004789618199206086
 KURONET_LR_ETA_MIN           = 1e-6       
-KURONET_WEIGHT_DECAY         = 5e-4       # was 9.4e-5; raised to fight overfitting
+KURONET_WEIGHT_DECAY         = 0.0003042318888471685
 
 # Training
 KURONET_EPOCHS               = 50
@@ -334,3 +341,45 @@ SAM2_ILLUS_PRED_IOU_THRESH  = 0.85
 SAM2_ILLUS_STABILITY_THRESH = 0.90
 SAM2_PROPOSALS_PREPROCESSING = True
 SAM2_PROPOSALS_DIR = ROOT / "assets/sam2_proposals"
+
+# ============================================================
+# Translation Pipeline (Claude API resilience + OCR-confidence handling)
+# ============================================================
+
+# SDK-native retry/timeout for both the OpenRouter (openai) and direct
+# Anthropic clients in ClaudeTranslator. Both SDKs already retry
+# connection errors / 408 / 409 / 429 / 5xx with exponential backoff.
+TRANSLATION_API_MAX_RETRIES = 3
+TRANSLATION_API_TIMEOUT_SEC = 30.0
+
+# Chars reaching translate_text() already survived KURONET_CER_SCORE_THRESH
+# (0.35) upstream in run_inference(); this is a second, softer "still shaky"
+# bar used to bracket-annotate individual characters for Claude.
+TRANSLATION_UNCERTAIN_SCORE_THRESH = 0.6
+
+# Minimum run length of kana between kanji before it's flagged as possible
+# furigana (a single kana between kanji is more likely grammatical).
+FURIGANA_MIN_RUN_LENGTH = 2
+
+# Output token budget for classical_to_modern / translate_to_english: scaled
+# from input character count instead of a fixed 2000, so dense pages/long
+# scholarly notes don't get silently truncated. Clamped to [FLOOR, CEILING].
+TRANSLATION_MAX_TOKENS_FLOOR = 2000
+TRANSLATION_MAX_TOKENS_CEILING = 8000
+TRANSLATION_MAX_TOKENS_CHARS_MULTIPLIER = 4
+
+# Character-count proxy for Claude's ~1500-input-token guidance (no local
+# tokenizer available; CJK text tokenizes close enough to 1:1 that a char
+# count is a reasonable, cheap stand-in). translate_text() rejects longer
+# inputs rather than silently truncating context.
+TRANSLATION_MAX_INPUT_CHARS = 1500
+
+# ============================================================
+# Backend API — Rate Limiting
+# ============================================================
+
+# Per-IP sliding-window limit on /api/translate specifically — this endpoint
+# spends paid Claude API quota. /api/transcribe (GPU-cost, no external API
+# cost) is a separate concern, tracked as pipeline_analysis.txt item 6.3.
+TRANSLATE_RATE_LIMIT_MAX_REQUESTS = 5
+TRANSLATE_RATE_LIMIT_WINDOW_SECONDS = 600

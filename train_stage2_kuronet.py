@@ -15,8 +15,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
+import os
 import sys
 import time
 from collections import Counter
@@ -25,14 +27,16 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from config import (
     BACKBONE_BASE_FEATURES,
-    BATCH_SIZE,
+    STAGE2_BATCH_SIZE,
     CHECKPOINT_DIR,
     DATA_DIR,
     DEVICE,
@@ -143,7 +147,7 @@ def load_vocab() -> VocabManager:
     return VocabManager.from_annotations(ann_files)
 
 
-def build_dataloaders(vocab: VocabManager):
+def build_dataloaders(vocab: VocabManager, world_size: int = 1):
     pad_id = vocab.pad_id
 
     # Compute training-split character frequencies for Options A and B.
@@ -184,9 +188,18 @@ def build_dataloaders(vocab: VocabManager):
         threshold=KURONET_RARE_CHAR_THRESH,
         boost_scale=1.5,
     )
+    # Under DDP, each rank gets its own independent WeightedRandomSampler
+    # rather than a DistributedSampler wrapping a shared weighting scheme --
+    # PyTorch has no built-in DistributedWeightedRandomSampler, and since
+    # replacement=True already means this isn't a strict one-full-pass
+    # shuffle, per-rank independent weighted sampling is a reasonable, low-
+    # risk simplification. num_samples is a fixed Python int identical on
+    # every rank, which is what actually keeps len(train_loader) (and thus
+    # collective-op step counts) in lockstep across ranks -- not the
+    # replacement semantics.
     sampler = WeightedRandomSampler(
         weights=sample_weights,
-        num_samples=len(train_dataset),
+        num_samples=len(train_dataset) // world_size,
         replacement=True,
     )
     print(
@@ -196,7 +209,7 @@ def build_dataloaders(vocab: VocabManager):
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=STAGE2_BATCH_SIZE,
         sampler=sampler,         # replaces shuffle=True
         num_workers=NUM_WORKERS,
         collate_fn=partial(collate_fn, pad_id=pad_id),
@@ -206,7 +219,7 @@ def build_dataloaders(vocab: VocabManager):
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=STAGE2_BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
         collate_fn=partial(collate_fn, pad_id=pad_id),
@@ -292,7 +305,7 @@ def build_kuronet_model(
         crop_encoder_size=KURONET_CROP_ENCODER_SIZE,
         freeze_crop_encoder=KURONET_FREEZE_CROP_ENCODER,
         crop_encoder_chunk_size=KURONET_CROP_ENCODER_CHUNK_SIZE,
-    ).to(DEVICE)
+    ).to(DEVICE, memory_format=torch.channels_last)
 
     if FREEZE_BACKBONE:
         for p in model.backbone.parameters():
@@ -791,33 +804,34 @@ def validate_kuronet(
             if max_batches is not None and batch_idx >= max_batches:
                 break
 
-            images         = batch["image"].to(DEVICE, non_blocking=True)
+            images         = batch["image"].to(DEVICE, non_blocking=True, memory_format=torch.channels_last)
             boxes_list     = [b.to(DEVICE, dtype=torch.float32) for b in batch["boxes"]]
             gt_labels_list = [l.to(DEVICE, dtype=torch.long) for l in batch["labels"]]
             orientations   = [
                 _normalize_orientation_label(o) for o in batch["orientations"]
             ]
 
-            sam2_boxes, sam2_scores = None, None
-            if sam2_dir is not None:
-                stems = batch.get("image_stems", [])
-                sam2_boxes, sam2_scores = _load_sam2_proposals(stems, sam2_dir, torch.device(DEVICE))
-            outputs = model(images, orientations, sam2_boxes, sam2_scores)
+            with torch.cuda.amp.autocast(enabled=USE_MIXED_PRECISION, dtype=torch.float16):
+                sam2_boxes, sam2_scores = None, None
+                if sam2_dir is not None:
+                    stems = batch.get("image_stems", [])
+                    sam2_boxes, sam2_scores = _load_sam2_proposals(stems, sam2_dir, torch.device(DEVICE))
+                outputs = model(images, orientations, sam2_boxes, sam2_scores)
 
-            # Build refinement targets in original box order
-            refine_targets = build_refinement_targets(
-                coarse_boxes=outputs["roi_boxes"],
-                roi_mask=outputs["roi_mask"],
-                gt_boxes_list=boxes_list,
-                gt_labels_list=gt_labels_list,
-                pos_iou_thresh=STAGE2_REFINE_POS_IOU,
-                neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
-                ignore_label_ids=[vocab.unk_id],
-                use_hungarian=STAGE2_USE_HUNGARIAN,
-            )
+                # Build refinement targets in original box order
+                refine_targets = build_refinement_targets(
+                    coarse_boxes=outputs["roi_boxes"],
+                    roi_mask=outputs["roi_mask"],
+                    gt_boxes_list=boxes_list,
+                    gt_labels_list=gt_labels_list,
+                    pos_iou_thresh=STAGE2_REFINE_POS_IOU,
+                    neg_iou_thresh=STAGE2_REFINE_NEG_IOU,
+                    ignore_label_ids=[vocab.unk_id],
+                    use_hungarian=STAGE2_USE_HUNGARIAN,
+                )
 
-            loss, parts = compute_kuronet_loss(outputs, refine_targets, bg_id=bg_id, vocab=vocab,
-                                              vocab_weights=vocab_weights)
+                loss, parts = compute_kuronet_loss(outputs, refine_targets, bg_id=bg_id, vocab=vocab,
+                                                  vocab_weights=vocab_weights)
             total_loss += float(loss.item())
             for k in loss_parts:
                 loss_parts[k] += float(parts[k].item())
@@ -1279,12 +1293,15 @@ def train_epoch(
     hard_neg_pairs: Optional[set] = None,
     vocab_weights: Optional[torch.Tensor] = None,
     sam2_dir: Optional[Path] = None,
+    is_distributed: bool = False,
+    disable_tqdm: bool = False,
 ) -> dict:
     model.train()
+    raw_model = model.module if is_distributed else model
     if FREEZE_BACKBONE:
-        model.backbone.eval()
+        raw_model.backbone.eval()
     if FREEZE_DETECTOR:
-        model.detector.eval()
+        raw_model.detector.eval()
 
     bg_id = vocab.bg_id if hasattr(vocab, "bg_id") and vocab.BG_TOKEN in vocab.char2id else None
 
@@ -1301,7 +1318,7 @@ def train_epoch(
     bar = tqdm(
         train_loader,
         desc=f"Epoch {epoch}",
-        disable=not KURONET_ENABLE_TQDM,
+        disable=disable_tqdm or not KURONET_ENABLE_TQDM,
         dynamic_ncols=True,
     )
 
@@ -1313,14 +1330,14 @@ def train_epoch(
         t0 = _sync()
         t_data += t0 - t_batch_start   # time the dataloader took to produce this batch
 
-        images         = batch["image"].to(DEVICE, non_blocking=True)
+        images         = batch["image"].to(DEVICE, non_blocking=True, memory_format=torch.channels_last)
         boxes_list     = [b.to(DEVICE, dtype=torch.float32) for b in batch["boxes"]]
         gt_labels_list = [l.to(DEVICE, dtype=torch.long) for l in batch["labels"]]
         orientations   = [_normalize_orientation_label(o) for o in batch["orientations"]]
         t1 = _sync()
         t_transfer += t1 - t0
 
-        with torch.cuda.amp.autocast(enabled=USE_MIXED_PRECISION):
+        with torch.cuda.amp.autocast(enabled=USE_MIXED_PRECISION, dtype=torch.float16):
             # If SAM2 proposals are available for this batch, bypass the frozen detector.
             sam2_boxes, sam2_scores = None, None
             if sam2_dir is not None:
@@ -1346,24 +1363,45 @@ def train_epoch(
             # No ROI proposals survived for any sample in this batch (e.g. an
             # aggressive det_score_thresh filtered everything out) -> every loss
             # term below would fall back to a disconnected zero tensor with no
-            # grad_fn, crashing backward(). Nothing to supervise, so skip it.
-            if not refine_targets["refine_pos_mask"].any() and not refine_targets["refine_neg_mask"].any():
+            # grad_fn, crashing backward(). Nothing to supervise.
+            batch_empty = not refine_targets["refine_pos_mask"].any() and not refine_targets["refine_neg_mask"].any()
+
+            if batch_empty and not is_distributed:
+                # Single-process: skipping backward() here is just an
+                # efficiency win, nothing else depends on every step running.
                 t_batch_start = _sync()
                 continue
-
-            loss, parts = compute_kuronet_loss(
-                outputs, refine_targets, bg_id=bg_id, hn_keys=hn_keys, vocab=vocab,
-                vocab_weights=vocab_weights,
-            )
+            elif batch_empty:
+                # Under DDP, skipping backward() here would desync ranks that
+                # hit this on different batches (each rank draws data
+                # independently), hanging the all-reduce for any rank that DID
+                # call backward() this step. Substitute a zero-valued but
+                # graph-connected loss touching every trainable parameter so
+                # every rank always calls backward() the same number of times.
+                loss = images.new_zeros(())
+                for p in model.parameters():
+                    if p.requires_grad:
+                        loss = loss + p.sum() * 0.0
+                parts = {k: loss.detach() for k in loss_parts}
+            else:
+                loss, parts = compute_kuronet_loss(
+                    outputs, refine_targets, bg_id=bg_id, hn_keys=hn_keys, vocab=vocab,
+                    vocab_weights=vocab_weights,
+                )
             loss = loss / grad_accum_steps
             t4 = _sync()
             t_loss += t4 - t3
 
-        scaler.scale(loss).backward()
+        sync_now = (batch_idx + 1) % grad_accum_steps == 0
+        backward_ctx = (
+            contextlib.nullcontext() if (sync_now or not is_distributed) else model.no_sync()
+        )
+        with backward_ctx:
+            scaler.scale(loss).backward()
         t5 = _sync()
         t_backward += t5 - t4
 
-        if (batch_idx + 1) % grad_accum_steps == 0:
+        if sync_now:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             scaler.step(optimizer)
@@ -1461,6 +1499,24 @@ def main():
     if getattr(args, "no_warmup", False):
         args.warmup_ckpt = None
 
+    # --- Distributed setup (torchrun sets these env vars automatically) ---
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_distributed = world_size > 1
+    if is_distributed:
+        # Must run before any .to(DEVICE)/model construction: every bare
+        # "cuda" string in this file resolves to "this process's current
+        # device", which is only correct once set_device has run.
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group("nccl")
+
+    # Non-zero ranks stay silent: one rank's worth of logs/progress bars,
+    # not world_size copies racing on the same log file / interleaving stdout.
+    if is_distributed and rank != 0:
+        sys.stdout = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w")
+
     # Setup logging — tee stdout so every print() also lands in the log file
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True, parents=True)
@@ -1502,7 +1558,7 @@ def main():
     KURONET_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
     vocab = load_vocab()
-    train_loader, val_loader = build_dataloaders(vocab)
+    train_loader, val_loader = build_dataloaders(vocab, world_size=world_size)
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
     # Pre-compute per-class focal loss weights (Clanuwat-inspired: kanji needs more gradient)
@@ -1546,6 +1602,14 @@ def main():
     print(f"Trainable params: {sum(p.numel() for p in trainable_params):,}")
     print("=" * 70)
 
+    if is_distributed:
+        # Must wrap after set_trainable_modules: DDP snapshots which params
+        # require grad at construction time to build its reduction buckets.
+        # trainable_params above already holds direct references to the same
+        # tensor objects (DDP wraps, never clones), so the optimizer stays
+        # correctly attached regardless of wrap order relative to this line.
+        model = DistributedDataParallel(model, device_ids=[local_rank])
+
     optimizer = optim.AdamW(
         trainable_params,
         lr=args.lr,
@@ -1569,6 +1633,8 @@ def main():
         eta_min=KURONET_LR_ETA_MIN,
         last_epoch=start_epoch - 2,
     )
+    # fp16 mixed precision (Turing GPUs have no bf16 tensor core path); GradScaler
+    # guards against fp16 underflow during backward.
     scaler = torch.cuda.amp.GradScaler(enabled=USE_MIXED_PRECISION)
 
     hard_neg_path = KURONET_CHECKPOINT_DIR / "hard_neg_pairs.json"
@@ -1593,6 +1659,8 @@ def main():
             hard_neg_pairs=hard_neg_pairs,
             vocab_weights=vocab_weights,
             sam2_dir=sam2_dir,
+            is_distributed=is_distributed,
+            disable_tqdm=is_distributed and rank != 0,
         )
 
         print(
@@ -1605,74 +1673,117 @@ def main():
             f" | train_top1={train_metrics.get('train_top1', 0):.4f}"
         )
 
-        val_metrics = validate_kuronet(
-            model=model,
-            val_loader=val_loader,
-            vocab=vocab,
-            max_batches=KURONET_VALIDATION_BATCHES,
-            vocab_weights=vocab_weights,
-            sam2_dir=sam2_dir,
-        )
+        # Validation runs on rank 0 only, against the raw (unwrapped) module.
+        # DDP's forward() defaults to broadcast_buffers=True, issuing a
+        # collective on every call to keep the (still-trainable) crop
+        # encoder's BatchNorm running stats synced from rank 0 -- a solo
+        # rank-0 forward through the DDP wrapper would hang waiting for other
+        # ranks to participate. Calling the raw module directly issues no
+        # collective at all, so other ranks need no coordination here.
+        if rank == 0:
+            raw_model = model.module if is_distributed else model
+            val_metrics = validate_kuronet(
+                model=raw_model,
+                val_loader=val_loader,
+                vocab=vocab,
+                max_batches=KURONET_VALIDATION_BATCHES,
+                vocab_weights=vocab_weights,
+                sam2_dir=sam2_dir,
+            )
 
-        # Persist top-K confusion pairs for the next epoch's hard negative mining
-        new_pairs = val_metrics.pop("hard_neg_pairs", [])
-        if new_pairs:
-            with open(hard_neg_path, "w") as f:
-                json.dump(new_pairs, f)
-            print(f"Saved {len(new_pairs)} hard-negative pairs → {hard_neg_path.name}")
+            # Persist top-K confusion pairs for the next epoch's hard negative mining
+            new_pairs = val_metrics.pop("hard_neg_pairs", [])
+            if new_pairs:
+                with open(hard_neg_path, "w") as f:
+                    json.dump(new_pairs, f)
+                print(f"Saved {len(new_pairs)} hard-negative pairs → {hard_neg_path.name}")
 
         # Two-phase crop encoder freeze: unfreeze for domain adaptation, then freeze to save compute.
         # Triggered once when epoch crosses KURONET_FREEZE_CROP_ENCODER_AFTER.
+        # Depends only on the plain epoch counter (identical on every rank),
+        # so this runs unconditionally on all ranks -- no broadcast needed.
+        raw_model = model.module if is_distributed else model
         if (
             KURONET_FREEZE_CROP_ENCODER_AFTER > 0
             and epoch == KURONET_FREEZE_CROP_ENCODER_AFTER
-            and model.roi_crop_encoder is not None
-            and not model.roi_crop_encoder.freeze_encoder
+            and raw_model.roi_crop_encoder is not None
+            and not raw_model.roi_crop_encoder.freeze_encoder
         ):
-            for p in model.roi_crop_encoder.encoder.parameters():
+            for p in raw_model.roi_crop_encoder.encoder.parameters():
                 p.requires_grad_(False)
-            model.roi_crop_encoder.encoder.eval()
-            model.roi_crop_encoder.freeze_encoder = True
-            n_frozen = sum(p.numel() for p in model.roi_crop_encoder.encoder.parameters())
+            raw_model.roi_crop_encoder.encoder.eval()
+            raw_model.roi_crop_encoder.freeze_encoder = True
+            n_frozen = sum(p.numel() for p in raw_model.roi_crop_encoder.encoder.parameters())
             print(
                 f"[Epoch {epoch}] Crop encoder frozen "
                 f"({n_frozen:,} EfficientNet-B0 params removed from backprop)"
            )
+            if is_distributed:
+                # DDP's reducer/bucket bookkeeping is built once, at wrap
+                # time, from the parameters that require grad then -- a set
+                # that shrinks mid-training (like this freeze event) breaks
+                # the pre-registered all-reduce hooks and hangs. Rewrapping
+                # rebuilds that bookkeeping from scratch against the new
+                # trainable-parameter set. DDP never clones parameters (only
+                # stores a reference + broadcasts values at construction), so
+                # the optimizer's param_groups/state (keyed by tensor
+                # identity) stay validly attached across this cycle.
+                model = DistributedDataParallel(raw_model, device_ids=[local_rank])
 
-        score   = select_model_score(val_metrics)
-        is_best = score > best_score
-        if is_best:
-            best_score   = score
-            patience_ctr = 0
-        else:
-            patience_ctr += 1
+        # Scoring/checkpointing/early-stop decisions are computed on rank 0
+        # (the only rank with val_metrics); only the early-stop decision
+        # needs to reach the other ranks, since that's the only thing
+        # affecting their control flow -- they must `break` together or the
+        # job hangs on the next collective op.
+        if rank == 0:
+            score   = select_model_score(val_metrics)
+            is_best = score > best_score
+            if is_best:
+                best_score   = score
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
 
-        ckpt_state = {
-            "epoch":            epoch,
-            "model_state_dict": model.state_dict(),
-            "best_score":       best_score,
-            "patience_ctr":     patience_ctr,
-            "val_metrics":      val_metrics,
-            "train_metrics":    train_metrics,
-        }
+            raw_model = model.module if is_distributed else model
+            ckpt_state = {
+                "epoch":            epoch,
+                "model_state_dict": raw_model.state_dict(),
+                "best_score":       best_score,
+                "patience_ctr":     patience_ctr,
+                "val_metrics":      val_metrics,
+                "train_metrics":    train_metrics,
+            }
 
-        # Save epoch checkpoint (atomic write: .tmp → final path, safe on crash)
-        epoch_path = KURONET_CHECKPOINT_DIR / f"kuronet_epoch{epoch}.pt"
-        _atomic_save(ckpt_state, epoch_path)
+            # Save epoch checkpoint (atomic write: .tmp → final path, safe on crash)
+            epoch_path = KURONET_CHECKPOINT_DIR / f"kuronet_epoch{epoch}.pt"
+            _atomic_save(ckpt_state, epoch_path)
 
-        if is_best:
-            best_path = KURONET_CHECKPOINT_DIR / "kuronet_best.pt"
-            _atomic_save(ckpt_state, best_path)
-            print(f"✅ saved best: kuronet_best.pt (score={score:.4f})")
+            if is_best:
+                best_path = KURONET_CHECKPOINT_DIR / "kuronet_best.pt"
+                _atomic_save(ckpt_state, best_path)
+                print(f"✅ saved best: kuronet_best.pt (score={score:.4f})")
 
-        # Keep last 2 epoch checkpoints + best
-        prune_to_keep_last_n(KURONET_CHECKPOINT_DIR, keep=2)
+            # Keep last 2 epoch checkpoints + best
+            prune_to_keep_last_n(KURONET_CHECKPOINT_DIR, keep=2)
 
-        if KURONET_EARLY_STOPPING_PATIENCE > 0 and patience_ctr >= KURONET_EARLY_STOPPING_PATIENCE:
-            print(
-                f"Early stopping: {patience_ctr} epochs without improvement. "
-                f"best={best_score:.4f}"
+            should_stop = (
+                KURONET_EARLY_STOPPING_PATIENCE > 0
+                and patience_ctr >= KURONET_EARLY_STOPPING_PATIENCE
             )
+            if should_stop:
+                print(
+                    f"Early stopping: {patience_ctr} epochs without improvement. "
+                    f"best={best_score:.4f}"
+                )
+        else:
+            should_stop = False
+
+        if is_distributed:
+            payload = [should_stop]
+            dist.broadcast_object_list(payload, src=0)
+            should_stop = payload[0]
+
+        if should_stop:
             break
 
         scheduler.step()
@@ -1681,6 +1792,9 @@ def main():
     print(f"TRAINING COMPLETE")
     print(f"Best checkpoint: {KURONET_CHECKPOINT_DIR / 'kuronet_best.pt'}")
     print("=" * 70)
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

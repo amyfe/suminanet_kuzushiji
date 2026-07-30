@@ -2,6 +2,14 @@ import { columnsOf, columnsFromChars } from '../utils/text'
 
 const VERTICAL_TARGET_CHARS_PER_COL = 14
 
+const NORMALIZATION_LABELS = {
+  'mecab+unidic-kinsei-edo': { text: 'Normalization: MeCab + Edo-period dictionary', degraded: false },
+  'mecab+unidic':            { text: 'Normalization: MeCab + modern dictionary (Edo dictionary unavailable)', degraded: true },
+  'mecab+unidic-lite':       { text: 'Normalization: MeCab + lite dictionary (reduced accuracy)', degraded: true },
+  'heuristic':               { text: 'Normalization: heuristic only — MeCab unavailable (reduced accuracy)', degraded: true },
+  'none':                    { text: 'Normalization: skipped', degraded: false },
+}
+
 export default function TranscriptionPanel({
   transcription,
   chars,
@@ -11,6 +19,7 @@ export default function TranscriptionPanel({
   translation,
   modernJapanese,
   translationNotes,
+  normalizationMethod,
   onCopy,
   onDownload,
   copyLabel,
@@ -72,6 +81,12 @@ export default function TranscriptionPanel({
           )}
           {translationNotes && (
             <p className="result-caption">{translationNotes}</p>
+          )}
+          {normalizationMethod && NORMALIZATION_LABELS[normalizationMethod] && (
+            <p className={`result-caption${NORMALIZATION_LABELS[normalizationMethod].degraded ? ' result-caption--warn' : ''}`}>
+              {NORMALIZATION_LABELS[normalizationMethod].degraded ? '⚠ ' : ''}
+              {NORMALIZATION_LABELS[normalizationMethod].text}
+            </p>
           )}
 
           <div className="export-bar" style={{ marginTop: '1.1rem' }}>

@@ -1,24 +1,3 @@
-"""Kontextualisiert die ROI-Token-Sequenz.
-Input
-token embeddings (B, T, D_tok)
-mask (B, T)
-from torch import nn
-
-
-Output
-context states (B, T, D_ctx)
-mask (B, T)
-Empfehlung
-
-Für den ersten sauberen C-Stand:
-
-BiGRU behalten
-from torch import nn
-
-
-später optional Transformer testen
-"""
-
 # model/kuronet/context/roi_context.py
 
 from __future__ import annotations
@@ -79,13 +58,6 @@ class ROIContextEncoder(nn.Module):
         bidirectional = (mode == "bigru")
         rnn_out_dim = hidden_dim * 2 if bidirectional else hidden_dim
 
-        self.input_proj = None
-
-        # Explicit spatial bias: projects normalized (cx, cy) into token space
-        # and adds it to the sequence before the GRU. This gives the recurrent
-        # model a stable positional signal independent of reading-order index,
-        # which helps disambiguate characters with similar visual appearance
-        # that occur at different page positions (e.g. top vs. bottom of column).
         self.pos_proj = nn.Linear(2, in_dim)
 
         self.rnn = nn.GRU(
@@ -135,8 +107,6 @@ class ROIContextEncoder(nn.Module):
                 f"seq shape {tuple(seq.shape)} and mask shape {tuple(mask.shape)} are incompatible"
             )
 
-        if self.input_proj is not None:
-            seq_in = self.input_proj(seq)
         else:
             seq_in = seq
 

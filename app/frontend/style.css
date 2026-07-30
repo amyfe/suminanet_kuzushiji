@@ -251,6 +251,10 @@ a { color: inherit; }
   margin-top: 0.9rem;
 }
 
+.result-caption--warn {
+  color: var(--accent);
+}
+
 .result-modern {
   font-family: var(--font-serif);
   font-style: italic;
