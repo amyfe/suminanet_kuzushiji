@@ -1,0 +1,19 @@
+/* Only the two flags actually used by the language switcher, sourced
+   directly from flag-icons' SVGs — avoids pulling in the full library's
+   ~250-flag stylesheet for two icons. */
+
+.fi {
+  position: relative;
+  display: inline-block;
+  background-size: contain;
+  background-position: 50%;
+  background-repeat: no-repeat;
+}
+
+.fi-gb {
+  background-image: url('flag-icons/flags/4x3/gb.svg');
+}
+
+.fi-de {
+  background-image: url('flag-icons/flags/4x3/de.svg');
+}

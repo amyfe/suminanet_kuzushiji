@@ -58,6 +58,7 @@ Das wäre wieder Altlasten-Denken. Erstmal soll die Option-C-Basis stabil werden
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 import numpy as np
@@ -290,27 +291,7 @@ def build_refinement_targets(
     if ignore_label_ids is not None:
         _ignore_ids_t = torch.tensor(ignore_label_ids, dtype=torch.long, device=device)
 
-    for b in range(bsz):
-        valid_t = int(roi_mask[b].sum().item())
-        if valid_t == 0:
-            continue
-
-        boxes_b    = coarse_boxes[b, :valid_t]
-        gt_boxes_b = gt_boxes_list[b].to(device=device, dtype=dtype)
-
-        if gt_boxes_b.numel() == 0:
-            refine_neg_mask[b, :valid_t] = True
-            continue
-
-        iou_mat = box_iou(boxes_b, gt_boxes_b)   # (valid_t, M)
-        if use_hungarian:
-            # One-to-one: each GT matched to at most one proposal.
-            # Surplus proposals fall back to argmax (typically become negatives).
-            best_gt, max_iou = hungarian_match_iou(iou_mat)
-        else:
-            # Many-to-one: each proposal independently picks its best GT.
-            max_iou, best_gt = iou_mat.max(dim=1)
-
+    def _assign(b, valid_t, boxes_b, gt_boxes_b, best_gt, max_iou):
         best_gt_boxes = gt_boxes_b[best_gt]                # (valid_t, 4)
         matched_gt_boxes[b, :valid_t]  = best_gt_boxes
         target_deltas[b, :valid_t]     = boxes_to_deltas(boxes_b, best_gt_boxes)
@@ -336,6 +317,44 @@ def build_refinement_targets(
         refine_pos_mask[b, :valid_t]    = pos
         refine_neg_mask[b, :valid_t]    = neg
         refine_ignore_mask[b, :valid_t] = ign
+
+    # Pass 1 (sequential, cheap GPU ops): compute each image's IoU matrix. Hungarian
+    # matching (CPU-bound) is deferred to pass 2 instead of solved inline here, so it
+    # can run across images in parallel rather than blocking this loop one image at a time.
+    pending = []  # (b, valid_t, boxes_b, gt_boxes_b, iou_mat) awaiting Hungarian match
+
+    for b in range(bsz):
+        valid_t = int(roi_mask[b].sum().item())
+        if valid_t == 0:
+            continue
+
+        boxes_b    = coarse_boxes[b, :valid_t]
+        gt_boxes_b = gt_boxes_list[b].to(device=device, dtype=dtype)
+
+        if gt_boxes_b.numel() == 0:
+            refine_neg_mask[b, :valid_t] = True
+            continue
+
+        iou_mat = box_iou(boxes_b, gt_boxes_b)   # (valid_t, M)
+
+        if use_hungarian:
+            # One-to-one: each GT matched to at most one proposal.
+            # Surplus proposals fall back to argmax (typically become negatives).
+            pending.append((b, valid_t, boxes_b, gt_boxes_b, iou_mat))
+        else:
+            # Many-to-one: each proposal independently picks its best GT (already cheap, no need to defer).
+            max_iou, best_gt = iou_mat.max(dim=1)
+            _assign(b, valid_t, boxes_b, gt_boxes_b, best_gt, max_iou)
+
+    # Pass 2 (parallel, CPU-bound): each image's Hungarian assignment is independent of
+    # every other image's. scipy's linear_sum_assignment is implemented in C and releases
+    # the GIL during the solve, so a thread pool gives real parallelism here instead of
+    # solving bsz separate CPU-only assignments back-to-back on the main thread.
+    if pending:
+        with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as pool:
+            matches = pool.map(lambda item: hungarian_match_iou(item[4]), pending)
+            for (b, valid_t, boxes_b, gt_boxes_b, _iou_mat), (best_gt, max_iou) in zip(pending, matches):
+                _assign(b, valid_t, boxes_b, gt_boxes_b, best_gt, max_iou)
 
     # padded positions should be neither pos nor neg nor ignore
     refine_pos_mask = refine_pos_mask & roi_mask

@@ -34,6 +34,7 @@ from config import (
     KURONET_BG_SCORE_GATE,
     KURONET_CHECKPOINT_DIR,
     KURONET_CER_SCORE_THRESH,
+    KURONET_NUM_ALTERNATES,
 )
 from model.kuronet.kuronet_recognizer import KuroNetRecognizer
 from model.kuronet.roi.roi_ordering import infer_reading_orientation_from_boxes
@@ -90,7 +91,7 @@ def _align_compile_keys(model_state: dict, ckpt_state: dict) -> dict:
 
 
 def load_kuronet(kuronet_ckpt: str | Path, vocab) -> torch.nn.Module:
-    model = build_kuronet_model(vocab)
+    model = build_kuronet_model(vocab, load_stage1_weights=False)
     ckpt = torch.load(kuronet_ckpt, map_location=DEVICE)
     state = ckpt.get("model_state_dict", ckpt)
     state = _align_compile_keys(model.state_dict(), state)
@@ -370,7 +371,10 @@ def run_inference(
     -------
     dict with keys:
       transcription : str — full text in reading order
-      chars         : list of {char, box:[x1,y1,x2,y2], score}  (letterboxed IMAGE_SIZE coords)
+      chars         : list of {char, box:[x1,y1,x2,y2], score, col_id}  (letterboxed IMAGE_SIZE coords)
+                      col_id: column/row membership from ROIReadingOrder, reindexed into
+                      reading order -- lets a consumer tell a mere column wrap apart from
+                      a genuine text-block boundary (see translation.py's block-break logic)
       orientation   : str
       n_chars       : int
     """
@@ -485,6 +489,7 @@ def run_inference(
     # the same valid_pos used for boxes_sorted/pred_ids — no si_b remap needed.
     isolation_valid = outputs["isolation_mask"][b, valid_pos]
     furigana_valid  = outputs["furigana_mask"][b, valid_pos]
+    col_ids_valid   = outputs["col_ids"][b, valid_pos]
 
     # Build per-char records, skipping BG tokens and isolated non-furigana boxes
     chars_out: list[dict] = []
@@ -498,10 +503,38 @@ def run_inference(
             continue
         ch = unicode_token_to_char(decoded[0])
         x1, y1, x2, y2 = boxes_sorted[i].tolist()
+
+        # Candidate list for this ROI: the chosen pick plus up to
+        # KURONET_NUM_ALTERNATES runner-up classes, so the frontend can show
+        # "other candidates" for low-confidence chars without ever losing the
+        # model's own top pick from the list (it's always alternates[0]).
+        probs = logits_b[i].softmax(dim=-1)
+        topk_probs, topk_ids = probs.topk(KURONET_NUM_ALTERNATES + 2)
+        alternates: list[dict] = [{
+            "char":   ch,
+            "prob":   round(float(probs[p_id]), 3),
+            "chosen": True,
+        }]
+        for alt_prob, alt_id in zip(topk_probs.tolist(), topk_ids.tolist()):
+            if len(alternates) >= KURONET_NUM_ALTERNATES + 1:
+                break
+            if alt_id == p_id or (model.bg_id is not None and alt_id == model.bg_id):
+                continue
+            alt_decoded = vocab.decode([alt_id], remove_special=True)
+            if not alt_decoded:
+                continue
+            alternates.append({
+                "char":   unicode_token_to_char(alt_decoded[0]),
+                "prob":   round(alt_prob, 3),
+                "chosen": False,
+            })
+
         chars_out.append({
-            "char":  ch,
-            "box":   [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
-            "score": round(float(scores_sorted[i]), 4),
+            "char":       ch,
+            "box":        [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
+            "score":      round(float(scores_sorted[i]), 4),
+            "alternates": alternates,
+            "col_id":     int(col_ids_valid[i]),
         })
 
     transcription = "".join(c["char"] for c in chars_out)

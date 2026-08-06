@@ -327,7 +327,7 @@ class ROIReadingOrder:
         self,
         boxes: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Horizontal reading order: rows top-to-bottom, within each row left-to-right.
 
@@ -339,9 +339,15 @@ class ROIReadingOrder:
         ruby/furigana characters are additionally snapped to the nearest
         main-text row by height after that, preventing them from creating
         spurious extra rows.
+
+        Returns (sort_idx, row_ids_sorted): row_ids_sorted is the row/column
+        membership id of each box, reindexed into the same reading order as
+        sort_idx -- exposed so callers can tell a mere row wrap apart from a
+        genuine change in content (see translation.py's block-break logic).
         """
         if boxes.numel() == 0:
-            return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+            empty = torch.zeros((0,), dtype=torch.long, device=boxes.device)
+            return empty, empty
 
         y_center = (boxes[:, 1] + boxes[:, 3]) * 0.5
         heights  = (boxes[:, 3] - boxes[:, 1]).clamp_min(1.0)
@@ -377,13 +383,14 @@ class ROIReadingOrder:
         scale    = float(boxes[:, 2].max().item()) + 1.0
         sort_key = row_ids_orig.to(boxes.dtype) * scale + boxes[:, 0]
 
-        return sort_key.argsort()
+        sort_idx = sort_key.argsort()
+        return sort_idx, row_ids_orig[sort_idx]
 
     def _vertical_sort_indices(
         self,
         boxes: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Vertical reading order: columns right-to-left (Edo), within each column top-to-bottom.
 
@@ -398,9 +405,15 @@ class ROIReadingOrder:
         nearest anchor-established column. Furigana/small chars are
         additionally snapped to the nearest main-text column by width after
         that, preventing them from creating spurious isolated columns.
+
+        Returns (sort_idx, col_ids_sorted): col_ids_sorted is the column
+        membership id of each box, reindexed into the same reading order as
+        sort_idx -- exposed so callers can tell a mere column wrap apart from
+        a genuine change in content (see translation.py's block-break logic).
         """
         if boxes.numel() == 0:
-            return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+            empty = torch.zeros((0,), dtype=torch.long, device=boxes.device)
+            return empty, empty
 
         x_center = (boxes[:, 0] + boxes[:, 2]) * 0.5
         widths   = (boxes[:, 2] - boxes[:, 0]).clamp_min(1.0)
@@ -440,7 +453,8 @@ class ROIReadingOrder:
         scale    = float(boxes[:, 3].max().item()) + 1.0
         sort_key = col_rank * scale + boxes[:, 1]
 
-        return sort_key.argsort()
+        sort_idx = sort_key.argsort()
+        return sort_idx, col_ids_orig[sort_idx]
 
     def _compute_isolation_mask(
         self,
@@ -562,31 +576,42 @@ class ROIReadingOrder:
                 already do).
 
         Returns:
-            sorted_boxes, sorted_mask, *sorted_extras, sort_idx
+            sorted_boxes, sorted_mask, *sorted_extras, sort_idx, col_ids
+
+        col_ids: (T,) long, column/row membership of each box reindexed into
+            sort order, -1 at padded/invalid positions (mirroring sort_batch's
+            padding convention) -- callers distinguish valid positions via
+            sorted_mask, same as for every other output here.
         """
         valid_t = self._valid_count(mask)
         if valid_t <= 1:
             sort_idx = torch.arange(boxes.size(0), device=boxes.device, dtype=torch.long)
+            col_ids = torch.full_like(sort_idx, -1)
+            if valid_t == 1:
+                col_ids[0] = 0
             outputs = [boxes, mask]
             outputs.extend(extra_tensors)
             outputs.append(sort_idx)
+            outputs.append(col_ids)
             return tuple(outputs)
 
         valid_boxes = boxes[:valid_t]
         valid_scores = refine_scores[:valid_t] if refine_scores is not None else None
 
         if orientation == "horizontal":
-            valid_sort_idx = self._horizontal_sort_indices(valid_boxes, valid_scores)
+            valid_sort_idx, valid_col_ids = self._horizontal_sort_indices(valid_boxes, valid_scores)
         elif orientation == "vertical":
-            valid_sort_idx = self._vertical_sort_indices(valid_boxes, valid_scores)
+            valid_sort_idx, valid_col_ids = self._vertical_sort_indices(valid_boxes, valid_scores)
         else:
             raise ValueError(f"Unsupported orientation='{orientation}'. Use 'horizontal' or 'vertical'.")
 
         if valid_t < boxes.size(0):
             tail_idx = torch.arange(valid_t, boxes.size(0), device=boxes.device, dtype=torch.long)
             sort_idx = torch.cat([valid_sort_idx, tail_idx], dim=0)
+            col_ids = torch.cat([valid_col_ids, torch.full_like(tail_idx, -1)], dim=0)
         else:
             sort_idx = valid_sort_idx
+            col_ids = valid_col_ids
 
         sorted_boxes = boxes.index_select(0, sort_idx)
         sorted_mask = mask.index_select(0, sort_idx)
@@ -595,6 +620,7 @@ class ROIReadingOrder:
         for tensor in extra_tensors:
             outputs.append(tensor.index_select(0, sort_idx))
         outputs.append(sort_idx)
+        outputs.append(col_ids)
         return tuple(outputs)
 
     def sort_batch(
@@ -617,7 +643,13 @@ class ROIReadingOrder:
 
         Returns:
             dict with sorted tensors:
-                boxes, mask, sort_indices, plus all named tensors
+                boxes, mask, sort_indices, col_ids, plus all named tensors
+
+        col_ids: (B, T) long, column/row membership of each box reindexed into
+            sort order, -1 at padded positions -- lets a caller tell a mere
+            column/row wrap apart from a genuine content change (see
+            translation.py's block-break logic, which consumes this via
+            run_inference()'s per-char "col_id" field).
         """
         bsz, t_max, _ = boxes.shape
 
@@ -629,6 +661,7 @@ class ROIReadingOrder:
         sorted_boxes = torch.zeros_like(boxes)
         sorted_mask = torch.zeros_like(mask)
         sort_indices = torch.zeros((bsz, t_max), device=boxes.device, dtype=torch.long)
+        col_ids_batch = torch.full((bsz, t_max), -1, dtype=torch.long, device=boxes.device)
         isolation_masks = torch.zeros((bsz, t_max), dtype=torch.bool, device=boxes.device)
         furigana_masks  = torch.zeros((bsz, t_max), dtype=torch.bool, device=boxes.device)
         ordering_primary_mono = torch.ones((bsz,), device=boxes.device, dtype=boxes.dtype)
@@ -673,12 +706,16 @@ class ROIReadingOrder:
             for i, name in enumerate(named_tensors.keys()):
                 sorted_named[name][b] = result[offset + i]
 
-            sort_indices[b] = result[-1]
+            # sort_single now returns (..., sort_idx, col_ids) -- col_ids is the
+            # new last element, sort_idx the one before it.
+            sort_indices[b] = result[-2]
+            col_ids_batch[b] = result[-1]
 
         out = {
             "boxes": sorted_boxes,
             "mask": sorted_mask,
             "sort_indices": sort_indices,
+            "col_ids": col_ids_batch,
             "isolation_mask": isolation_masks,
             "furigana_mask":  furigana_masks,
             "ordering_diagnostics": {

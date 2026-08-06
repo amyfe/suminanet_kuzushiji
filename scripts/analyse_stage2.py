@@ -5,9 +5,10 @@ Loads a trained KuroNet checkpoint, runs detailed validation, and produces:
   2. cer_by_script.png       — CER breakdown: hiragana / katakana / kanji / rare kanji
   3. topk_errors.png         — fraction of wrong predictions where GT was in top-K
   4. per_page_cer.png        — distribution of CER across val images
+  5. learning_curves.png     — train/val loss + val CER/top-1 vs epoch (skipped if --log not found)
 
 Optionally, with --image:
-  5. confidence_vis.png      — boxes colored by confidence (<10% red, <50% orange, >=50% green)
+  6. confidence_vis.png      — boxes colored by confidence (<10% red, <50% orange, >=50% green)
 
 Usage:
     python scripts/analyse_stage2.py \\
@@ -15,6 +16,7 @@ Usage:
         [--out-dir results/stage2_analysis] \\
         [--split val] \\
         [--top-n 40] \\
+        [--log logs/train_stage2_kuronet.log] \\
         [--image path/to/page.jpg]
 """
 
@@ -36,6 +38,7 @@ from visualization.stage2 import (
     draw_confidence_boxes,
     plot_cer_by_script,
     plot_confusion_matrix,
+    plot_learning_curves,
     plot_per_page_cer,
     plot_topk_errors,
 )
@@ -51,13 +54,15 @@ def parse_args() -> argparse.Namespace:
                    help="Dataset split to evaluate on")
     p.add_argument("--top-n", type=int, default=40,
                    help="Number of top classes for the confusion matrix heatmap")
+    p.add_argument("--log", default="logs/train_stage2_kuronet.log",
+                   help="Training log file for learning curves (skipped if not found)")
     p.add_argument("--image", default=None,
                    help="Optional: path to a page image for confidence visualization")
     return p.parse_args()
 
 
 def _load_model(ckpt_path: str | Path, vocab) -> "train_module.KuroNetRecognizer":
-    model = train_module.build_kuronet_model(vocab)
+    model = train_module.build_kuronet_model(vocab, load_stage1_weights=False)
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
     state = ckpt.get("model_state_dict", ckpt)
     _load_compatible_state_dict(model, state)
@@ -173,6 +178,14 @@ def main() -> None:
         out_path=out_dir / "per_page_cer.png",
     )
     written.append(p)
+
+    print("Generating learning curves...")
+    lc_path = plot_learning_curves(
+        log_file=args.log,
+        out_path=out_dir / "learning_curves.png",
+    )
+    if lc_path:
+        written.append(lc_path)
 
     # ----------------------------------------------------------------
     # Optional: confidence visualization on a single image

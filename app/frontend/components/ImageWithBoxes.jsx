@@ -1,9 +1,12 @@
 import { useState, useRef } from 'react'
+import { scoreTier, formatScore } from '../utils/text'
+import i18next from 'i18next'
 
-export default function ImageWithBoxes({ imageUrl, chars }) {
+export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onReplace }) {
   const imgRef = useRef(null)
   const [imgDisplaySize, setImgDisplaySize] = useState(null)
   const [hoveredCharIdx, setHoveredCharIdx] = useState(null)
+  const t = i18next.t.bind(i18next)
 
   function onImageLoad() {
     const img = imgRef.current
@@ -20,10 +23,12 @@ export default function ImageWithBoxes({ imageUrl, chars }) {
       <img
         ref={imgRef}
         src={imageUrl}
-        className="overlay-image"
-        alt="Manuscript with annotations"
+        className={`overlay-image${onReplace ? ' replaceable' : ''}`}
+        alt={t('imageWithBoxes.overlayAlt')}
         onLoad={onImageLoad}
+        onClick={onReplace}
       />
+      {onReplace && <span className="replace-hint">{t('workspace.replaceImageHint')}</span>}
       {imgDisplaySize && chars.map((c, i) => {
         const scaleX = imgDisplaySize.w / imgDisplaySize.natW
         const scaleY = imgDisplaySize.h / imgDisplaySize.natH
@@ -31,7 +36,7 @@ export default function ImageWithBoxes({ imageUrl, chars }) {
         return (
           <div
             key={i}
-            className="char-box"
+            className={`char-box char-box--${scoreTier(c.score)}`}
             style={{
               left: x1 * scaleX,
               top: y1 * scaleY,
@@ -43,8 +48,33 @@ export default function ImageWithBoxes({ imageUrl, chars }) {
           >
             {hoveredCharIdx === i && (
               <div className="char-tooltip">
-                <span className="tooltip-char">{c.char}</span>
-                <span className="tooltip-score">{(c.score * 100).toFixed(0)}%</span>
+                {c.alternates?.length > 0 ? (
+                  <div className="tooltip-alternates">
+                    {c.alternates.map((alt, ai) => (
+                      <button
+                        type="button"
+                        // Backend guarantees all candidates in c.alternates are
+                        // distinct chars (vocab is a char<->id bijection, and the
+                        // chosen id is excluded when collecting runner-ups), so
+                        // char equality is a safe way to mark the active pick.
+                        className={`tooltip-alt-char${alt.char === c.char ? ' tooltip-alt-char--active' : ''}`}
+                        key={ai}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          onSelectAlternate?.(i, alt.char)
+                        }}
+                        aria-label={t('imageWithBoxes.useAlternate', { char: alt.char })}
+                      >
+                        {alt.char} <span className="tooltip-alt-score">{formatScore(alt.prob)}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="tooltip-main">
+                    <span className="tooltip-char">{c.char}</span>
+                    <span className="tooltip-score">{formatScore(c.score)}</span>
+                  </div>
+                )}
               </div>
             )}
           </div>

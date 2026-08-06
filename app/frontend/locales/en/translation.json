@@ -1,0 +1,134 @@
+{
+    "toolbar": {
+        "brandName": "Sumina",
+        "brandTagline": "TRANSCRIBE · TRANSLATE EDO",
+        "howItWorks": "How it works",
+        "examples": "Examples",
+        "about": "About",
+        "policy": "Privacy Policy",
+        "tryIt": "Try it →"
+    },
+    "home": {
+        "heroEyebrow": "墨 SUMI · BUILT ON KURONET 黒",
+        "heroTitle": "Read the hand of Edo.",
+        "heroSub": "Sumina reads the cursive kuzushiji in your scans of woodblock prints and manuscripts, lets you correct the draft, and renders centuries of Japanese into English you can actually read.",
+        "heroCta": "Try it now →",
+        "howTitle": "How it works",
+        "how_steps": [
+            { "step": 1, "title": "Upload a scan", "body": "Drop in a photograph or scan of any woodblock print or handwritten manuscript — modern or Edo-era." },
+            { "step": 2, "title": "Transcribe & correct", "body": "KuroNet detects each cursive character and proposes a reading. You review and fix anything it misjudged." },
+            { "step": 3, "title": "Translate", "body": "Get fluent English alongside the original, drawn straight from the corrected transcription." }
+        ],
+        "examplesEyebrow": "SELECT A TEXT · 用例",
+        "examplesTitle": "Examples to try",
+        "examplesSub": "Public-domain Edo-period verse. Pick one to drop its text straight into the workspace, ready to translate.",
+        "examples": [
+            { "id": "furuike", "title": "The Old Pond", "author": "松尾芭蕉 · Bashō", "year": "c.1686", "text": "古池や蛙飛び込む水の音" },
+            { "id": "natsukusa", "title": "Summer Grasses", "author": "松尾芭蕉 · Bashō", "year": "1689", "text": "夏草や兵どもが夢の跡" },
+            { "id": "shizukasa", "title": "Cicada in Stone", "author": "松尾芭蕉 · Bashō", "year": "1689", "text": "閑さや岩にしみ入る蝉の声" },
+            { "id": "asagao", "title": "Morning Glory", "author": "加賀千代女 · Chiyo-jo", "year": "c.1740", "text": "朝顔に釣瓶とられてもらひ水" },
+            { "id": "suzume", "title": "Little Sparrow", "author": "小林一茶 · Issa", "year": "c.1819", "text": "雀の子そこのけそこのけ御馬が通る" },
+            { "id": "nanakorobi", "title": "Fall Seven, Rise Eight", "author": "江戸の諺 · Edo proverb", "year": "Edo period", "text": "七転び八起き" }
+        ],
+        "exampleCta": "Open in workspace →",
+        "footerCredit": "墨奈 Sumina — 幸 by Amina Felic",
+        "footerPowered": "Recognition powered by KuroNet (Clanuwat et al.)"
+    },
+    "workspace": {
+        "title": "Workspace",
+        "stepUpload": "① UPLOAD",
+        "stepTranscribe": "② TRANSCRIBE & CORRECT",
+        "stepTranslate": "③ TRANSLATE",
+        "panelOriginal": "ORIGINAL · 原文",
+        "transcribeBtn": "Transcribe",
+        "transcribingBtn": "Transcribing...",
+        "resultHeaderPrefix": "墨奈 Sumina — transcription & translation",
+        "resultSourceLabel": "Source",
+        "resultTranscriptionLabel": "TRANSCRIPTION (翻刻):",
+        "resultNone": "(none)",
+        "resultModernLabel": "MODERN JAPANESE:",
+        "resultEnglishLabel": "ENGLISH:",
+        "resultGermanLabel": "GERMAN:",
+        "transcribeError": "Error: could not reach transcription API.",
+        "translateError": "Error: could not reach translation API.",
+        "copyText": "Copy text",
+        "copiedText": "Copied ✓",
+        "transcribingLabel": "Detecting characters…",
+        "replaceImageBtn": "Upload new image",
+        "replaceImageHint": "Click image to replace"
+    },
+    "transcriptionPanel": {
+        "panelHeader": "TRANSCRIPTION · 翻刻",
+        "placeholder": "Type or correct the reading…",
+        "hint": "Run Transcribe on a scan, or type/paste classical Japanese directly, then Translate.",
+        "reorderHint": "Reading order looks wrong? Drag a column to move it.",
+        "translateBtn": "Translate",
+        "translatingBtn": "Translating...",
+        "translatingLabel": "Translating classical Japanese…",
+        "resultLabel": "English · 英訳",
+        "resultLabelDe": "German · 独訳",
+        "targetLangAriaLabel": "Translation language",
+        "exportLabel": "EXPORT",
+        "downloadBtn": "Download .txt",
+        "normalization": {
+            "mecab+unidic-kinsei-edo": "Normalization: MeCab + Edo-period dictionary",
+            "mecab+unidic": "Normalization: MeCab + modern dictionary (Edo dictionary unavailable)",
+            "mecab+unidic-lite": "Normalization: MeCab + lite dictionary (reduced accuracy)",
+            "heuristic": "Normalization: heuristic only — MeCab unavailable (reduced accuracy)",
+            "none": "Normalization: skipped"
+        }
+    },
+    "uploadArea": {
+        "placeholder": "Click or drag an image here"
+    },
+    "imageWithBoxes": {
+        "overlayAlt": "Manuscript with annotations",
+        "useAlternate": "Use {{char}} instead"
+    },
+    "about": {
+        "eyebrow": "ABOUT · 沿革",
+        "title": "Why Sumina exists",
+        "creditLine": "墨奈 Sumina — 幸 by Amina Felic.",
+        "p1": [
+            { "text": "Most people — even fluent readers of modern Japanese — cannot read " },
+            { "em": "kuzushiji" },
+            { "text": ", the flowing cursive in which nearly every Edo-period book, letter, and ledger was written. Centuries of literature, science, and ordinary life sit locked behind a hand almost no one is trained to decipher." }
+        ],
+        "p2": [
+            { "text": "Sumina pairs " },
+            { "b": "KuroNet" },
+            { "text": " — the character-recognition model built by Tarin Clanuwat and collaborators — with a human correction step and translation, so a scan becomes a reading, and a reading becomes English. Made for researchers, students, and anyone curious enough to look closely." }
+        ],
+        "etymology": [
+            { "text": "The name fuses 墨 " },
+            { "b": "sumi" },
+            { "text": " (\"ink\", after KuroNet's 黒 " },
+            { "b": "kuro" },
+            { "text": ", \"black\") with " },
+            { "b": "Amina" },
+            { "text": "; 幸 " },
+            { "b": "sachi" },
+            { "text": " (\"fortune\") for Felic." }
+        ],
+        "photoAlt": "Illustration of daily life in the Edo period"
+    },
+    "policy": {
+        "title": "Privacy Policy",
+        "intro": "Your privacy is important to us. This policy outlines how we collect, use, and protect your personal information.",
+        "collectHeading": "Information We Collect",
+        "collectIntro": "We may collect the following types of information:",
+        "collectItems": [
+            "Personal identification information (name, email address, phone number)",
+            "Usage data (how you interact with our service)"
+        ],
+        "useHeading": "How We Use Your Information",
+        "useIntro": "We use the collected information to:",
+        "useItems": [
+            "Provide and improve our services",
+            "Communicate with you about updates and offers",
+            "Analyze usage patterns to enhance user experience"
+        ],
+        "protectionHeading": "Data Protection",
+        "protectionText": "We implement appropriate security measures to protect your personal information from unauthorized access or disclosure."
+    }
+}

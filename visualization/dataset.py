@@ -12,6 +12,7 @@ from pathlib import Path
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 
 from visualization.common import BAR_ALPHA, GRID_ALPHA, savefig
 
@@ -478,5 +479,158 @@ def plot_split_overview(
         ax.set_ylim(0, max(vals) * 1.18)
 
     fig.suptitle("Dataset split summary", fontsize=12)
+    fig.tight_layout()
+    return savefig(fig, out_path)
+
+
+# ---------------------------------------------------------------------------
+# 7. Augmentation comparison — classic vs. rare-character strength
+# ---------------------------------------------------------------------------
+
+def plot_augmentation_comparison(
+    image_path: "str | Path",
+    crop_box: "tuple[int, int, int, int] | None" = None,
+    seed: int = 0,
+    out_path: "str | Path" = "augmentation_comparison.png",
+) -> Path:
+    """
+    Side-by-side comparison of an original crop, the standard ("classic")
+    train-time augmentation applied to every training image, and the
+    stronger rare-character augmentation from
+    utils.char_augmentation.build_rare_char_transform (Option A), which is
+    applied only to images that contain at least one rare character.
+
+    Both pixel-level transforms are drawn from the exact same code paths
+    used at training time (utils/__init__.py and utils/char_augmentation.py),
+    with the ToTensor/Normalize steps stripped so the result stays a
+    displayable image.
+
+    Args:
+        image_path: path to a page image (e.g. assets/data/<book>/images/<id>.jpg)
+        crop_box:   optional (x1, y1, x2, y2) region to crop before augmenting,
+                    so individual glyphs are legible in the figure
+        seed:       torch RNG seed, applied before each transform so both
+                    panels sample from a comparable random draw
+        out_path:   output image path
+    """
+    import torch
+    import torchvision.transforms as T
+
+    from utils.char_augmentation import build_rare_char_transform
+
+    img = Image.open(image_path).convert("RGB")
+    if crop_box is not None:
+        img = img.crop(crop_box)
+
+    classic_transform = T.Compose([
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+    ])
+    rare_transform = T.Compose([
+        t for t in build_rare_char_transform().transforms
+        if not isinstance(t, (T.ToTensor, T.Normalize))
+    ])
+
+    torch.manual_seed(seed)
+    classic_img = classic_transform(img)
+    torch.manual_seed(seed)
+    rare_img = rare_transform(img)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.5))
+    panels = [
+        (img,         "Original"),
+        (classic_img, "Classic augmentation\n(ColorJitter ±0.2, applied to all training images)"),
+        (rare_img,    "Rare-character augmentation\n(ColorJitter ±0.4 + GaussianBlur + RandomGrayscale)"),
+    ]
+    for ax, (im, title) in zip(axes, panels):
+        ax.imshow(im)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+
+    fig.suptitle(f"Augmentation strength comparison — {Path(image_path).name}", fontsize=12)
+    fig.tight_layout()
+    return savefig(fig, out_path)
+
+
+# ---------------------------------------------------------------------------
+# 8. Copy-paste rare-kanji augmentation (Option C)
+# ---------------------------------------------------------------------------
+
+def plot_copy_paste_augmentation(
+    image_path: "str | Path",
+    boxes: list,
+    labels: list,
+    rare_chars: "set[str] | frozenset[str]",
+    crop_db: "dict[str, list]",
+    n_paste: int = 3,
+    seed: int = 0,
+    out_path: "str | Path" = "copy_paste_augmentation.png",
+) -> Path:
+    """
+    Side-by-side comparison of an original page and the same page after
+    utils.char_augmentation.copy_paste_rare_chars (Option C) pastes a few
+    rare-kanji crops onto it. Pasted characters are highlighted with a red
+    box and their glyph + codepoint so the injected instances stand out.
+
+    Args:
+        image_path: path to the page image to paste onto
+        boxes:      existing GT boxes for this page, [[x1,y1,x2,y2], ...]
+        labels:     existing GT labels for this page
+        rare_chars: frozenset of rare character labels (paste candidates)
+        crop_db:    {char_label: [crop_array, ...]}, e.g. from a small scan
+                    of annotations for rare kanji (see build_rare_char_crop_db
+                    for the general-purpose version)
+        n_paste:    number of rare-kanji crops to paste
+        seed:       Python `random` seed so the pasted positions/chars are
+                    reproducible across runs
+        out_path:   output image path
+    """
+    import random
+
+    import cv2
+    from matplotlib.patches import Rectangle
+
+    from utils.char_augmentation import copy_paste_rare_chars
+
+    img_pil = Image.open(image_path).convert("RGB")
+    img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+    random.seed(seed)
+    pasted_bgr, new_boxes, new_labels = copy_paste_rare_chars(
+        image=img_bgr,
+        boxes=boxes,
+        labels=labels,
+        crop_db=crop_db,
+        rare_chars=frozenset(rare_chars),
+        n_paste=n_paste,
+    )
+    pasted_rgb = cv2.cvtColor(pasted_bgr, cv2.COLOR_BGR2RGB)
+
+    n_before = len(labels)
+    pasted = list(zip(new_boxes[n_before:], new_labels[n_before:]))
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 7.5))
+    axes[0].imshow(img_pil)
+    axes[0].set_title("Original", fontsize=11)
+    axes[0].axis("off")
+
+    axes[1].imshow(pasted_rgb)
+    axes[1].set_title(f"Copy-paste augmentation\n(+{len(pasted)} rare kanji pasted)", fontsize=11)
+    axes[1].axis("off")
+
+    jp_fp = _jp_font(size=13)
+    for box, lbl in pasted:
+        x1, y1, x2, y2 = box
+        axes[1].add_patch(Rectangle(
+            (x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor="red", linewidth=1.6,
+        ))
+        char = _label_to_char(lbl)
+        # Glyph and codepoint are drawn separately: DroidSansFallback renders
+        # Latin/ASCII as tofu boxes, so the "U+XXXX" part needs the default font.
+        axes[1].text(x1, y1 - 8, char, color="red", fontsize=13,
+                     fontproperties=jp_fp, ha="left", va="bottom")
+        axes[1].text(x1 + 18, y1 - 8, lbl, color="red", fontsize=8,
+                     ha="left", va="bottom")
+
+    fig.suptitle(f"Rare-kanji copy-paste augmentation — {Path(image_path).name}", fontsize=12)
     fig.tight_layout()
     return savefig(fig, out_path)

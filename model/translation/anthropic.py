@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 _OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 _OPENROUTER_MODEL = "anthropic/claude-sonnet-4-6"
 
+_TARGET_LANGUAGES = {"en": "English", "de": "German"}
+
+
+def _target_language_name(lang: str) -> str:
+    try:
+        return _TARGET_LANGUAGES[lang]
+    except KeyError:
+        raise ValueError(
+            f"Unsupported target language {lang!r}; expected one of {sorted(_TARGET_LANGUAGES)}"
+        ) from None
+
 
 def _estimate_max_tokens(text: str) -> int:
     """Output token budget scaled from input length, clamped to
@@ -76,16 +87,23 @@ class ClaudeTranslator:
     # Step 1: classical → modern Japanese
     # ------------------------------------------------------------------
 
-    def classical_to_modern(self, text: str) -> Tuple[Dict[str, str], Dict[str, int]]:
+    def classical_to_modern(
+        self, text: str, mecab_reference: Optional[str] = None
+    ) -> Tuple[Dict[str, str], Dict[str, int]]:
         """
         Convert classical/Edo-period Japanese to modern Japanese.
+
+        mecab_reference: optional dictionary-normalized text (MeCab + UniDic orthBase
+            substitution) for the same source, given to the model as a secondary aid for
+            archaic vocabulary/spelling. Not positionally aligned to `text` and contains
+            none of its inline annotation markers — see _build_classical_to_modern_prompt.
 
         Returns (result, usage) where result has keys:
           modern_japanese, notes, truncated
         and usage has keys:
           input_tokens, output_tokens, total_tokens
         """
-        prompt = self._build_classical_to_modern_prompt(text)
+        prompt = self._build_classical_to_modern_prompt(text, mecab_reference)
         result, response = self._call_structured(
             prompt,
             tool_name="provide_modern_japanese",
@@ -105,7 +123,24 @@ class ClaudeTranslator:
         )
         return result, self._usage(response)
 
-    def _build_classical_to_modern_prompt(self, text: str) -> str:
+    def _build_classical_to_modern_prompt(
+        self, text: str, mecab_reference: Optional[str] = None
+    ) -> str:
+        reference_block = ""
+        if mecab_reference:
+            reference_block = f"""
+
+A dictionary-normalized reference version of the same text is provided below, produced by a
+separate morphological analyzer (MeCab + UniDic) that substitutes each word's standardized
+modern spelling. Character positions in this reference do NOT correspond 1:1 to the annotated
+text above (words may have been merged, split, or rewritten during normalization), and it
+contains none of the inline markers described above. Use it only as an aid for resolving
+archaic vocabulary and spelling — the annotated text above remains the authoritative source for
+character-level uncertainty and document structure.
+
+Dictionary-normalized reference (MeCab + UniDic):
+{mecab_reference}"""
+
         return f"""You are an expert in classical Japanese literature, specifically Edo period texts (1603-1868).
 
 Convert the following classical Japanese text to modern Japanese (現代日本語).
@@ -123,32 +158,36 @@ The text may contain inline annotations added by the OCR/preprocessing pipeline 
 - "[char:NN%]" marks a character the OCR model was uncertain about (NN% confidence). Use context to judge whether "char" is correct, or infer a more plausible reading; do not treat the brackets as literal text.
 - "[furigana?:XY]" marks a run of kana between two kanji that may be a misdetected furigana gloss rather than main text. Use judgement: if it reads as a phonetic annotation for the adjacent kanji, disregard it; if it reads as legitimate grammatical text, incorporate it normally.
 - "｜" marks a detected boundary between independent text blocks on the page (e.g., unrelated inscriptions, captions, or marginal notes). Treat text on either side as potentially unrelated in topic and context — do not assume narrative continuity across this marker. If it appears in your modern_japanese output, preserve it verbatim so the boundary carries through to the English translation step.
+- A line break (newline) marks where the original page wraps to a new column. It carries no topic or content boundary — read across it as continuous text, the same as if it were not there.
 
 Classical Japanese text:
-{text}"""
+{text}{reference_block}"""
 
     # ------------------------------------------------------------------
     # Step 2: modern Japanese → English
     # ------------------------------------------------------------------
 
     def translate_to_english(
-        self, modern_japanese: str, classical_text: str = ""
+        self, modern_japanese: str, classical_text: str = "", lang: str = "en"
     ) -> Tuple[Dict[str, str], Dict[str, int]]:
         """
-        Translate modern Japanese to English.
+        Translate modern Japanese to the target language (`lang`: "en" or "de").
 
         Returns (result, usage) where result has keys:
           english_translation, translation_notes, truncated
+        (keys keep their "english_translation" name regardless of `lang` for
+        pipeline compatibility; the value is in the requested target language)
         """
-        prompt = self._build_translate_to_english_prompt(modern_japanese, classical_text)
+        language_name = _target_language_name(lang)
+        prompt = self._build_translate_to_english_prompt(modern_japanese, classical_text, language_name)
         result, response = self._call_structured(
             prompt,
             tool_name="provide_english_translation",
-            description="Provide the English translation of modern Japanese text.",
+            description=f"Provide the {language_name} translation of modern Japanese text.",
             properties={
                 "english_translation": {
                     "type": "string",
-                    "description": "The English translation",
+                    "description": f"The {language_name} translation",
                 },
                 "translation_notes": {
                     "type": "string",
@@ -160,23 +199,128 @@ Classical Japanese text:
         )
         return result, self._usage(response)
 
+    # ------------------------------------------------------------------
+    # Combined step: classical -> modern -> English in one request
+    # (experimental, for comparison against the two-call pipeline above)
+    # ------------------------------------------------------------------
+
+    def translate_classical_to_english(
+        self, text: str, mecab_reference: Optional[str] = None, lang: str = "en"
+    ) -> Tuple[Dict[str, str], Dict[str, int]]:
+        """
+        Single-request variant of classical_to_modern() + translate_to_english():
+        asks for both conversions in one tool call, with modern_japanese declared
+        before english_translation in the schema so the model still produces the
+        modern-Japanese conversion first, before using it to produce the
+        target-language translation, within one continuous generation.
+
+        `lang`: target language for the translation step ("en" or "de"); the
+        modern_japanese conversion step is unaffected.
+
+        Returns (result, usage) where result has keys:
+          modern_japanese, notes, english_translation, translation_notes, truncated
+        (keys keep their "english_translation" name regardless of `lang` for
+        pipeline compatibility; the value is in the requested target language)
+        """
+        language_name = _target_language_name(lang)
+        prompt = self._build_combined_prompt(text, mecab_reference, language_name)
+        result, response = self._call_structured(
+            prompt,
+            tool_name="provide_modern_and_english",
+            description=(
+                f"Provide the modern Japanese conversion and the {language_name} translation "
+                "of the classical Japanese text, in that order."
+            ),
+            properties={
+                "modern_japanese": {
+                    "type": "string",
+                    "description": "The classical text converted to modern Japanese",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Any ambiguities or important conversion decisions in the classical->modern step (empty string if none)",
+                },
+                "english_translation": {
+                    "type": "string",
+                    "description": f"The {language_name} translation of the modern Japanese text",
+                },
+                "translation_notes": {
+                    "type": "string",
+                    "description": "Cultural context or important decisions in the modern->English step (empty string if none)",
+                },
+            },
+            required=["modern_japanese", "notes", "english_translation", "translation_notes"],
+            # Budget must cover both generated texts, not just one -- double the
+            # single-step estimate, still bounded by the same ceiling.
+            max_tokens=min(TRANSLATION_MAX_TOKENS_CEILING, _estimate_max_tokens(text) * 2),
+        )
+        return result, self._usage(response)
+
+    def _build_combined_prompt(
+        self, text: str, mecab_reference: Optional[str] = None, language_name: str = "English"
+    ) -> str:
+        reference_block = ""
+        if mecab_reference:
+            reference_block = f"""
+
+A dictionary-normalized reference version of the same text is provided below, produced by a
+separate morphological analyzer (MeCab + UniDic) that substitutes each word's standardized
+modern spelling. Character positions in this reference do NOT correspond 1:1 to the annotated
+text above (words may have been merged, split, or rewritten during normalization), and it
+contains none of the inline markers described above. Use it only as an aid for resolving
+archaic vocabulary and spelling — the annotated text above remains the authoritative source for
+character-level uncertainty and document structure.
+
+Dictionary-normalized reference (MeCab + UniDic):
+{mecab_reference}"""
+
+        return f"""You are an expert in classical Japanese literature, specifically Edo period texts (1603-1868), and in translating historical Japanese into natural, fluent {language_name}.
+
+Perform two sequential conversions on the classical Japanese text below:
+1. Convert it to modern Japanese (現代日本語).
+2. Translate that modern Japanese into natural, fluent {language_name}.
+
+Requirements for step 1 (classical -> modern Japanese):
+- Preserve the original meaning and nuance precisely
+- Convert classical grammar forms to modern equivalents
+- Update archaic vocabulary to contemporary terms
+- Maintain the tone and register of the original
+- Note ambiguous passages
+
+Requirements for step 2 (modern Japanese -> {language_name}):
+- Read naturally in {language_name}
+- Preserve the meaning and nuance
+- Maintain appropriate formality
+- Note important cultural context where relevant
+
+The text was produced by an OCR model and may contain recognition errors. Use context to infer the intended meaning where possible.
+
+The text may contain inline annotations added by the OCR/preprocessing pipeline — these are not part of the original document:
+- "[char:NN%]" marks a character the OCR model was uncertain about (NN% confidence). Use context to judge whether "char" is correct, or infer a more plausible reading; do not treat the brackets as literal text.
+- "[furigana?:XY]" marks a run of kana between two kanji that may be a misdetected furigana gloss rather than main text. Use judgement: if it reads as a phonetic annotation for the adjacent kanji, disregard it; if it reads as legitimate grammatical text, incorporate it normally.
+- "｜" marks a detected boundary between independent text blocks on the page (e.g., unrelated inscriptions, captions, or marginal notes). Treat text on either side as potentially unrelated in topic and context — do not assume narrative continuity across this marker. Preserve "｜" verbatim in your modern_japanese output (do not convert it to a line break or other formatting there); only in your english_translation output should it become a clear separation (e.g., a paragraph break) rather than being merged into one continuous narrative.
+- A line break (newline) marks where the original page wraps to a new column — a different thing from "｜" above. It carries no topic or content boundary — read across it as continuous text, the same as if it were not there.
+
+Classical Japanese text:
+{text}{reference_block}"""
+
     def _build_translate_to_english_prompt(
-        self, modern_japanese: str, classical_text: str = ""
+        self, modern_japanese: str, classical_text: str = "", language_name: str = "English"
     ) -> str:
         context = (
             f"\n\nOriginal classical text for reference:\n{classical_text}"
             if classical_text
             else ""
         )
-        return f"""Translate the following modern Japanese text to natural, fluent English.
+        return f"""Translate the following modern Japanese text to natural, fluent {language_name}.
 
 The text is from an Edo-period Japanese document that has been converted to modern Japanese. Your translation should:
-- Read naturally in English
+- Read naturally in {language_name}
 - Preserve the meaning and nuance
 - Maintain appropriate formality
 - Note important cultural context where relevant
 
-The text may contain "｜" markers inherited from the OCR pipeline, indicating a boundary between independent text blocks (unrelated inscriptions, captions, or marginal notes). Reflect this as a clear separation (e.g., a paragraph break) in the English translation rather than merging the blocks into one continuous narrative.
+The text may contain "｜" markers inherited from the OCR pipeline, indicating a boundary between independent text blocks (unrelated inscriptions, captions, or marginal notes). Reflect this as a clear separation (e.g., a paragraph break) in the {language_name} translation rather than merging the blocks into one continuous narrative.
 
 Modern Japanese text:
 {modern_japanese}{context}"""

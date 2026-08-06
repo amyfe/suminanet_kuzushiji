@@ -1,23 +1,26 @@
+import i18next from 'i18next'
+
 const Policy = () => {
+  const t = i18next.t.bind(i18next)
+  const collectItems = t('policy.collectItems', { returnObjects: true })
+  const useItems = t('policy.useItems', { returnObjects: true })
+
   return (
     <div className="page-content">
-      <h1>Privacy Policy</h1>
-      <p>Your privacy is important to us. This policy outlines how we collect, use, and protect your personal information.</p>
-      <h2>Information We Collect</h2>
-      <p>We may collect the following types of information:</p>
+      <h1>{t('policy.title')}</h1>
+      <p>{t('policy.intro')}</p>
+      <h2>{t('policy.collectHeading')}</h2>
+      <p>{t('policy.collectIntro')}</p>
       <ul>
-        <li>Personal identification information (name, email address, phone number)</li>
-        <li>Usage data (how you interact with our service)</li>
+        {collectItems.map((item, i) => <li key={i}>{item}</li>)}
       </ul>
-      <h2>How We Use Your Information</h2>
-      <p>We use the collected information to:</p>
+      <h2>{t('policy.useHeading')}</h2>
+      <p>{t('policy.useIntro')}</p>
       <ul>
-        <li>Provide and improve our services</li>
-        <li>Communicate with you about updates and offers</li>
-        <li>Analyze usage patterns to enhance user experience</li>
+        {useItems.map((item, i) => <li key={i}>{item}</li>)}
       </ul>
-      <h2>Data Protection</h2>
-      <p>We implement appropriate security measures to protect your personal information from unauthorized access or disclosure.</p>
+      <h2>{t('policy.protectionHeading')}</h2>
+      <p>{t('policy.protectionText')}</p>
     </div>
   )
 }

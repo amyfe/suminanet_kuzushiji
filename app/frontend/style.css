@@ -151,6 +151,53 @@ a { color: inherit; }
   color: var(--accent);
 }
 
+.translate-row {
+  display: flex;
+  gap: 0.7rem;
+  align-items: stretch;
+}
+
+.translate-row .btn {
+  flex: 1;
+}
+
+.lang-select-wrap {
+  position: relative;
+  flex: none;
+  display: flex;
+  align-items: center;
+}
+
+.lang-select-flag {
+  position: absolute;
+  left: 0.75rem;
+  width: 1.1rem;
+  line-height: 1.1rem;
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+.lang-select {
+  flex: none;
+  padding: 0 0.9rem 0 2.15rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  background: var(--paper);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.lang-select:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.lang-select-wrap:has(.lang-select:disabled) .lang-select-flag {
+  opacity: 0.4;
+}
+
 /* ===================== Upload area ===================== */
 
 .actions {
@@ -208,6 +255,46 @@ a { color: inherit; }
   max-height: 480px;
   object-fit: contain;
   display: block;
+}
+
+/* ===================== Loading indicator ===================== */
+
+.loading-indicator {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  min-height: 200px;
+  padding: 2rem;
+  color: var(--label-soft);
+}
+
+.loading-brush {
+  display: flex;
+  gap: 8px;
+}
+
+.loading-brush-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: brushDab 1.1s ease-in-out infinite;
+}
+
+.loading-brush-dot:nth-child(2) { animation-delay: 0.15s; }
+.loading-brush-dot:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes brushDab {
+  0%, 60%, 100% { opacity: 0.25; transform: scale(0.8); }
+  30% { opacity: 1; transform: scale(1); }
+}
+
+.loading-label {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
 }
 
 /* ===================== Result panels ===================== */
@@ -325,6 +412,30 @@ a { color: inherit; }
   display: block;
 }
 
+.overlay-image.replaceable {
+  cursor: pointer;
+}
+
+.image-overlay-container .replace-hint {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: rgba(33, 29, 24, 0.72);
+  color: #fbf7ec;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+  padding: 4px 8px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  pointer-events: none;
+}
+
+.image-overlay-container:hover .replace-hint {
+  opacity: 1;
+}
+
 .char-box {
   position: absolute;
   border: 3px solid rgba(178, 58, 43, 0.75);
@@ -335,6 +446,26 @@ a { color: inherit; }
 
 .char-box:hover {
   background: rgba(178, 58, 43, 0.15);
+}
+
+/* Confidence tiers — mirror utils/text.js's scoreTier() thresholds. */
+.char-box--high {
+  border-color: rgba(46, 125, 50, 0.75);
+}
+.char-box--high:hover {
+  background: rgba(46, 125, 50, 0.15);
+}
+.char-box--medium {
+  border-color: rgba(224, 160, 0, 0.8);
+}
+.char-box--medium:hover {
+  background: rgba(224, 160, 0, 0.15);
+}
+.char-box--low {
+  border-color: rgba(198, 40, 40, 0.8);
+}
+.char-box--low:hover {
+  background: rgba(198, 40, 40, 0.15);
 }
 
 .char-tooltip {
@@ -349,16 +480,65 @@ a { color: inherit; }
   font-family: var(--font-mono);
   font-size: 0.75rem;
   white-space: nowrap;
-  pointer-events: none;
+  /* auto (not none): alternates below are clickable, and this element is a
+     DOM child of .char-box, so hovering onto it doesn't fire the box's
+     onMouseLeave (mouseleave ignores transitions onto descendants). */
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  z-index: 10;
+}
+
+.tooltip-main {
   display: flex;
   gap: 5px;
   align-items: center;
-  z-index: 10;
 }
 
 .tooltip-score {
   color: var(--label);
   font-size: 0.65rem;
+}
+
+.tooltip-alternates {
+  display: flex;
+  gap: 4px;
+}
+
+.tooltip-alt-char {
+  font-family: var(--font-mono);
+  color: #f2b34d;
+  font-size: 0.7rem;
+  background: none;
+  border: none;
+  padding: 1px 3px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.tooltip-alt-char:hover,
+.tooltip-alt-char:focus-visible {
+  background: rgba(255, 255, 255, 0.15);
+  outline: none;
+}
+
+/* Currently-assigned candidate within the row — stays visible without
+   hovering, so switching between candidates never "loses" one. */
+.tooltip-alt-char--active {
+  color: #fff;
+  background: rgba(242, 179, 77, 0.35);
+  font-weight: 600;
+}
+
+.tooltip-alt-char--active:hover,
+.tooltip-alt-char--active:focus-visible {
+  background: rgba(242, 179, 77, 0.5);
+}
+
+.tooltip-alt-score {
+  color: var(--label);
+  font-size: 0.6rem;
 }
 
 /* Read-only vertical-column rendering of the transcription, traditional
@@ -367,8 +547,10 @@ a { color: inherit; }
   display: flex;
   flex-direction: row;
   gap: 0.6rem;
-  height: 260px;
+  min-height: 200px;
+  max-height: 480px;
   overflow-x: auto;
+  overflow-y: auto;
   padding: 0.9rem 1rem;
   margin-bottom: 0.8rem;
   border: 1px solid var(--border-strong);
@@ -385,6 +567,24 @@ a { color: inherit; }
 .transcription-vertical-col {
   writing-mode: vertical-rl;
   letter-spacing: 0.05em;
+  border-radius: 3px;
+  transition: background 0.12s, outline-color 0.12s;
+}
+
+/* Manual reading-order fix (6.19): drag a column to move it elsewhere. */
+.transcription-vertical-col.reorderable {
+  cursor: grab;
+  padding: 0 2px;
+}
+
+.transcription-vertical-col.reorderable:active {
+  cursor: grabbing;
+}
+
+.transcription-vertical-col.drag-over {
+  background: rgba(178, 58, 43, 0.12);
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
 }
 
 /* Editable transcription textarea */

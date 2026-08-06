@@ -35,7 +35,7 @@ from model.kuronet.roi.roi_ordering import ROIReadingOrder
 from model.kuronet.roi.roi_pool import ROIPoolEncoder
 from model.kuronet.roi.roi_refinement import ROIRefinementHead
 from model.kuronet.roi.roi_tokens import ROITokenProjector
-
+from typing import Literal
 
 def _compute_neighbor_features(
     boxes: torch.Tensor,   # (B, T, 4) xyxy, sorted by reading order
@@ -195,7 +195,7 @@ class KuroNetRecognizer(nn.Module):
         use_context: bool = True,
         context_hidden_dim: int = 384,
         context_num_layers: int = 2,
-        context_mode: str = "gru",
+        context_mode: Literal["bigru", "gru"] = "bigru",
         context_block_gap_factor: float = 2.5,
 
         # Classifier head
@@ -452,7 +452,7 @@ class KuroNetRecognizer(nn.Module):
         )
 
         roi_feats_for_refine = roi_out["roi_feats"]
-        if _crop_stream is not None and _crop_feats is not None:
+        if _crop_stream is not None and _crop_feats is not None and self.crop_fusion is not None:
             # Wait for crop encoder stream before fusing (CUDA only)
             if torch.cuda.is_available():
                 torch.cuda.current_stream().wait_stream(_crop_stream)
@@ -563,6 +563,7 @@ class KuroNetRecognizer(nn.Module):
             "ordered_boxes": ordered["boxes"],
             "ordered_mask": ordered["mask"],
             "sort_indices": ordered["sort_indices"],
+            "col_ids": ordered.get("col_ids", None),
             "isolation_mask": ordered.get("isolation_mask", None),
             "furigana_mask":  ordered.get("furigana_mask",  None),
             "ordering_diagnostics": ordered.get("ordering_diagnostics", None),
@@ -645,6 +646,8 @@ class KuroNetRecognizer(nn.Module):
                 # Reorder refine_scores into sorted order for filtering
                 si = sort_indices[b]  # (T,)
                 valid_si = si[mask_b]
+                if refine_scores is None:
+                    raise ValueError("refine_scores must be provided for score_thresh filtering.")
                 scores_ordered = refine_scores[b].index_select(0, valid_si)
                 score_mask = torch.sigmoid(scores_ordered) >= score_thresh
                 valid_positions = mask_b.nonzero(as_tuple=True)[0][score_mask]

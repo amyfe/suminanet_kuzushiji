@@ -238,21 +238,27 @@ def build_dataloaders(vocab: VocabManager, world_size: int = 1):
 def build_kuronet_model(
     vocab: VocabManager,
     warmup_ckpt: Optional[str | Path] = None,
+    load_stage1_weights: bool = True,
 ) -> KuroNetRecognizer:
     """
     Build KuroNetRecognizer.
 
-    Loads backbone + detector weights from Stage 1 checkpoint.
+    Loads backbone + detector weights from Stage 1 checkpoint (unless
+    load_stage1_weights=False, e.g. at inference/eval, where a full KuroNet
+    checkpoint is loaded on top right after and would overwrite them anyway).
     Optionally warm-starts shared ROI pipeline from warmup checkpoint.
     """
     vocab_size = vocab.vocab_size
 
-    stage1_ckpt = CHECKPOINT_DIR / "stage1_detection" / "detector_best.pt"
-    if not stage1_ckpt.exists():
-        raise FileNotFoundError(f"Stage 1 checkpoint not found: {stage1_ckpt}")
+    if load_stage1_weights:
+        stage1_ckpt = CHECKPOINT_DIR / "stage1_detection" / "detector_best.pt"
+        if not stage1_ckpt.exists():
+            raise FileNotFoundError(f"Stage 1 checkpoint not found: {stage1_ckpt}")
+        ckpt = torch.load(stage1_ckpt, map_location=DEVICE)
+        backbone_type = ckpt.get("backbone_type", BACKBONE_TYPE)
+    else:
+        backbone_type = BACKBONE_TYPE
 
-    ckpt = torch.load(stage1_ckpt, map_location=DEVICE)
-    backbone_type = ckpt.get("backbone_type", BACKBONE_TYPE)
     backbone = build_backbone(backbone_type, BACKBONE_BASE_FEATURES, pretrained=False).to(DEVICE)
     detector = DetectorHead(
         in_ch=BACKBONE_BASE_FEATURES,
@@ -262,10 +268,14 @@ def build_kuronet_model(
         predict_classes=False,
     ).to(DEVICE)
 
-    state_key = "backbone_state_dict" if "backbone_state_dict" in ckpt else "unet_state_dict"
-    backbone.load_state_dict(ckpt[state_key])
-    detector.load_state_dict(ckpt["detector_state_dict"])
-    print(f"Loaded Stage 1 weights from {stage1_ckpt} (backbone={backbone_type})")
+    if load_stage1_weights:
+        state_key = "backbone_state_dict" if "backbone_state_dict" in ckpt else "unet_state_dict"
+        backbone.load_state_dict(ckpt[state_key])
+        detector.load_state_dict(ckpt["detector_state_dict"])
+        print(f"Loaded Stage 1 weights from {stage1_ckpt} (backbone={backbone_type})")
+    else:
+        print(f"Skipping Stage 1 checkpoint read (backbone={backbone_type}); "
+              f"weights will be loaded from the KuroNet checkpoint instead.")
 
     bg_id = vocab.bg_id if hasattr(vocab, "bg_id") and vocab.BG_TOKEN in vocab.char2id else None
 
@@ -1152,20 +1162,9 @@ def validate_kuronet(
         metrics["per_image_cer"]    = per_image_cer_list
         metrics["topk_in_gt"]       = topk_in_gt_list
 
-    # Top-K confusion pairs for hard negative mining in the next epoch.
-    # Excluded pair types (mining these destabilises training):
-    #   1. pred == bg_id  → BG-escape pairs trigger a cascade into voiced/unvoiced errors
-    #   2. ALL intra-kana confusions (both gt AND pred are hiragana or katakana) →
-    #      kana confusions (き↔さ, て↔く, ハ↔は, …) are handled by the script-aux-head
-    #      (λ=0.15); penalising them through hard-neg mining creates conflicting gradients
-    #   3. Iteration marks (ゝ/ヽ/ゞ/ヾ/〱/〲) confused with visually similar kana
-    #      are a visual-similarity floor that extra loss weight cannot overcome
-    # Mining focuses on kanji↔kanji and kanji↔other confusions, where the aux head
-    # cannot help and gradient signal is most needed.
-
     _ITERATION_MARK_IDS: set = {
-        vocab.char2id[c] for c in ("ゝ", "ヽ", "ゞ", "ヾ", "〱", "〲")
-        if c in vocab.char2id
+        vocab.char2id[tok] for c in ("ゝ", "ヽ", "ゞ", "ヾ", "〱", "〲")
+        if (tok := f"U+{ord(c):04X}") in vocab.char2id
     }
 
     def _is_kana(char_id: int) -> bool:
@@ -1431,21 +1430,21 @@ def train_epoch(
         n_batches += 1
         t_batch_start = _sync()   # start timing next batch's data-load from here
 
-        # if CHECK_TIMING_EVERY_N > 0 and n_batches % CHECK_TIMING_EVERY_N == 0:
-        #     n = n_batches
-        #     total_t = t_data + t_transfer + t_forward + t_targets + t_loss + t_backward + t_step + t_metrics
-        #     print(
-        #         f"\n[TIMING] step {n_batches} | "
-        #         f"total={total_t/n*1000:.0f}ms/batch  "
-        #         f"data={t_data/n*1000:.0f}  "
-        #         f"transfer={t_transfer/n*1000:.0f}  "
-        #         f"forward={t_forward/n*1000:.0f}  "
-        #         f"targets={t_targets/n*1000:.0f}  "
-        #         f"loss={t_loss/n*1000:.0f}  "
-        #         f"backward={t_backward/n*1000:.0f}  "
-        #         f"optim={t_step/n*1000:.0f}  "
-        #         f"metrics={t_metrics/n*1000:.0f}  (all ms)"
-        #     )
+        if CHECK_TIMING_EVERY_N > 0 and n_batches % CHECK_TIMING_EVERY_N == 0:
+            n = n_batches
+            total_t = t_data + t_transfer + t_forward + t_targets + t_loss + t_backward + t_step + t_metrics
+            print(
+                f"\n[TIMING] step {n_batches} | "
+                f"total={total_t/n*1000:.0f}ms/batch  "
+                f"data={t_data/n*1000:.0f}  "
+                f"transfer={t_transfer/n*1000:.0f}  "
+                f"forward={t_forward/n*1000:.0f}  "
+                f"targets={t_targets/n*1000:.0f}  "
+                f"loss={t_loss/n*1000:.0f}  "
+                f"backward={t_backward/n*1000:.0f}  "
+                f"optim={t_step/n*1000:.0f}  "
+                f"metrics={t_metrics/n*1000:.0f}  (all ms)"
+            )
 
         if (batch_idx + 1) % KURONET_PROGRESS_POSTFIX_N == 0:
             bar.set_postfix({
@@ -1532,18 +1531,25 @@ def main():
             for s in self._streams:
                 s.flush()
 
-    _log_fh = open(log_dir / "train_stage2_kuronet.log", "a")
-    sys.stdout = _Tee(sys.__stdout__, _log_fh)
-    sys.stderr = _Tee(sys.__stderr__, _log_fh)
+    # sys.__stdout__/__stderr__ are the process's ORIGINAL streams, unaffected by the
+    # devnull reassignment above -- so this tee must be skipped on non-zero ranks, or
+    # it silently undoes that reassignment and every rank ends up writing to the same
+    # log file / console again (world_size copies of every line).
+    if rank == 0:
+        _log_fh = open(log_dir / "train_stage2_kuronet.log", "a")
+        sys.stdout = _Tee(sys.__stdout__, _log_fh)
+        sys.stderr = _Tee(sys.__stderr__, _log_fh)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_dir / 'train_stage2_kuronet.log'),
-            logging.StreamHandler()
-        ]
-    )
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_dir / 'train_stage2_kuronet.log'),
+                logging.StreamHandler()
+            ]
+        )
+    else:
+        logging.basicConfig(level=logging.CRITICAL + 1, handlers=[logging.NullHandler()])
     logger = logging.getLogger(__name__)
 
     # Fixed input sizes → cuDNN finds optimal kernels once and reuses them.
@@ -1608,7 +1614,12 @@ def main():
         # trainable_params above already holds direct references to the same
         # tensor objects (DDP wraps, never clones), so the optimizer stays
         # correctly attached regardless of wrap order relative to this line.
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        # find_unused_parameters=True: this model's active parameter subset
+        # varies per forward pass (variable ROI counts, hard-negative-mining
+        # masking, optional SAM2 bypass), so some trainable params legitimately
+        # get no gradient on a given step -- without this flag DDP's reducer
+        # hangs/errors expecting every bucketed param to be touched every step.
+        model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
 
     optimizer = optim.AdamW(
         trainable_params,
@@ -1697,6 +1708,12 @@ def main():
                 with open(hard_neg_path, "w") as f:
                     json.dump(new_pairs, f)
                 print(f"Saved {len(new_pairs)} hard-negative pairs → {hard_neg_path.name}")
+                decoded = [
+                    f"{unicode_token_to_char(vocab.id2char.get(g, '?'))}"
+                    f"→{unicode_token_to_char(vocab.id2char.get(p, '?'))}"
+                    for g, p in new_pairs
+                ]
+                print(f"  Mined pairs: {decoded}")
 
         # Two-phase crop encoder freeze: unfreeze for domain adaptation, then freeze to save compute.
         # Triggered once when epoch crosses KURONET_FREEZE_CROP_ENCODER_AFTER.
@@ -1728,7 +1745,7 @@ def main():
                 # stores a reference + broadcasts values at construction), so
                 # the optimizer's param_groups/state (keyed by tensor
                 # identity) stay validly attached across this cycle.
-                model = DistributedDataParallel(raw_model, device_ids=[local_rank])
+                model = DistributedDataParallel(raw_model, device_ids=[local_rank], find_unused_parameters=True)
 
         # Scoring/checkpointing/early-stop decisions are computed on rank 0
         # (the only rank with val_metrics); only the early-stop decision

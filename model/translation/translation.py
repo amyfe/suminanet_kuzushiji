@@ -34,6 +34,7 @@ import logging
 import math
 import re
 import statistics
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -79,11 +80,18 @@ def _strip_furigana_heuristic(text: str) -> str:
     return _FURIGANA_RUN_RE.sub(_mark, text)
 
 
-def _detect_block_breaks(chars: List[Dict], gap_factor: float) -> set:
-    """Indices into chars/classical_text where a new independent text block
-    starts. Reimplements the median-gap heuristic from _compute_block_ids()
-    in model/kuronet/kuronet_recognizer.py in plain Python (this module
-    stays torch-free) — keep the two in sync if the heuristic changes.
+def _detect_block_breaks_by_distance(chars: List[Dict], gap_factor: float) -> set:
+    """Fallback heuristic for chars lists without `col_id` (older cached
+    result.json files predating column-id support, or synthetic chars lists
+    built without it): flags a break wherever the Euclidean distance between
+    consecutive box centres exceeds gap_factor x the page's median inter-char
+    distance.
+
+    Kept only as a fallback -- on any real multi-column vertical page this
+    fires at EVERY column transition (bottom of one column to top of the
+    next is a large jump by construction), not just genuine content breaks.
+    Prefer _detect_column_breaks + _detect_block_breaks below whenever
+    `col_id` is available, which is now the normal case via run_inference().
     """
     if len(chars) < 2:
         return set()
@@ -101,20 +109,116 @@ def _detect_block_breaks(chars: List[Dict], gap_factor: float) -> set:
     return {i + 1 for i, d in enumerate(dists) if d > gap_factor * median}
 
 
+def _detect_column_breaks(chars: List[Dict]) -> set:
+    """Indices into chars/classical_text where a new column (or row, for
+    horizontal orientation) starts, using each char's `col_id` (from
+    ROIReadingOrder, threaded through by run_inference()). Deterministic --
+    no threshold. Returns an empty set if `col_id` isn't present on every
+    char, signalling callers to fall back to the distance heuristic instead.
+    """
+    if len(chars) < 2 or any("col_id" not in c for c in chars):
+        return set()
+    return {
+        i + 1 for i in range(len(chars) - 1)
+        if chars[i]["col_id"] != chars[i + 1]["col_id"]
+    }
+
+
+def _column_stats(chars: List[Dict], col_id: int) -> dict:
+    """Aggregate geometry for one column: median character area, vertical
+    span, and mean x-center -- used to judge whether an adjacent column looks
+    like a continuation of the same content or genuinely different content.
+    """
+    boxes = [c["box"] for c in chars if c.get("col_id") == col_id]
+    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]
+    ys = [(b[1] + b[3]) / 2.0 for b in boxes]
+    xs = [(b[0] + b[2]) / 2.0 for b in boxes]
+    return {
+        "median_area": statistics.median(areas),
+        "y_span": (max(ys) - min(ys)) if len(ys) > 1 else 0.0,
+        "x_center": statistics.mean(xs),
+    }
+
+
+def _detect_block_breaks(
+    chars: List[Dict],
+    gap_factor: float,
+    area_ratio_thresh: float = 2.0,
+    gap_pitch_factor: float = 2.0,
+) -> set:
+    """Indices into chars/classical_text where a new independent text block
+    starts (a caption, marginal note, or unrelated inscription) -- as opposed
+    to a mere column wrap within one continuous narrative.
+
+    When `col_id` is available, a block boundary is only ever considered AT a
+    column-transition point (see _detect_column_breaks), and only when the
+    two adjacent columns also look like different content: their median
+    character area differs by more than area_ratio_thresh x, or the
+    horizontal gap between their x-centers exceeds gap_pitch_factor x the
+    page's typical inter-column pitch. A column transition where neither
+    holds is treated as a plain column wrap, not a block boundary.
+
+    Falls back to _detect_block_breaks_by_distance when `col_id` is
+    unavailable on the chars list (thresholds above then unused). Exact
+    thresholds are a first pass -- validate visually against real
+    multi-column pages before treating them as final.
+    """
+    column_breaks = _detect_column_breaks(chars)
+    if not column_breaks:
+        if len(chars) >= 2 and any("col_id" not in c for c in chars):
+            return _detect_block_breaks_by_distance(chars, gap_factor)
+        return set()
+
+    col_order: List[int] = []
+    seen = set()
+    for c in chars:
+        cid = c["col_id"]
+        if cid not in seen:
+            seen.add(cid)
+            col_order.append(cid)
+
+    stats_by_col = {cid: _column_stats(chars, cid) for cid in col_order}
+    pitches = [
+        abs(stats_by_col[col_order[i + 1]]["x_center"] - stats_by_col[col_order[i]]["x_center"])
+        for i in range(len(col_order) - 1)
+    ]
+    median_pitch = statistics.median(pitches) if pitches else 0.0
+
+    blocks = set()
+    for i in column_breaks:
+        s_prev = stats_by_col[chars[i - 1]["col_id"]]
+        s_next = stats_by_col[chars[i]["col_id"]]
+
+        area_ratio = max(s_prev["median_area"], s_next["median_area"]) / max(
+            1e-6, min(s_prev["median_area"], s_next["median_area"])
+        )
+        pitch_gap = abs(s_next["x_center"] - s_prev["x_center"])
+
+        if area_ratio > area_ratio_thresh or (
+            median_pitch > 1e-6 and pitch_gap > gap_pitch_factor * median_pitch
+        ):
+            blocks.add(i)
+    return blocks
+
+
 def _build_llm_text(text: str, chars: List[Dict], uncertain_threshold: float, block_gap_factor: float) -> str:
     """Build the LLM-facing text: insert "｜" at detected text-block
-    boundaries and wrap OCR-uncertain characters as "[char:NN%]".
+    boundaries, a plain "\\n" at column-only boundaries (no content change,
+    just a layout wrap), and wrap OCR-uncertain characters as "[char:NN%]".
 
     `chars` must be positionally 1:1 with `text` (guaranteed by
-    run_inference()'s chars_out). The two transforms are combined into a
-    single pass since inserting either kind of token would break the index
-    alignment the other one needs.
+    run_inference()'s chars_out). The three transforms are combined into a
+    single pass since inserting any of them would break the index alignment
+    the others need.
     """
-    breaks = _detect_block_breaks(chars, block_gap_factor)
+    column_breaks = _detect_column_breaks(chars)
+    block_breaks = _detect_block_breaks(chars, block_gap_factor)
     out = []
     for i, (ch, c) in enumerate(zip(text, chars)):
-        if i in breaks:
+        if i in block_breaks:
             out.append("｜")
+        elif i in column_breaks:
+            out.append("\n")
         score = c.get("score", 1.0)
         if score < uncertain_threshold:
             out.append(f"[{ch}:{score * 100:.0f}%]")
@@ -201,6 +305,8 @@ class EdoPeriodTranslationPipeline:
         strip_furigana: bool = True,
         normalize_historical: bool = True,
         chars: Optional[List[Dict]] = None,
+        combined: bool = True,
+        lang: str = "en",
     ) -> Dict:
         if chars:
             actual = "".join(c.get("char", "") for c in chars)
@@ -212,10 +318,6 @@ class EdoPeriodTranslationPipeline:
                 )
                 chars = None
 
-        # Plain track: always derived from the raw, un-annotated text.
-        # Feeds classical_japanese/normalized_japanese (display fields) and
-        # the classical_text= reference context for the English-translation
-        # call. Unaffected by confidence annotation.
         cleaned = _preprocess(classical_text, strip_furigana=strip_furigana)
 
         if len(cleaned) > TRANSLATION_MAX_INPUT_CHARS:
@@ -226,19 +328,14 @@ class EdoPeriodTranslationPipeline:
             )
 
         # Step 0: MeCab + UniDic normalization
+        pipeline_start = time.perf_counter()
+        step_start = pipeline_start
         if normalize_historical:
             norm = self._normalizer.normalize(cleaned)
         else:
             norm = None
+        logger.info("translate_text: normalize step took %.2fs", time.perf_counter() - step_start)
 
-        # LLM-input track: only for the classical_to_modern call. When chars
-        # are available, annotate uncertain characters onto the raw text
-        # first (preserves strict 1:1 alignment with chars), then apply
-        # furigana-marking on top. MeCab normalization is intentionally
-        # skipped for this call — its orthBase substitution can change
-        # character identity, and its behavior on injected ASCII/bracket
-        # annotations is unvalidated. The plain `norm` above still populates
-        # normalized_japanese/normalization_method for display.
         if chars:
             annotated = _build_llm_text(
                 classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, KURONET_CONTEXT_BLOCK_GAP_FACTOR
@@ -247,26 +344,45 @@ class EdoPeriodTranslationPipeline:
         else:
             text_for_llm = norm.normalized if norm else cleaned
 
-        # Step 1: classical → modern Japanese
-        modern, modern_usage = self._translator.classical_to_modern(text_for_llm)
+        mecab_reference = norm.normalized if (chars and norm) else None
+        step_start = time.perf_counter()
+        if combined:
+            # Step 1+2: classical → modern → English in one call
+            translation, usage = self._translator.translate_classical_to_english(
+                text_for_llm, mecab_reference=mecab_reference, lang=lang
+            )
+            logger.info("translate_text: classical_to_modern_and_english (Claude) took %.2fs", time.perf_counter() - step_start)
+            logger.info("translate_text: total pipeline took %.2fs", time.perf_counter() - pipeline_start)
+            modern_japanese = translation["modern_japanese"]
+            conversion_notes = translation.get("notes", "")
+        else:
+            # Step 1: classical → modern Japanese
+            modern, modern_usage = self._translator.classical_to_modern(
+                text_for_llm, mecab_reference=mecab_reference
+            )
+            logger.info("translate_text: classical_to_modern (Claude) took %.2fs", time.perf_counter() - step_start)
 
-        # Step 2: modern → English
-        translation, english_usage = self._translator.translate_to_english(
-            modern["modern_japanese"], classical_text=cleaned
-        )
-
+            # Step 2: modern → English
+            step_start = time.perf_counter()
+            translation, english_usage = self._translator.translate_to_english(
+                modern["modern_japanese"], classical_text=cleaned, lang=lang
+            )
+            logger.info("translate_text: translate_to_english (Claude) took %.2fs", time.perf_counter() - step_start)
+            logger.info("translate_text: total pipeline took %.2fs", time.perf_counter() - pipeline_start)
+            usage = _sum_usage(modern_usage, english_usage)
+            modern_japanese = modern["modern_japanese"]
+            conversion_notes = modern.get("notes", "")
         return {
             "classical_japanese":   cleaned,
             "normalized_japanese":  norm.normalized if norm else cleaned,
             "normalization_method": norm.method if norm else "none",
             "normalization_notes":  norm.notes if norm else "",
-            "modern_japanese":      modern["modern_japanese"],
-            "conversion_notes":     modern.get("notes", ""),
-            "conversion_truncated": modern.get("truncated", False),
+            "modern_japanese":      modern_japanese,
+            "conversion_notes":     conversion_notes,
             "english_translation":  translation["english_translation"],
             "translation_notes":    translation.get("translation_notes", ""),
             "translation_truncated": translation.get("truncated", False),
-            "usage":                _sum_usage(modern_usage, english_usage),
+            "usage":                usage,
         }
 
     # ------------------------------------------------------------------

@@ -16,11 +16,16 @@ import json
 import sys
 from pathlib import Path
 
+from PIL import Image
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from visualization.dataset import (
+    _script,
+    plot_augmentation_comparison,
     plot_chars_per_image,
     plot_class_imbalance,
+    plot_copy_paste_augmentation,
     plot_script_distribution,
     plot_split_overview,
     plot_top_characters,
@@ -84,6 +89,97 @@ def _load_dataset_stats(assets_root: Path):
     return label_counts, split_label_counts, chars_per_image, split_cpi, split_image_counts
 
 
+def _find_rare_char_example(
+    assets_root: Path,
+    rare_chars: set[str],
+    pad: int = 350,
+):
+    """
+    Scan annotations for the first image containing a rare character.
+    Returns (image_path, crop_box, boxes, labels) where crop_box is padded
+    around that character so a few neighbouring glyphs stay visible for
+    context; boxes/labels are the full GT for that page (original scale).
+    Returns (None, None, None, None) if no rare character is found.
+    """
+    ann_dir = assets_root / "data" / "annotations"
+    for f in sorted(ann_dir.glob("*.json")):
+        d = json.load(open(f, encoding="utf-8"))
+        labels = d.get("labels", [])
+        boxes = d.get("boxes", d.get("bboxes", []))
+        img_rel = d.get("image_path")
+        if not labels or not boxes or not img_rel:
+            continue
+        for lbl, box in zip(labels, boxes):
+            if lbl not in rare_chars:
+                continue
+            img_path = assets_root / "data" / img_rel
+            if not img_path.exists():
+                continue
+            with Image.open(img_path) as im:
+                w, h = im.size
+            x1, y1, x2, y2 = box
+            crop_box = (
+                max(0, int(x1) - pad),
+                max(0, int(y1) - pad),
+                min(w, int(x2) + pad),
+                min(h, int(y2) + pad),
+            )
+            return img_path, crop_box, boxes, labels
+    return None, None, None, None
+
+
+def _build_rare_kanji_crop_db(
+    assets_root: Path,
+    rare_kanji_chars: set[str],
+    min_crops: int = 10,
+    max_files_scanned: int = 2000,
+) -> dict:
+    """
+    Build a small crop database of rare-kanji glyphs for the copy-paste demo.
+    Scans annotations (only loading an image when the annotation actually
+    contains a rare kanji) until at least `min_crops` crops are collected or
+    `max_files_scanned` candidate files have been read, whichever comes first.
+    """
+    import cv2
+
+    ann_dir = assets_root / "data" / "annotations"
+    db: dict[str, list] = collections.defaultdict(list)
+    scanned = 0
+
+    for f in sorted(ann_dir.glob("*.json")):
+        if scanned >= max_files_scanned or sum(len(v) for v in db.values()) >= min_crops:
+            break
+        d = json.load(open(f, encoding="utf-8"))
+        labels = d.get("labels", [])
+        boxes = d.get("boxes", d.get("bboxes", []))
+        img_rel = d.get("image_path")
+        if not labels or not boxes or not img_rel:
+            continue
+        if not any(lbl in rare_kanji_chars for lbl in labels):
+            continue
+        scanned += 1
+
+        img_path = assets_root / "data" / img_rel
+        if not img_path.exists():
+            continue
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+
+        for lbl, box in zip(labels, boxes):
+            if lbl not in rare_kanji_chars:
+                continue
+            x1, y1, x2, y2 = (int(round(v)) for v in box)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            db[lbl].append(img[y1:y2, x1:x2].copy())
+
+    return dict(db)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Dataset introduction visualizations for thesis")
     p.add_argument("--assets-root", default="assets",
@@ -93,6 +189,18 @@ def parse_args() -> argparse.Namespace:
                    help="Number of top characters to show in the bar chart")
     p.add_argument("--rare-thresh", type=int, default=50,
                    help="Characters with fewer occurrences are classified as 'rare'")
+    p.add_argument("--aug-image", default=None,
+                   help="Image to use for the augmentation comparison plot. "
+                        "Defaults to the first image found containing a rare character.")
+    p.add_argument("--aug-crop", default=None,
+                   help="Crop box 'x1,y1,x2,y2' applied before augmenting (default: auto, "
+                        "centered on a rare character). Use 'none' to disable cropping.")
+    p.add_argument("--skip-aug-demo", action="store_true",
+                   help="Skip the classic-vs-rare augmentation comparison plot")
+    p.add_argument("--copy-paste-n", type=int, default=3,
+                   help="Number of rare-kanji crops to paste in the copy-paste demo plot")
+    p.add_argument("--skip-copy-paste-demo", action="store_true",
+                   help="Skip the rare-kanji copy-paste augmentation demo plot")
     return p.parse_args()
 
 
@@ -177,6 +285,56 @@ def main() -> None:
         split_chars_per_image=split_cpi,
         out_path=out_dir / "chars_per_image.png",
     )
+
+    rare_chars = {ch for ch, cnt in label_counts.items() if cnt < args.rare_thresh}
+    example_img_path = example_boxes = example_labels = example_crop_box = None
+    if not args.aug_image or not args.skip_copy_paste_demo:
+        print("  Locating an example image with a rare character …")
+        example_img_path, example_crop_box, example_boxes, example_labels = \
+            _find_rare_char_example(assets, rare_chars)
+
+    if not args.skip_aug_demo:
+        if args.aug_image:
+            img_path = Path(args.aug_image)
+            crop_box = None
+        else:
+            img_path, crop_box = example_img_path, example_crop_box
+
+        if args.aug_crop == "none":
+            crop_box = None
+        elif args.aug_crop:
+            crop_box = tuple(int(v) for v in args.aug_crop.split(","))
+
+        if img_path is None:
+            print("  Skipping augmentation comparison plot (no rare-character image found).")
+        else:
+            print(f"  Plotting classic-vs-rare augmentation comparison ({img_path.name}) …")
+            plots["augmentation_comparison"] = plot_augmentation_comparison(
+                img_path,
+                crop_box=crop_box,
+                out_path=out_dir / "augmentation_comparison.png",
+            )
+
+    if not args.skip_copy_paste_demo:
+        rare_kanji = {ch for ch in rare_chars if _script(ch) == "Kanji"}
+        if example_img_path is None or not rare_kanji:
+            print("  Skipping copy-paste demo (no rare-kanji example image found).")
+        else:
+            print("  Building a small rare-kanji crop database …")
+            crop_db = _build_rare_kanji_crop_db(assets, rare_kanji)
+            if not crop_db:
+                print("  Skipping copy-paste demo (could not collect any rare-kanji crops).")
+            else:
+                print(f"  Plotting rare-kanji copy-paste demo ({example_img_path.name}) …")
+                plots["copy_paste_augmentation"] = plot_copy_paste_augmentation(
+                    example_img_path,
+                    boxes=example_boxes,
+                    labels=example_labels,
+                    rare_chars=rare_kanji,
+                    crop_db=crop_db,
+                    n_paste=args.copy_paste_n,
+                    out_path=out_dir / "copy_paste_augmentation.png",
+                )
 
     # ------------------------------------------------------------------
     # 4. Summary

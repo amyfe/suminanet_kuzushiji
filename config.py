@@ -17,12 +17,13 @@ DATA_ZIP_DIR = ROOT / "assets/data_cached"
 CHECKPOINT_DIR = ROOT / "checkpoints"
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 
-# Optional: books excluded from validation/test experiments
-EXCLUDE_BOOKS = {
-    "200021925",
-    "200022050",
-    "200025191",
-    "umgy00000",
+EXCLUDE_BOOKS = set()
+
+EXCLUDE_PAGES = {
+    "200021925": ["200021925_00003_2.jpg", "200021925_00007_2.jpg", "200021925_00012_1.jpg", "200021925_00012_2.jpg", "200021925_00013_2.jpg"],
+    "200022050": ["200022050_00004_2.jpg", "200022050_00006_2.jpg", "200022050_00007_2.jpg", "200022050_00010_1.jpg", "200022050_00014_2.jpg"],
+    "200025191": ["200025191_00021_2.jpg", "200025191_00039_2.jpg", "200025191_00057_1.jpg", "200025191_00061_1.jpg", "200025191_00061_2.jpg"],
+    "umgy00000": ["umgy001_004.jpg", "umgy002_032.jpg", "umgy006_034.jpg", "umgy010_023.jpg", "umgy012_025.jpg"],
 }
 
 
@@ -66,7 +67,6 @@ IN_CHANNELS = 3
 #                      outputs at stride=2 (H//2, W//2). Requires timm.
 BACKBONE_TYPE = "efficientnet_b2"
 BACKBONE_BASE_FEATURES = 64
-NUM_CLASSES = 3000
 
 
 # ============================================================
@@ -211,13 +211,13 @@ STAGE2_TRAIN_PROP_STATS_EVERY_N_STEPS = 8
 # Warmup training (ROI pipeline pre-training for KuroNet)
 # ============================================================
 
-WARMUP_EPOCHS = 15
+WARMUP_EPOCHS = 40
 WARMUP_LAMBDA_BOX = 0.5
 WARMUP_LAMBDA_DELTA = 1.0
 WARMUP_LAMBDA_SCORE = 0.3
 WARMUP_LAMBDA_AUX = 1.0
 
-KURONET_CHECKPOINT_DIR       = CHECKPOINT_DIR / "kuronet_recognizer"
+KURONET_CHECKPOINT_DIR       = CHECKPOINT_DIR /"kuronet_recognizer"
 KURONET_CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 KURONET_USE_CONTEXT          = True
@@ -234,7 +234,7 @@ KURONET_CROP_ENCODER_SIZE    = (112, 112)
 # Phase 2 (epoch FREEZE_AFTER+1+): auto-frozen — only out_proj + crop_fusion keep training.
 #   Drops ~5.3M params from backprop → no longer bottleneck at 112px.
 KURONET_FREEZE_CROP_ENCODER       = False  # start unfrozen
-KURONET_FREEZE_CROP_ENCODER_AFTER = 5      # freeze EfficientNet-B0 weights after this epoch
+KURONET_FREEZE_CROP_ENCODER_AFTER = 8      # freeze EfficientNet-B0 weights after this epoch
 # A dense page of Kuzushiji can yield hundreds of ROIs per image; with
 # STAGE2_BATCH_SIZE=8 and DET_TOP_K up to 500, a single training batch can
 # produce ~4000 crops. When unfrozen (gradients flowing through EfficientNet-
@@ -249,7 +249,7 @@ KURONET_FREEZE_CROP_ENCODER_AFTER = 5      # freeze EfficientNet-B0 weights afte
 # still changes BatchNorm statistics from "computed over all N crops" to
 # "computed per chunk" whenever a batch's ROI count does exceed this value
 # (eval-mode BN uses running stats, unaffected either way).
-KURONET_CROP_ENCODER_CHUNK_SIZE   = 4096
+KURONET_CROP_ENCODER_CHUNK_SIZE   = 8192
 # Pool output size: the AdaptiveAvgPool2d target after the conv layers, before the MLP.
 # This is DISTINCT from STAGE2_ROI_SIZE:
 #   ROI_SIZE    = how finely tv_roi_align samples from the feature map (conv input resolution)
@@ -271,6 +271,13 @@ KURONET_DELTA_SCALE_XY       = 0.25
 KURONET_DELTA_SCALE_WH       = 0.20
 
 KURONET_CER_SCORE_THRESH     = 0.35
+
+# Number of runner-up character candidates (excluding BG) surfaced alongside
+# each transcribed char via the /api/transcribe "alternates" field, so the
+# frontend can show "next best guesses" for low-confidence chars. The chosen
+# top-1 pick is also included as alternates[0] (marked "chosen": True), so
+# the field returns up to KURONET_NUM_ALTERNATES + 1 entries in total.
+KURONET_NUM_ALTERNATES        = 3
 
 # Furigana / noise-box filter: proposals whose area is below this fraction of the
 # median character area are discarded.  Only applied when at least KURONET_FURIGANA_MIN_SAMPLES
@@ -314,8 +321,11 @@ KURONET_WEIGHT_DECAY         = 0.0003042318888471685
 
 # Training
 KURONET_EPOCHS               = 50
-KURONET_EARLY_STOPPING_PATIENCE = 7   # epochs without composite-score improvement before stopping
-KURONET_GRAD_ACCUM_STEPS     = 4
+KURONET_EARLY_STOPPING_PATIENCE = 10   # epochs without composite-score improvement before stopping
+# Effective batch = STAGE2_BATCH_SIZE * KURONET_GRAD_ACCUM_STEPS * (GPU count in
+# submit_kuronet.sh's --gres / NPROC_PER_NODE). Currently 8*1*4=32. Keep this product
+# constant when changing GPU count so LR/WEIGHT_DECAY above stay valid for the new batch.
+KURONET_GRAD_ACCUM_STEPS     = 1
 KURONET_ENABLE_TQDM          = True
 KURONET_PROGRESS_POSTFIX_N   = 70
 KURONET_LOG_PREDICTIONS      = True
@@ -383,3 +393,11 @@ TRANSLATION_MAX_INPUT_CHARS = 1500
 # cost) is a separate concern, tracked as pipeline_analysis.txt item 6.3.
 TRANSLATE_RATE_LIMIT_MAX_REQUESTS = 5
 TRANSLATE_RATE_LIMIT_WINDOW_SECONDS = 600
+
+# /api/transcribe has no external API cost but is GPU-bound, so it gets its
+# own (looser) sliding-window limit plus an upload size cap and inference
+# timeout — pipeline_analysis.txt item 6.3.
+TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = 10
+TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = 60
+MAX_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024
+TRANSCRIBE_INFERENCE_TIMEOUT_SEC = 60.0

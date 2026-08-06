@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -350,3 +351,172 @@ def draw_confidence_boxes(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_path), img)
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Learning curves (train/val over epochs) — justifies the chosen epoch budget
+# ---------------------------------------------------------------------------
+
+_EPOCH_RE = re.compile(
+    r"Epoch\s+(\d+)/\d+\s+\|\s+Train loss=([\d.]+)\s+\(char=([\d.]+),\s*bg=([\d.]+),"
+    r"\s*delta=([\d.]+),\s*score=([\d.]+)\)\s+\|\s+train_top1=([\d.]+)"
+)
+_VAL_LOSS_RE = re.compile(r"Val \| loss=([\d.]+)")
+_VAL_METRICS_RE = re.compile(
+    r"Val \| top1=([\d.]+)\s+top5=([\d.]+)\s+CER=([\d.]+)\s+coverage=([\d.]+)"
+)
+_BEST_RE = re.compile(r"saved best: kuronet_best\.pt \(score=([\d.]+)\)")
+_EARLY_STOP_RE = re.compile(r"Early stopping: (\d+) epochs without improvement\. best=([\d.]+)")
+
+
+def _parse_kuronet_log(log_file: "str | Path") -> tuple[list[dict], int | None]:
+    """
+    Parse train_stage2_kuronet.log epoch/val summary lines.
+
+    Each epoch is logged as three consecutive lines: an "Epoch N/M | Train
+    loss=..." line, a "Val | loss=..." line, and a "Val | top1=... CER=..."
+    line. Returns (records, early_stop_epoch).
+    """
+    records: list[dict] = []
+    pending: dict = {}
+    early_stop_epoch: int | None = None
+    with open(log_file, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            m = _EPOCH_RE.search(line)
+            if m:
+                if pending:
+                    records.append(pending)
+                pending = {
+                    "epoch":      int(m.group(1)),
+                    "train_loss": float(m.group(2)),
+                    "train_top1": float(m.group(7)),
+                }
+                continue
+
+            m = _VAL_LOSS_RE.search(line)
+            if m and pending and "val_loss" not in pending:
+                pending["val_loss"] = float(m.group(1))
+                continue
+
+            m = _VAL_METRICS_RE.search(line)
+            if m and pending and "val_cer" not in pending:
+                pending["val_top1"] = float(m.group(1))
+                pending["val_cer"]  = float(m.group(3))
+                records.append(pending)
+                pending = {}
+                continue
+
+            m = _BEST_RE.search(line)
+            if m and records:
+                records[-1]["is_best"] = True
+                continue
+
+            m = _EARLY_STOP_RE.search(line)
+            if m:
+                early_stop_epoch = records[-1]["epoch"] if records else None
+
+    if pending:
+        records.append(pending)
+    return records, early_stop_epoch
+
+
+def _split_runs(records: list[dict]) -> list[list[dict]]:
+    """Split into contiguous training runs whenever epoch resets (resume)."""
+    if not records:
+        return []
+    runs, current = [], [records[0]]
+    for rec in records[1:]:
+        if rec["epoch"] <= current[-1]["epoch"]:
+            runs.append(current)
+            current = [rec]
+        else:
+            current.append(rec)
+    runs.append(current)
+    return runs
+
+
+def plot_learning_curves(
+    log_file: "str | Path",
+    out_path: "str | Path" = "learning_curves.png",
+) -> "Path | None":
+    """
+    Parse train_stage2_kuronet.log and plot train/val loss + val CER/top1
+    curves, marking the checkpoint that was actually kept (best composite
+    score) and the early-stopping point, if any.
+
+    Returns None if the log file is missing or has no matching lines.
+    """
+    log_file = Path(log_file)
+    if not log_file.exists():
+        print(f"Learning curve: log file not found ({log_file}), skipping.")
+        return None
+
+    records, early_stop_epoch = _parse_kuronet_log(log_file)
+    if not records:
+        print(f"Learning curve: no epoch summary lines found in {log_file}, skipping.")
+        return None
+
+    runs = _split_runs(records)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    ax2b = ax2.twinx()
+    ax2b.set_ylabel("Val top-1 accuracy")
+    colors = plt.cm.tab10.colors
+    global_epoch = 0
+    best_ep = None
+
+    for run_idx, run in enumerate(runs):
+        epochs     = [global_epoch + r["epoch"] for r in run]
+        train_loss = [r["train_loss"] for r in run]
+        val_loss   = [r.get("val_loss") for r in run]
+        val_cer    = [r.get("val_cer")  for r in run]
+        val_top1   = [r.get("val_top1") for r in run]
+
+        c_t = colors[run_idx % len(colors)]
+        c_v = colors[(run_idx + 5) % len(colors)]
+
+        label_sfx = f" (run {run_idx + 1})" if len(runs) > 1 else ""
+        ax1.plot(epochs, train_loss, "-",  color=c_t, linewidth=1.5, label=f"Train{label_sfx}")
+        ax1.plot(epochs, val_loss,   "--", color=c_v, linewidth=1.5, label=f"Val{label_sfx}")
+
+        ax2.plot(epochs, val_cer, "--", color=c_v, linewidth=1.5, label=f"Val CER{label_sfx}")
+        ax2b.plot(epochs, val_top1, "-", color=c_t, linewidth=1.2, alpha=0.7,
+                  label=f"Val top1{label_sfx}")
+
+        for r, ep in zip(run, epochs):
+            if r.get("is_best"):
+                best_ep = ep
+
+        if run_idx > 0:
+            for ax in [ax1, ax2]:
+                ax.axvline(epochs[0], color="grey", linestyle=":", linewidth=0.8, alpha=0.6)
+
+        global_epoch = epochs[-1]
+
+    if best_ep is not None:
+        for ax in [ax1, ax2]:
+            ax.axvline(best_ep, color="crimson", linestyle="--", linewidth=1.0,
+                       alpha=0.7, label=f"Best checkpoint (epoch {best_ep})")
+
+    if early_stop_epoch is not None:
+        for ax in [ax1, ax2]:
+            ax.axvline(early_stop_epoch, color="black", linestyle=":", linewidth=1.2,
+                       alpha=0.7, label=f"Early stop (epoch {early_stop_epoch})")
+
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.set_title("Total loss")
+    ax1.grid(True, alpha=GRID_ALPHA)
+    ax1.legend(fontsize=7, ncol=2)
+
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Val CER")
+    ax2.set_title("Val CER vs top-1 accuracy")
+    ax2.grid(True, alpha=GRID_ALPHA)
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    lines2b, labels2b = ax2b.get_legend_handles_labels()
+    ax2.legend(lines2 + lines2b, labels2 + labels2b, fontsize=7, ncol=2)
+
+    fig.suptitle("Stage 2 (KuroNet) training curves", fontsize=11)
+    fig.tight_layout()
+    return savefig(fig, out_path)

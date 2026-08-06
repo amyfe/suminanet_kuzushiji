@@ -339,7 +339,7 @@ def run_validation(
     vocab = load_vocab()
     _, val_loader = build_dataloaders(vocab)
 
-    model = build_kuronet_model(vocab=vocab)
+    model = build_kuronet_model(vocab=vocab, load_stage1_weights=False)
     epoch = _load_kuronet_weights(model, ckpt_path)
     model.eval()
     print(f"Loaded checkpoint: {ckpt_path}  (epoch={epoch})")

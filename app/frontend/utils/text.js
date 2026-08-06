@@ -1,3 +1,20 @@
+// Mirrors KURONET_CER_SCORE_THRESH (0.35, the cutoff for a char surviving
+// detection at all) and TRANSLATION_UNCERTAIN_SCORE_THRESH (0.6, the "still
+// shaky" bar used to bracket chars for Claude) in config.py, so the UI's
+// confidence tiers stay conceptually aligned with the backend's own bars.
+const SCORE_LOW_THRESH = 0.35
+const SCORE_MEDIUM_THRESH = 0.6
+
+export function scoreTier(score) {
+  if (score < SCORE_LOW_THRESH) return 'low'
+  if (score < SCORE_MEDIUM_THRESH) return 'medium'
+  return 'high'
+}
+
+export function formatScore(score) {
+  return (score * 100).toFixed(1) + '%'
+}
+
 export function columnsOf(text, maxCols) {
   const chars = Array.from(text)
   const numCols = Math.min(maxCols, Math.max(1, Math.ceil(chars.length / 3)))

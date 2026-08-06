@@ -13,13 +13,22 @@ Run from project root:
 
 from __future__ import annotations
 
+import asyncio
 import io
+import logging
+import os
 import sys
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# INFO-level logs (e.g. the per-step timing breakdown in translation.py,
+# logged to diagnose slow /api/translate requests) are silently dropped
+# without a configured handler — Python's root logger defaults to WARNING.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 # Make project root importable regardless of working directory
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -39,11 +48,15 @@ from config import (
     DEVICE,
     IMAGE_SIZE,
     KURONET_CER_SCORE_THRESH,
+    MAX_UPLOAD_SIZE_BYTES,
+    TRANSCRIBE_INFERENCE_TIMEOUT_SEC,
+    TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+    TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
     TRANSLATE_RATE_LIMIT_MAX_REQUESTS,
     TRANSLATE_RATE_LIMIT_WINDOW_SECONDS,
 )
-from model.translation.infer import _TRANSFORM, _align_compile_keys, load_kuronet, run_inference, _unletterbox_boxes
-from train_stage2_kuronet import build_kuronet_model, load_vocab
+from model.translation.infer import _TRANSFORM, load_kuronet, run_inference, _unletterbox_boxes
+from train_stage2_kuronet import load_vocab
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +72,19 @@ _translation_pipeline = None
 def _get_translation_pipeline():
     global _translation_pipeline
     if _translation_pipeline is None:
+        # Fail fast without touching MeCab/dict extraction when the failure is
+        # deterministic (no key configured) — that won't resolve until the
+        # server env changes, so retrying the full construction on every
+        # request would just waste I/O for the same error.
+        if not os.environ.get("OPENROUTER_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
+            raise HTTPException(
+                503,
+                detail=(
+                    "Translation pipeline unavailable: no API key configured. "
+                    "Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY in the server "
+                    "environment and restart."
+                ),
+            )
         try:
             from model.translation.translation import EdoPeriodTranslationPipeline
             _translation_pipeline = EdoPeriodTranslationPipeline()
@@ -67,12 +93,11 @@ def _get_translation_pipeline():
     return _translation_pipeline
 
 
-_DEFAULT_CKPT = CHECKPOINT_DIR /"A_first_thesis_run" / "kuronet_recognizer" / "kuronet_best.pt"
+_DEFAULT_CKPT = CHECKPOINT_DIR  / "kuronet_recognizer" / "kuronet_best.pt"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import os
     if not os.environ.get("OPENROUTER_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "[WARNING] Neither OPENROUTER_API_KEY nor ANTHROPIC_API_KEY is set. "
@@ -97,9 +122,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Kuzushiji Transcription API", lifespan=lifespan)
 
+_DEFAULT_CORS_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+_cors_env = os.environ.get("CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] or _DEFAULT_CORS_ORIGINS
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -134,6 +163,33 @@ def _preprocess_image(data: bytes) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Per-IP sliding-window rate limiting (shared by /api/transcribe and
+# /api/translate, each with their own log + limits). In-memory state is fine
+# here: single-process demo app (see INSTALL.md).
+# ---------------------------------------------------------------------------
+
+def _check_rate_limit(log: deque, client_ip: str, max_requests: int, window: float) -> None:
+    now = time.monotonic()
+    while log and now - log[0] > window:
+        log.popleft()
+    if len(log) >= max_requests:
+        retry_after = int(window - (now - log[0])) + 1
+        raise HTTPException(
+            429,
+            detail=(
+                f"Rate limit exceeded: max {max_requests} requests per {window}s. "
+                f"Try again in {retry_after}s."
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+    log.append(now)
+
+
+_translate_request_log: dict[str, deque] = defaultdict(deque)
+_transcribe_request_log: dict[str, deque] = defaultdict(deque)
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -148,6 +204,7 @@ def health():
 
 @app.post("/api/transcribe")
 async def transcribe(
+    http_request: Request,
     image: UploadFile = File(...),
     orientation: str = Form(default="auto"),
     score_thresh: float = Form(default=KURONET_CER_SCORE_THRESH),
@@ -155,23 +212,48 @@ async def transcribe(
     if not _state["ready"]:
         raise HTTPException(503, detail=_state["error"] or "Model not loaded yet.")
 
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    _check_rate_limit(
+        _transcribe_request_log[client_ip],
+        client_ip,
+        TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+        TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+    )
+
     content_type = image.content_type or ""
     if not image or not content_type.startswith("image/"):
         raise HTTPException(400, detail="Uploaded file must be an image.")
 
     data = await image.read()
+    if len(data) > MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(
+            413,
+            detail=f"Image exceeds max upload size of {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)} MB.",
+        )
     try:
         image_tensor, orig_size, scale, pad = _preprocess_image(data)
     except Exception as exc:
         raise HTTPException(400, detail=f"Could not decode image: {exc}")
 
-    result = run_inference(
-        _state["model"],
-        image_tensor,
-        _state["vocab"],
-        orientation=orientation,
-        score_thresh=score_thresh,
-    )
+    inference_start = time.perf_counter()
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                run_inference,
+                _state["model"],
+                image_tensor,
+                _state["vocab"],
+                orientation=orientation,
+                score_thresh=score_thresh,
+            ),
+            timeout=TRANSCRIBE_INFERENCE_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            504,
+            detail=f"Inference timed out after {TRANSCRIBE_INFERENCE_TIMEOUT_SEC}s.",
+        )
+    logger.info("run_inference took %.2fs (%d chars)", time.perf_counter() - inference_start, result["n_chars"])
 
     # Map boxes from letterboxed model coords → original image coords
     _unletterbox_boxes(result["chars"], orig_size, scale, pad)
@@ -193,31 +275,7 @@ class TranslateRequest(BaseModel):
     strip_furigana: bool = True
     normalize_historical: bool = True
     chars: Optional[List[Dict[str, Any]]] = None
-
-
-# Per-IP sliding-window limit on /api/translate — this endpoint spends paid
-# Claude API quota, unlike /api/transcribe (GPU-cost only). In-memory state
-# is fine here: single-process demo app (see INSTALL.md).
-_translate_request_log: dict[str, deque] = defaultdict(deque)
-
-
-def _check_translate_rate_limit(client_ip: str) -> None:
-    now = time.monotonic()
-    window = TRANSLATE_RATE_LIMIT_WINDOW_SECONDS
-    log = _translate_request_log[client_ip]
-    while log and now - log[0] > window:
-        log.popleft()
-    if len(log) >= TRANSLATE_RATE_LIMIT_MAX_REQUESTS:
-        retry_after = int(window - (now - log[0])) + 1
-        raise HTTPException(
-            429,
-            detail=(
-                f"Rate limit exceeded: max {TRANSLATE_RATE_LIMIT_MAX_REQUESTS} "
-                f"requests per {window}s. Try again in {retry_after}s."
-            ),
-            headers={"Retry-After": str(retry_after)},
-        )
-    log.append(now)
+    lang: str = "en"  # default to English if not specified
 
 
 @app.post("/api/translate")
@@ -233,7 +291,12 @@ async def translate(payload: TranslateRequest, http_request: Request):
         raise HTTPException(400, detail="text must not be empty.")
 
     client_ip = http_request.client.host if http_request.client else "unknown"
-    _check_translate_rate_limit(client_ip)
+    _check_rate_limit(
+        _translate_request_log[client_ip],
+        client_ip,
+        TRANSLATE_RATE_LIMIT_MAX_REQUESTS,
+        TRANSLATE_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
     pipeline = _get_translation_pipeline()
     try:
@@ -242,6 +305,7 @@ async def translate(payload: TranslateRequest, http_request: Request):
             strip_furigana=payload.strip_furigana,
             normalize_historical=payload.normalize_historical,
             chars=payload.chars,
+            lang=payload.lang
         )
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))

@@ -1,10 +1,25 @@
 import { useState, useEffect } from 'react'
-import { Link, useRouter } from './Router'
+import { NavLink, useNavigate } from 'react-router'
+import i18next from 'i18next'
 import './Toolbar.css'
 
-export default function Navbar({ onNavigateHome }) {
+const LANGUAGES = [
+  { code: 'en', label: 'EN' },
+  { code: 'de', label: 'DE' },
+]
+
+// Plain i18next (no react-i18next), so nothing re-renders on language change
+// on its own — persist the choice and reload to re-render the whole app
+// with the newly active language.
+function changeLanguage(code) {
+  localStorage.setItem('i18nextLng', code)
+  window.location.reload()
+}
+
+export default function Navbar() {
   const [menuOpen, setMenuOpen] = useState(false)
-  const { navigate } = useRouter()
+  const navigate = useNavigate()
+  const t = i18next.t.bind(i18next)
 
   useEffect(() => {
     function onResize() {
@@ -18,39 +33,51 @@ export default function Navbar({ onNavigateHome }) {
     return (e) => {
       e.preventDefault()
       setMenuOpen(false)
-      navigate('/')
-      onNavigateHome(section)
+      navigate(`/#${section}`)
     }
   }
 
   return (
     <nav className="navbar">
-      <a href="/" className="brand" onClick={goHomeSection('home')}>
+      <a href="/" className="brand" onClick={goHomeSection('top')}>
         <span className="brand-mark">墨奈</span>
         <span className="brand-word">
-          <span className="brand-name">Sumina</span>
-          <span className="brand-tagline">TRANSCRIBE · TRANSLATE EDO</span>
+          <span className="brand-name">{t('toolbar.brandName')}</span>
+          <span className="brand-tagline">{t('toolbar.brandTagline')}</span>
         </span>
       </a>
 
       <div className={`navbar-container ${menuOpen ? 'show-menu' : ''}`}>
         <ul className="navbar-links">
-          <li><a href="/" onClick={goHomeSection('how')}>How it works</a></li>
-          <li><a href="/" onClick={goHomeSection('examples')}>Examples</a></li>
+          <li><a href="/#how" onClick={goHomeSection('how')}>{t('toolbar.howItWorks')}</a></li>
+          <li><a href="/#examples" onClick={goHomeSection('examples')}>{t('toolbar.examples')}</a></li>
           <li>
-            <Link href="/about" activeClass="active" onClick={() => setMenuOpen(false)}>
-              About
-            </Link>
+            <NavLink to="/about" className={({ isActive }) => (isActive ? 'active' : undefined)} onClick={() => setMenuOpen(false)}>
+              {t('toolbar.about')}
+            </NavLink>
           </li>
           <li>
-            <Link href="/policy" activeClass="active" onClick={() => setMenuOpen(false)}>
-              Policy
-            </Link>
+            <NavLink to="/policy" className={({ isActive }) => (isActive ? 'active' : undefined)} onClick={() => setMenuOpen(false)}>
+              {t('toolbar.policy')}
+            </NavLink>
+          </li>
+          <li className="navbar-lang">
+            {LANGUAGES.map((lang) => (
+              <button
+                key={lang.code}
+                type="button"
+                className={`lang-btn ${i18next.language === lang.code ? 'active' : ''}`}
+                onClick={() => changeLanguage(lang.code)}
+                aria-label={`Switch language to ${lang.label}`}
+              >
+                {lang.label}
+              </button>
+            ))}
           </li>
         </ul>
-        <a href="/" className="navbar-cta" onClick={goHomeSection('try')}>
-          Try it →
-        </a>
+        <NavLink to="/workspace" className="navbar-cta" onClick={() => setMenuOpen(false)}>
+          {t('toolbar.tryIt')}
+        </NavLink>
       </div>
 
       <button

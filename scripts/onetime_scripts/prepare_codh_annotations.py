@@ -25,7 +25,7 @@ from PIL import Image
 
 # Add parent directory to path to import config
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import DATA_DIR, DATA_PREPROCESSED_DIR, DATA_ZIP_DIR, EXCLUDE_BOOKS
+from config import DATA_DIR, DATA_PREPROCESSED_DIR, DATA_ZIP_DIR, EXCLUDE_BOOKS, EXCLUDE_PAGES
 from tqdm import tqdm
 
 OUTPUT_ANNOT_DIR = DATA_DIR / "annotations"
@@ -59,9 +59,16 @@ def process_book(book_dir: Path):
         raise ValueError(f"Missing important columns in {csv_path.name}")
 
     all_labels = set()
+    # Keyed by book_dir.name (not the per-image book_id heuristic below, which
+    # mis-derives for books like umgy00000 whose filenames don't match the dir name).
+    excluded_stems = {Path(f).stem for f in EXCLUDE_PAGES.get(book_dir.name, [])}
 
     for _, row in df.iterrows():
         img_name_base = str(row["Image"]).strip()
+        if img_name_base in excluded_stems:
+            # Reserved as a held-out test page — added separately by
+            # scripts/onetime_scripts/add_excluded_books.py.
+            continue
         img_dir = book_dir / "images"
         # flexible Extension suchen
         matches = list(img_dir.glob(f"{img_name_base}.*"))

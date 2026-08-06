@@ -233,7 +233,7 @@ class KuzushijiDataset(Dataset):
         if len(boxes) > 0:
             boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
             mask = torch.ones((boxes_tensor.size(0),), dtype=torch.bool)
-            _, _, sort_idx = self.roi_order.sort_single(boxes_tensor, mask, orientation)
+            _, _, sort_idx, _col_ids = self.roi_order.sort_single(boxes_tensor, mask, orientation)
             sorted_indices = sort_idx.detach().cpu().tolist()
             boxes = [boxes[i] for i in sorted_indices]
             labels = [labels[i] for i in sorted_indices]

@@ -1,0 +1,134 @@
+{
+    "toolbar": {
+        "brandName": "Sumina",
+        "brandTagline": "TRANSKRIBIEREN · EDO ÜBERSETZEN",
+        "howItWorks": "So funktioniert's",
+        "examples": "Beispiele",
+        "about": "Über uns",
+        "policy": "Datenschutz",
+        "tryIt": "Ausprobieren →"
+    },
+    "home": {
+        "heroEyebrow": "墨 SUMI · AUF KURONET AUFGEBAUT 黒",
+        "heroTitle": "Lesen Sie die Handschrift Edos.",
+        "heroSub": "Sumina liest das kursive Kuzushiji in Ihren Scans von Holzschnitten und Manuskripten, lässt Sie den Entwurf korrigieren und macht Jahrhunderte altes Japanisch zu Englisch, das Sie tatsächlich lesen können.",
+        "heroCta": "Jetzt ausprobieren →",
+        "howTitle": "So funktioniert es",
+        "how_steps": [
+            { "step": 1, "title": "Scan hochladen", "body": "Laden Sie ein Foto oder einen Scan eines Holzschnitts oder handschriftlichen Manuskripts hoch — ob modern oder aus der Edo-Zeit." },
+            { "step": 2, "title": "Transkribieren & korrigieren", "body": "KuroNet erkennt jedes kursive Zeichen und schlägt eine Lesung vor. Sie überprüfen das Ergebnis und korrigieren, was falsch erkannt wurde." },
+            { "step": 3, "title": "Übersetzen", "body": "Erhalten Sie fließendes Englisch neben dem Original, direkt aus der korrigierten Transkription abgeleitet." }
+        ],
+        "examplesEyebrow": "TEXT AUSWÄHLEN · 用例",
+        "examplesTitle": "Beispiele zum Ausprobieren",
+        "examplesSub": "Gemeinfreie Gedichte aus der Edo-Zeit. Wählen Sie eines aus, um dessen Text direkt in den Arbeitsbereich zu übernehmen, bereit zur Übersetzung.",
+        "examples": [
+            { "id": "furuike", "title": "Der alte Teich", "author": "松尾芭蕉 · Bashō", "year": "um 1686", "text": "古池や蛙飛び込む水の音" },
+            { "id": "natsukusa", "title": "Sommergräser", "author": "松尾芭蕉 · Bashō", "year": "1689", "text": "夏草や兵どもが夢の跡" },
+            { "id": "shizukasa", "title": "Zikade im Stein", "author": "松尾芭蕉 · Bashō", "year": "1689", "text": "閑さや岩にしみ入る蝉の声" },
+            { "id": "asagao", "title": "Prunkwinde", "author": "加賀千代女 · Chiyo-jo", "year": "um 1740", "text": "朝顔に釣瓶とられてもらひ水" },
+            { "id": "suzume", "title": "Kleiner Spatz", "author": "小林一茶 · Issa", "year": "um 1819", "text": "雀の子そこのけそこのけ御馬が通る" },
+            { "id": "nanakorobi", "title": "Siebenmal fallen, achtmal aufstehen", "author": "江戸の諺 · Edo-Sprichwort", "year": "Edo-Zeit", "text": "七転び八起き" }
+        ],
+        "exampleCta": "Im Arbeitsbereich öffnen →",
+        "footerCredit": "墨奈 Sumina — 幸 by Amina Felic",
+        "footerPowered": "Zeichenerkennung unterstützt durch KuroNet (Clanuwat et al.)"
+    },
+    "workspace": {
+        "title": "Arbeitsbereich",
+        "stepUpload": "① HOCHLADEN",
+        "stepTranscribe": "② TRANSKRIBIEREN & KORRIGIEREN",
+        "stepTranslate": "③ ÜBERSETZEN",
+        "panelOriginal": "ORIGINAL · 原文",
+        "transcribeBtn": "Transkribieren",
+        "transcribingBtn": "Transkribiere...",
+        "resultHeaderPrefix": "墨奈 Sumina — Transkription & Übersetzung",
+        "resultSourceLabel": "Quelle",
+        "resultTranscriptionLabel": "TRANSKRIPTION (翻刻):",
+        "resultNone": "(keine)",
+        "resultModernLabel": "MODERNES JAPANISCH:",
+        "resultEnglishLabel": "ENGLISCH:",
+        "resultGermanLabel": "DEUTSCH:",
+        "transcribeError": "Fehler: Transkriptions-API nicht erreichbar.",
+        "translateError": "Fehler: Übersetzungs-API nicht erreichbar.",
+        "copyText": "Text kopieren",
+        "copiedText": "Kopiert ✓",
+        "transcribingLabel": "Zeichen werden erkannt…",
+        "replaceImageBtn": "Neues Bild hochladen",
+        "replaceImageHint": "Bild anklicken zum Ersetzen"
+    },
+    "transcriptionPanel": {
+        "panelHeader": "TRANSKRIPTION · 翻刻",
+        "placeholder": "Lesung eingeben oder korrigieren…",
+        "hint": "Führen Sie „Transkribieren\" für einen Scan aus, oder geben Sie klassisches Japanisch direkt ein, und übersetzen Sie anschließend.",
+        "reorderHint": "Lesereihenfolge falsch? Ziehen Sie eine Spalte an eine andere Stelle.",
+        "translateBtn": "Übersetzen",
+        "translatingBtn": "Übersetze...",
+        "translatingLabel": "Klassisches Japanisch wird übersetzt…",
+        "resultLabel": "Englisch · 英訳",
+        "resultLabelDe": "Deutsch · 独訳",
+        "targetLangAriaLabel": "Übersetzungssprache",
+        "exportLabel": "EXPORT",
+        "downloadBtn": "Als .txt herunterladen",
+        "normalization": {
+            "mecab+unidic-kinsei-edo": "Normalisierung: MeCab + Edo-Zeit-Wörterbuch",
+            "mecab+unidic": "Normalisierung: MeCab + modernes Wörterbuch (Edo-Wörterbuch nicht verfügbar)",
+            "mecab+unidic-lite": "Normalisierung: MeCab + Lite-Wörterbuch (geringere Genauigkeit)",
+            "heuristic": "Normalisierung: nur heuristisch — MeCab nicht verfügbar (geringere Genauigkeit)",
+            "none": "Normalisierung: übersprungen"
+        }
+    },
+    "uploadArea": {
+        "placeholder": "Bild hier klicken oder ablegen"
+    },
+    "imageWithBoxes": {
+        "overlayAlt": "Manuskript mit Anmerkungen",
+        "useAlternate": "Stattdessen {{char}} verwenden"
+    },
+    "about": {
+        "eyebrow": "ÜBER UNS · 沿革",
+        "title": "Warum es Sumina gibt",
+        "creditLine": "墨奈 Sumina — 幸 by Amina Felic.",
+        "p1": [
+            { "text": "Die meisten Menschen — selbst versierte Leser des modernen Japanisch — können kein " },
+            { "em": "Kuzushiji" },
+            { "text": " lesen, jene fließende Kursivschrift, in der fast jedes Buch, jeder Brief und jedes Kontobuch der Edo-Zeit verfasst wurde. Jahrhunderte an Literatur, Wissenschaft und Alltagsleben liegen verschlossen hinter einer Handschrift, die kaum jemand zu entziffern gelernt hat." }
+        ],
+        "p2": [
+            { "text": "Sumina verbindet " },
+            { "b": "KuroNet" },
+            { "text": " — das Zeichenerkennungsmodell von Tarin Clanuwat und Kolleg:innen — mit einem menschlichen Korrekturschritt und einer Übersetzung, sodass aus einem Scan eine Lesung und aus einer Lesung ein englischer Text wird. Entwickelt für Forschende, Studierende und alle, die neugierig genug sind, genau hinzusehen." }
+        ],
+        "etymology": [
+            { "text": "Der Name vereint 墨 " },
+            { "b": "sumi" },
+            { "text": " („Tinte\", nach KuroNets 黒 " },
+            { "b": "kuro" },
+            { "text": ", „schwarz\") mit " },
+            { "b": "Amina" },
+            { "text": "; 幸 " },
+            { "b": "sachi" },
+            { "text": " („Glück\") für Felic." }
+        ],
+        "photoAlt": "Illustration des Alltagslebens in der Edo-Zeit"
+    },
+    "policy": {
+        "title": "Datenschutzerklärung",
+        "intro": "Ihre Privatsphäre ist uns wichtig. Diese Erklärung beschreibt, wie wir Ihre personenbezogenen Daten erheben, verwenden und schützen.",
+        "collectHeading": "Von uns erhobene Informationen",
+        "collectIntro": "Wir können folgende Arten von Informationen erheben:",
+        "collectItems": [
+            "Persönliche Identifikationsdaten (Name, E-Mail-Adresse, Telefonnummer)",
+            "Nutzungsdaten (wie Sie mit unserem Dienst interagieren)"
+        ],
+        "useHeading": "Wie wir Ihre Informationen verwenden",
+        "useIntro": "Wir verwenden die erhobenen Informationen, um:",
+        "useItems": [
+            "unsere Dienste bereitzustellen und zu verbessern",
+            "Sie über Neuerungen und Angebote zu informieren",
+            "Nutzungsmuster zu analysieren, um die Nutzererfahrung zu verbessern"
+        ],
+        "protectionHeading": "Datenschutzmaßnahmen",
+        "protectionText": "Wir setzen angemessene Sicherheitsmaßnahmen ein, um Ihre personenbezogenen Daten vor unbefugtem Zugriff oder unbefugter Offenlegung zu schützen."
+    }
+}

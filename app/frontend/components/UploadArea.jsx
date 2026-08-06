@@ -1,8 +1,10 @@
 import { useState, useRef } from 'react'
+import i18next from 'i18next'
 
 export default function UploadArea({ imageUrl, onFile }) {
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef(null)
+  const t = i18next.t.bind(i18next)
 
   function handleFile(file) {
     if (!file || !file.type.startsWith('image/')) return
@@ -29,7 +31,7 @@ export default function UploadArea({ imageUrl, onFile }) {
       ) : (
         <div className="upload-placeholder">
           <div className="upload-icon">+</div>
-          <p>Click or drag an image here</p>
+          <p>{t('uploadArea.placeholder')}</p>
         </div>
       )}
     </div>

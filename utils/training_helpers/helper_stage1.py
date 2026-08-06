@@ -272,7 +272,7 @@ def validate_detector(unet, detector, dataloader, device, use_mixed_precision, b
             for l in batch.get("labels", [])
         ]
 
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_mixed_precision):
+        with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_mixed_precision):
             features = unet(images)
             _, _, hf, wf = features.shape
             gt_heat, gt_bbox, gt_bbox_mask, _ = build_detection_targets(
