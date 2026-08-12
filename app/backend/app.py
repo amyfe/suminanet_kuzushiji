@@ -7,8 +7,6 @@ Endpoints
   POST /api/translate    — translate classical Japanese text (full pipeline)
   GET  /api/health       — model load status
 
-Run from project root:
-  uvicorn app.backend.app:app --reload --port 8000
 """
 
 from __future__ import annotations
@@ -24,13 +22,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# INFO-level logs (e.g. the per-step timing breakdown in translation.py,
-# logged to diagnose slow /api/translate requests) are silently dropped
-# without a configured handler — Python's root logger defaults to WARNING.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# Make project root importable regardless of working directory
 ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -38,13 +32,12 @@ if str(ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
 
 from config import (
-    CHECKPOINT_DIR,
     DEVICE,
     IMAGE_SIZE,
     KURONET_CER_SCORE_THRESH,
@@ -54,6 +47,7 @@ from config import (
     TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
     TRANSLATE_RATE_LIMIT_MAX_REQUESTS,
     TRANSLATE_RATE_LIMIT_WINDOW_SECONDS,
+    WEBSITE_CHECKPOINT_DIR
 )
 from model.translation.infer import _TRANSFORM, load_kuronet, run_inference, _unletterbox_boxes
 from train_stage2_kuronet import load_vocab
@@ -65,23 +59,18 @@ from train_stage2_kuronet import load_vocab
 
 _state: dict = {"model": None, "vocab": None, "ready": False, "error": None}
 
-# Translation pipeline is loaded lazily on first request (needs ANTHROPIC_API_KEY)
 _translation_pipeline = None
 
 
 def _get_translation_pipeline():
     global _translation_pipeline
     if _translation_pipeline is None:
-        # Fail fast without touching MeCab/dict extraction when the failure is
-        # deterministic (no key configured) — that won't resolve until the
-        # server env changes, so retrying the full construction on every
-        # request would just waste I/O for the same error.
-        if not os.environ.get("OPENROUTER_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
+        if not os.environ.get("OPENROUTER_API_KEY"):
             raise HTTPException(
                 503,
                 detail=(
                     "Translation pipeline unavailable: no API key configured. "
-                    "Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY in the server "
+                    "Set OPENROUTER_API_KEY in the server "
                     "environment and restart."
                 ),
             )
@@ -93,22 +82,33 @@ def _get_translation_pipeline():
     return _translation_pipeline
 
 
-_DEFAULT_CKPT = CHECKPOINT_DIR  / "kuronet_recognizer" / "kuronet_best.pt"
+def _require_api_key(x_api_key: Optional[str] = Header(default=None)):
+    """Gate /api/transcribe and /api/translate behind a shared secret.
+    """
+    expected = os.environ.get("API_KEY")
+    if expected and x_api_key != expected:
+        raise HTTPException(401, detail="Missing or invalid API key.")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not os.environ.get("OPENROUTER_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
+    if not os.environ.get("OPENROUTER_API_KEY"):
         print(
-            "[WARNING] Neither OPENROUTER_API_KEY nor ANTHROPIC_API_KEY is set. "
+            "[WARNING] OPENROUTER_API_KEY is not set. "
             "/api/translate will return 503. Copy .env.example to .env and fill in a key.",
+            flush=True,
+        )
+    if not os.environ.get("API_KEY"):
+        print(
+            "[WARNING] API_KEY not set — /api/transcribe and /api/translate are "
+            "open to anyone. Set API_KEY in .env before deploying outside localhost.",
             flush=True,
         )
     print("Loading vocab...", flush=True)
     try:
         vocab = load_vocab()
-        print(f"Loading KuroNet from {_DEFAULT_CKPT}...", flush=True)
-        model = load_kuronet(_DEFAULT_CKPT, vocab)
+        print(f"Loading KuroNet from {WEBSITE_CHECKPOINT_DIR}...", flush=True)
+        model = load_kuronet(WEBSITE_CHECKPOINT_DIR, vocab)
         _state["vocab"] = vocab
         _state["model"] = model
         _state["ready"] = True
@@ -202,7 +202,7 @@ def health():
     }
 
 
-@app.post("/api/transcribe")
+@app.post("/api/transcribe", dependencies=[Depends(_require_api_key)])
 async def transcribe(
     http_request: Request,
     image: UploadFile = File(...),
@@ -253,6 +253,9 @@ async def transcribe(
             504,
             detail=f"Inference timed out after {TRANSCRIBE_INFERENCE_TIMEOUT_SEC}s.",
         )
+    except Exception:
+        logger.exception("run_inference failed")
+        raise HTTPException(500, detail="Transcription failed. Please try again.")
     logger.info("run_inference took %.2fs (%d chars)", time.perf_counter() - inference_start, result["n_chars"])
 
     # Map boxes from letterboxed model coords → original image coords
@@ -276,15 +279,16 @@ class TranslateRequest(BaseModel):
     normalize_historical: bool = True
     chars: Optional[List[Dict[str, Any]]] = None
     lang: str = "en"  # default to English if not specified
+    include_notes: bool = True
 
 
-@app.post("/api/translate")
+@app.post("/api/translate", dependencies=[Depends(_require_api_key)])
 async def translate(payload: TranslateRequest, http_request: Request):
     """
     Run the full translation pipeline on classical Japanese text:
       MeCab+UniDic normalization → modern Japanese → English (via Claude).
 
-    Requires ANTHROPIC_API_KEY in the server environment.
+    Requires OPENROUTER_API_KEY in the server environment.
     Returns translation result including per-step token usage.
     """
     if not payload.text.strip():
@@ -305,11 +309,13 @@ async def translate(payload: TranslateRequest, http_request: Request):
             strip_furigana=payload.strip_furigana,
             normalize_historical=payload.normalize_historical,
             chars=payload.chars,
-            lang=payload.lang
+            lang=payload.lang,
+            include_notes=payload.include_notes,
         )
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(500, detail=str(exc))
+    except Exception:
+        logger.exception("translate_text failed")
+        raise HTTPException(500, detail="Translation failed. Please try again.")
 
     return result

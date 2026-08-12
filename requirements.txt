@@ -27,7 +27,7 @@ optuna>=4.9.0
 
 #Translation
 anthropic>=0.116.0
-openai>=2.44.0   # Required for OpenRouter backend (OPENROUTER_API_KEY); not imported when using ANTHROPIC_API_KEY
+openai>=2.44.0   # Required for OpenRouter backend (OPENROUTER_API_KEY);
 python-dotenv>=1.2.2
 # fugashi requires MeCab system library (see INSTALL.md)
 fugashi>=1.5.2

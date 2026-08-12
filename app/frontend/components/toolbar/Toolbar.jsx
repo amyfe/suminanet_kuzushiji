@@ -8,9 +8,6 @@ const LANGUAGES = [
   { code: 'de', label: 'DE' },
 ]
 
-// Plain i18next (no react-i18next), so nothing re-renders on language change
-// on its own — persist the choice and reload to re-render the whole app
-// with the newly active language.
 function changeLanguage(code) {
   localStorage.setItem('i18nextLng', code)
   window.location.reload()

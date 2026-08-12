@@ -30,13 +30,6 @@ function median(nums) {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
 }
 
-// Group per-char boxes (already in model reading order: right-to-left
-// columns, top-to-bottom within each column) into their true source columns
-// by x-center proximity, mirroring the backend's column clustering
-// (ROIReadingOrder._vertical_sort_indices in roi_ordering.py). Unlike
-// columnsOf(), this respects the manuscript's actual column boundaries
-// instead of chopping the flat string into fixed-length blocks.
-// Returns column groups of char objects, in reading order (first = rightmost).
 export function columnsFromChars(chars) {
   if (chars.length === 0) return []
   const widths = chars.map((c) => c.box[2] - c.box[0])

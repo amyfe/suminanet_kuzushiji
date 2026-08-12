@@ -70,6 +70,12 @@
         "targetLangAriaLabel": "Übersetzungssprache",
         "exportLabel": "EXPORT",
         "downloadBtn": "Als .txt herunterladen",
+        "includeNotesLabel": "Anmerkungen einschließen (verbraucht mehr Tokens)",
+        "showIntermediateLabel": "Zwischenschritte anzeigen",
+        "normalizedLabel": "Normalisiertes klassisches Japanisch",
+        "modernLabel": "Modernes Japanisch",
+        "conversionNotesLabel": "Anmerkungen zur Umwandlung",
+        "translationNotesLabel": "Anmerkungen zur Übersetzung",
         "normalization": {
             "mecab+unidic-kinsei-edo": "Normalisierung: MeCab + Edo-Zeit-Wörterbuch",
             "mecab+unidic": "Normalisierung: MeCab + modernes Wörterbuch (Edo-Wörterbuch nicht verfügbar)",
@@ -114,21 +120,24 @@
     },
     "policy": {
         "title": "Datenschutzerklärung",
-        "intro": "Ihre Privatsphäre ist uns wichtig. Diese Erklärung beschreibt, wie wir Ihre personenbezogenen Daten erheben, verwenden und schützen.",
-        "collectHeading": "Von uns erhobene Informationen",
-        "collectIntro": "Wir können folgende Arten von Informationen erheben:",
+        "intro": "Sumina ist ein Forschungsprototyp zur Transkription und Übersetzung von Kuzushiji (kursiver historischer japanischer Schrift). Diese Seite erklärt, was mit den von Ihnen übermittelten Bildern und Texten geschieht.",
+        "collectHeading": "Welche Daten wir verarbeiten",
+        "collectIntro": "Bei der Nutzung von Sumina fallen folgende Daten an:",
         "collectItems": [
-            "Persönliche Identifikationsdaten (Name, E-Mail-Adresse, Telefonnummer)",
-            "Nutzungsdaten (wie Sie mit unserem Dienst interagieren)"
+            "Hochgeladene Bilder — werden im Arbeitsspeicher des Servers verarbeitet, um Zeichen zu erkennen und zu transkribieren, und nach Abschluss der Anfrage verworfen. Bilder werden nicht auf der Festplatte gespeichert oder nach der Verarbeitung aufbewahrt.",
+            "Transkribierter Text — wenn Sie eine Übersetzung anfordern, wird der transkribierte Text (einschließlich Ihrer Korrekturen) an unseren Übersetzungsdienstleister gesendet, um das Ergebnis zu erzeugen.",
+            "IP-Adresse — wird kurzzeitig im Arbeitsspeicher des Servers gehalten, um Ratenbegrenzungen pro IP-Adresse durchzusetzen, und danach automatisch gelöscht; wird niemals auf der Festplatte gespeichert oder nach einem Neustart des Servers aufbewahrt.",
+            "Sprachauswahl — Ihre Wahl zwischen Englisch und Deutsch wird ausschließlich im lokalen Speicher Ihres Browsers gespeichert und niemals an unsere Server übermittelt."
         ],
-        "useHeading": "Wie wir Ihre Informationen verwenden",
-        "useIntro": "Wir verwenden die erhobenen Informationen, um:",
+        "useHeading": "Wie diese Daten verwendet werden",
+        "useIntro": "Die oben genannten Daten werden ausschließlich verwendet, um:",
         "useItems": [
-            "unsere Dienste bereitzustellen und zu verbessern",
-            "Sie über Neuerungen und Angebote zu informieren",
-            "Nutzungsmuster zu analysieren, um die Nutzererfahrung zu verbessern"
+            "die von Ihnen angeforderte Transkription und Übersetzung durchzuführen",
+            "Missbrauch des Dienstes durch Ratenbegrenzung zu verhindern"
         ],
+        "thirdPartyHeading": "Verarbeitung durch Dritte",
+        "thirdPartyText": "Die Übersetzung erfolgt mithilfe des Claude-Modells von Anthropic, das über die OpenRouter-API angebunden ist. Wenn Sie eine Übersetzung anfordern, wird der transkribierte Text an diesen Drittanbieter gesendet, um die Übersetzung zu erzeugen. Mit diesem Anbieter werden keine Bilder geteilt — nur Text.",
         "protectionHeading": "Datenschutzmaßnahmen",
-        "protectionText": "Wir setzen angemessene Sicherheitsmaßnahmen ein, um Ihre personenbezogenen Daten vor unbefugtem Zugriff oder unbefugter Offenlegung zu schützen."
+        "protectionText": "Wir legen keine Benutzerkonten an und erheben weder Namen, E-Mail-Adressen noch andere personenbezogene Identifikatoren. Hochgeladene Bilder werden zu keinem Zeitpunkt über die Dauer Ihrer Anfrage hinaus gespeichert."
     }
 }

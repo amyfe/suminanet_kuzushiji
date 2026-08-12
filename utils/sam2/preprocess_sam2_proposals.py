@@ -77,10 +77,13 @@ RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 from tqdm import tqdm
 
 from config import (
+    AVG_GT_PER_IMAGE,
     BACKBONE_BASE_FEATURES,
     BACKBONE_TYPE,
     CHECKPOINT_DIR,
     DATA_DIR,
+    DENSITY_FACTOR,
+    DENSITY_GRID,
     DEVICE,
     DET_NMS_IOU,
     DET_SCORE_THRESH,
@@ -417,6 +420,9 @@ def _recover_subthreshold(
         top_k=fn_top_k,
         nms_iou=DET_NMS_IOU,
         min_size=2.0,
+        density_grid=DENSITY_GRID,
+        density_factor=DENSITY_FACTOR,
+        avg_gt_per_image=AVG_GT_PER_IMAGE,
     )
 
     all_boxes  = boxes_list[0].cpu()
@@ -571,6 +577,9 @@ def _recover_framed_text(
                 top_k=top_k,
                 nms_iou=DET_NMS_IOU,
                 min_size=2.0,
+                density_grid=DENSITY_GRID,
+                density_factor=DENSITY_FACTOR,
+                avg_gt_per_image=AVG_GT_PER_IMAGE,
             )
 
         crop_boxes = boxes_list[0].cpu()
@@ -689,6 +698,9 @@ def _run_processing_loop(
                 top_k=args.top_k,
                 nms_iou=DET_NMS_IOU,
                 min_size=2.0,
+                density_grid=DENSITY_GRID,
+                density_factor=DENSITY_FACTOR,
+                avg_gt_per_image=AVG_GT_PER_IMAGE,
             )
 
         coarse_boxes  = boxes_list[0].cpu()

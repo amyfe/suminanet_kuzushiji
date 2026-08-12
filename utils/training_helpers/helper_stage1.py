@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from config import STAGE1_AVG_GT_PER_IMAGE, STAGE1_BBOX_WEIGHT, STAGE1_DIOU_WEIGHT, STAGE1_FOCAL_POS_THRESHOLD, STAGE1_HEATMAP_SIGMA, STAGE1_SIGMA_FLOOR, STAGE1_SIGMA_CEIL, STAGE1_SIGMA_SCALE, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_POS_WEIGHT
+from config import AVG_GT_PER_IMAGE, STAGE1_BBOX_WEIGHT, STAGE1_DIOU_WEIGHT, STAGE1_FOCAL_POS_THRESHOLD, STAGE1_HEATMAP_SIGMA, STAGE1_SIGMA_FLOOR, STAGE1_SIGMA_CEIL, STAGE1_SIGMA_SCALE, STAGE1_FOCAL_ALPHA, STAGE1_FOCAL_GAMMA, STAGE1_POS_WEIGHT
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap
 
@@ -152,7 +152,7 @@ def collate_fn(batch, pad_id):
         result["illus_mask"] = torch.stack([b["illus_mask"] for b in batch], dim=0)
 
     result["avg_gt_per_image"] = [
-        b.get("avg_gt_per_image", STAGE1_AVG_GT_PER_IMAGE) for b in batch
+        b.get("avg_gt_per_image", AVG_GT_PER_IMAGE) for b in batch
     ]
 
     return result

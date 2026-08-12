@@ -13,8 +13,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import (
+    AVG_GT_PER_IMAGE,
     BACKBONE_BASE_FEATURES,
     DATA_DIR,
+    DENSITY_FACTOR,
+    DENSITY_GRID,
     DEVICE,
     STAGE2_BATCH_SIZE,
     FREEZE_BACKBONE,
@@ -23,6 +26,7 @@ from config import (
     NUM_EPOCHS,
     LR,
     STAGE2_CONTEXT_HIDDEN_DIM,
+    STAGE2_CONTEXT_MODE,
     STAGE2_CONTEXT_NUM_LAYERS,
     DET_MIN_BOX_SIZE,
     DET_NMS_IOU,
@@ -262,12 +266,17 @@ def build_stage2_model(
     det_nms_iou = float(overrides.get("det_nms_iou", DET_NMS_IOU))
     det_min_box_size = float(overrides.get("det_min_box_size", DET_MIN_BOX_SIZE))
 
+    density_grid = int(overrides.get("density_grid", DENSITY_GRID))
+    density_factor = float(overrides.get("density_factor", DENSITY_FACTOR))
+    avg_gt_per_image = int(overrides.get("avg_gt_per_image", AVG_GT_PER_IMAGE))
+
     token_dim = int(overrides.get("token_dim", STAGE2_TOKEN_DIM))
     token_hidden_dim = int(overrides.get("token_hidden_dim", STAGE2_TOKEN_HIDDEN_DIM))
     token_use_score_branch = bool(overrides.get("token_use_score_branch", STAGE2_TOKEN_USE_SCORE_BRANCH))
 
     context_hidden_dim = int(overrides.get("context_hidden_dim", STAGE2_CONTEXT_HIDDEN_DIM))
     context_num_layers = int(overrides.get("context_num_layers", STAGE2_CONTEXT_NUM_LAYERS))
+    context_mode = str(overrides.get("context_mode", STAGE2_CONTEXT_MODE))
 
     checkpoint = torch.load(detector_ckpt_path, map_location=DEVICE)
     backbone_type = checkpoint.get("backbone_type", BACKBONE_TYPE)
@@ -299,11 +308,16 @@ def build_stage2_model(
         token_use_score_branch=token_use_score_branch,
         context_hidden_dim=context_hidden_dim,
         context_num_layers=context_num_layers,
+        context_mode=context_mode,
 
         det_score_thresh=det_score_thresh,
         det_top_k=det_top_k,
         det_nms_iou=det_nms_iou,
         det_min_box_size=det_min_box_size,
+
+        density_grid=density_grid,
+        density_factor=density_factor,
+        avg_gt_per_image=avg_gt_per_image,
 
         use_aux_head=STAGE2_USE_AUX_HEAD,
         dropout=STAGE2_DROPOUT_RATE,
@@ -829,6 +843,7 @@ def train_stage2_hybrid(
                 "token_use_score_branch": STAGE2_TOKEN_USE_SCORE_BRANCH,
                 "context_hidden_dim": STAGE2_CONTEXT_HIDDEN_DIM,
                 "context_num_layers": STAGE2_CONTEXT_NUM_LAYERS,
+                "context_mode": STAGE2_CONTEXT_MODE,
                 "det_score_thresh": float(model.det_score_thresh),
                 "det_top_k": int(model.det_top_k),
                 "det_nms_iou": float(model.det_nms_iou),

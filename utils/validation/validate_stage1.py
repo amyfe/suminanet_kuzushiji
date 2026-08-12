@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 
 from config import (DATA_DIR, DEVICE, IMAGE_SIZE, CHECKPOINT_DIR,
                     DET_SCORE_THRESH, DET_TOP_K, DET_NMS_IOU, DET_MIN_BOX_SIZE,
-                    STAGE1_DENSITY_GRID, STAGE1_DENSITY_FACTOR, STAGE1_AVG_GT_PER_IMAGE,
+                    DENSITY_GRID, DENSITY_FACTOR, AVG_GT_PER_IMAGE,
                     BACKBONE_BASE_FEATURES, BACKBONE_TYPE, STAGE1_FOCAL_POS_THRESHOLD)
 from model.kuronet import DetectorHead, build_backbone
 from utils import KuzushijiDataset
@@ -88,7 +88,7 @@ def extract_boxes_from_heatmap(
     nms_iou=DET_NMS_IOU,
     min_box_size=DET_MIN_BOX_SIZE,
     debug=False,
-    avg_gt_per_image=STAGE1_AVG_GT_PER_IMAGE,
+    avg_gt_per_image=AVG_GT_PER_IMAGE,
 ):
     hm = heatmap_probs[0, 0]
     bbox = bbox_reg[0]      # (4,H,W)
@@ -164,8 +164,8 @@ def extract_boxes_from_heatmap(
 
     boxes, scores_out = spatial_density_filter(
         boxes, scores_out, image_size,
-        grid_size=STAGE1_DENSITY_GRID,
-        density_factor=STAGE1_DENSITY_FACTOR,
+        grid_size=DENSITY_GRID,
+        density_factor=DENSITY_FACTOR,
         avg_gt_per_image=avg_gt_per_image,
     )
 
@@ -175,7 +175,7 @@ def extract_boxes_from_heatmap(
 
 
 def _filter_peaks(all_boxes, all_scores, confidence_thresh, nms_iou,
-                  avg_gt_per_image=STAGE1_AVG_GT_PER_IMAGE):
+                  avg_gt_per_image=AVG_GT_PER_IMAGE):
     """Apply confidence threshold + NMS + density filter to pre-extracted peak candidates."""
     paired = [(b, s) for b, s in zip(all_boxes, all_scores) if s >= confidence_thresh]
     if not paired:
@@ -188,8 +188,8 @@ def _filter_peaks(all_boxes, all_scores, confidence_thresh, nms_iou,
     kept_scores = [scores[i] for i in keep]
     kept_boxes, _ = spatial_density_filter(
         kept_boxes, kept_scores, IMAGE_SIZE,
-        grid_size=STAGE1_DENSITY_GRID,
-        density_factor=STAGE1_DENSITY_FACTOR,
+        grid_size=DENSITY_GRID,
+        density_factor=DENSITY_FACTOR,
         avg_gt_per_image=avg_gt_per_image,
     )
     return kept_boxes
@@ -555,7 +555,7 @@ def validate_stage1(
             _, _, Hf, Wf = features.shape
             debug_this = (idx == 0)
 
-            img_avg_gt = batch.get("avg_gt_per_image", [STAGE1_AVG_GT_PER_IMAGE])[0]
+            img_avg_gt = batch.get("avg_gt_per_image", [AVG_GT_PER_IMAGE])[0]
             pred_boxes, pred_scores, _ = extract_boxes_from_heatmap(
                 heatmap_probs=heatmap_probs,
                 bbox_reg=bbox_reg,
@@ -800,7 +800,7 @@ def _run_tiled_inference(
     top_k: int,
     nms_iou: float,
     min_box_size: float,
-    avg_gt_per_image: float = STAGE1_AVG_GT_PER_IMAGE,
+    avg_gt_per_image: float = AVG_GT_PER_IMAGE,
 ) -> tuple:
     """
     Run the detector on overlapping tiles of the image, then merge results.
@@ -889,8 +889,8 @@ def _run_tiled_inference(
     # Global density filter (same parameters as full-image run)
     all_boxes, all_scores = spatial_density_filter(
         all_boxes, all_scores, image_size,
-        grid_size=STAGE1_DENSITY_GRID,
-        density_factor=STAGE1_DENSITY_FACTOR,
+        grid_size=DENSITY_GRID,
+        density_factor=DENSITY_FACTOR,
         avg_gt_per_image=avg_gt_per_image,
     )
     return all_boxes, all_scores
@@ -977,7 +977,7 @@ def validate_stage1_tiled(
                 output_size=(Hf, Wf), image_size=IMAGE_SIZE,
                 top_k=top_k, min_box_size=min_box_size,
             )
-            tiled_avg_gt = batch.get("avg_gt_per_image", [STAGE1_AVG_GT_PER_IMAGE])[0]
+            tiled_avg_gt = batch.get("avg_gt_per_image", [AVG_GT_PER_IMAGE])[0]
             full_pred = _filter_peaks(full_boxes, full_scores, confidence_thresh, nms_iou,
                                       avg_gt_per_image=tiled_avg_gt)
             all_full_pred.append(full_pred)

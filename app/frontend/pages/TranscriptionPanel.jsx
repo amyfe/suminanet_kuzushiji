@@ -24,7 +24,9 @@ export default function TranscriptionPanel({
   onTranslate,
   translating,
   translation,
+  normalizedJapanese,
   modernJapanese,
+  conversionNotes,
   translationNotes,
   normalizationMethod,
   onCopy,
@@ -32,6 +34,8 @@ export default function TranscriptionPanel({
   copyLabel,
   targetLang,
   onTargetLangChange,
+  includeNotes,
+  onIncludeNotesChange,
 }) {
   const t = i18next.t.bind(i18next)
   const normalization = t('transcriptionPanel.normalization', { returnObjects: true })
@@ -40,6 +44,7 @@ export default function TranscriptionPanel({
     de: t('transcriptionPanel.resultLabelDe'),
   }
   const [dragOverIdx, setDragOverIdx] = useState(null)
+  const [showIntermediate, setShowIntermediate] = useState(false)
 
   // Prefer true column boundaries from the detected char boxes (matches the
   // manuscript's actual layout). Only valid while chars still matches the
@@ -56,6 +61,20 @@ export default function TranscriptionPanel({
   // Reordering only makes sense against real box-derived columns (not the
   // naive fallback chunking), and only when there's more than one column.
   const reorderable = charsInSync && cols.length > 1
+
+  // Ticket 6.8: mirror the vertical-column view's structure in the flat
+  // horizontal textarea below it by breaking at the same column boundaries
+  // (in canonical reading order, matching how `transcription` itself was
+  // assembled -- unlike `cols` above, this is NOT DOM-reversed). Gated on
+  // charsInSync like every other column-aware feature here: the moment the
+  // user edits, chars/transcription fall out of sync and this reverts to a
+  // single unbroken line, same as `reorderable` already does.
+  const readingOrderColStrings = charsInSync
+    ? columnsFromChars(chars).map((col) => col.map((c) => c.char).join(''))
+    : null
+  const textareaValue = readingOrderColStrings && readingOrderColStrings.length > 1
+    ? readingOrderColStrings.join('\n')
+    : transcription
 
   // cols is already reversed relative to columnsFromChars' canonical reading
   // order (rightmost/first-read column rendered last in DOM, since a plain
@@ -115,8 +134,8 @@ export default function TranscriptionPanel({
           )}
           <textarea
             className="transcription-textarea"
-            value={transcription}
-            onChange={(e) => onTranscriptionChange(e.target.value)}
+            value={textareaValue}
+            onChange={(e) => onTranscriptionChange(e.target.value.replace(/\n/g, ''))}
             placeholder={t('transcriptionPanel.placeholder')}
             rows={4}
           />
@@ -152,23 +171,70 @@ export default function TranscriptionPanel({
         </div>
       </div>
 
+      <label className="notes-toggle">
+        <input
+          type="checkbox"
+          checked={includeNotes}
+          onChange={(e) => onIncludeNotesChange(e.target.checked)}
+          disabled={translating}
+        />
+        {t('transcriptionPanel.includeNotesLabel')}
+      </label>
+
       {translating && <Animation label={t('transcriptionPanel.translatingLabel')} />}
 
       {translation && (
         <div className="result-box translation">
           <h2 className="result-label">{resultLabels[targetLang] || resultLabels.en}</h2>
           <p className="result-text">{translation}</p>
-          {modernJapanese && (
-            <p className="result-modern">{modernJapanese}</p>
+
+          {normDegraded && (
+            <p className="result-caption result-caption--warn">⚠ {normText}</p>
           )}
-          {translationNotes && (
-            <p className="result-caption">{translationNotes}</p>
-          )}
-          {normText && (
-            <p className={`result-caption${normDegraded ? ' result-caption--warn' : ''}`}>
-              {normDegraded ? '⚠ ' : ''}
-              {normText}
-            </p>
+
+          {(normalizedJapanese || modernJapanese || conversionNotes || translationNotes || (normText && !normDegraded)) && (
+            <>
+              <label className="intermediate-toggle">
+                <input
+                  type="checkbox"
+                  checked={showIntermediate}
+                  onChange={(e) => setShowIntermediate(e.target.checked)}
+                />
+                {t('transcriptionPanel.showIntermediateLabel')}
+              </label>
+
+              {showIntermediate && (
+                <div className="intermediate-steps">
+                  {normalizedJapanese && (
+                    <div className="intermediate-step">
+                      <span className="intermediate-step-label">{t('transcriptionPanel.normalizedLabel')}</span>
+                      <p className="result-modern">{normalizedJapanese}</p>
+                    </div>
+                  )}
+                  {modernJapanese && (
+                    <div className="intermediate-step">
+                      <span className="intermediate-step-label">{t('transcriptionPanel.modernLabel')}</span>
+                      <p className="result-modern">{modernJapanese}</p>
+                    </div>
+                  )}
+                  {conversionNotes && (
+                    <div className="intermediate-step">
+                      <span className="intermediate-step-label">{t('transcriptionPanel.conversionNotesLabel')}</span>
+                      <p className="result-caption">{conversionNotes}</p>
+                    </div>
+                  )}
+                  {translationNotes && (
+                    <div className="intermediate-step">
+                      <span className="intermediate-step-label">{t('transcriptionPanel.translationNotesLabel')}</span>
+                      <p className="result-caption">{translationNotes}</p>
+                    </div>
+                  )}
+                  {normText && !normDegraded && (
+                    <p className="result-caption">{normText}</p>
+                  )}
+                </div>
+              )}
+            </>
           )}
 
           <div className="export-bar" style={{ marginTop: '1.1rem' }}>

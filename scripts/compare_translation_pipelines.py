@@ -31,10 +31,10 @@ from config import KURONET_CONTEXT_BLOCK_GAP_FACTOR, TRANSLATION_UNCERTAIN_SCORE
 from model.kuronet.roi.roi_ordering import ROIReadingOrder
 from model.translation.anthropic import ClaudeTranslator
 from model.translation.translation import (
-    EdoPeriodTranslationPipeline,
-    _build_llm_text,
-    _preprocess,
+    EdoPeriodTranslationPipeline
 )
+from utils.training_helpers.helper_translation import _build_llm_text, _preprocess, _sum_usage   
+
 from utils.text_normalization import unicode_token_to_char
 
 SAMPLE_ANNOTATION = ROOT / "assets" / "data" / "annotations" / "200021071_00028_1.json"
@@ -83,17 +83,15 @@ def run_two_call(pipeline: EdoPeriodTranslationPipeline, classical_text: str, ch
         "modern_japanese": result["modern_japanese"],
         "english_translation": result["english_translation"],
         "usage": result["usage"],
-        "truncated": result["conversion_truncated"] or result["translation_truncated"],
-        "conversion_truncated": result["conversion_truncated"],
-        "translation_truncated": result["translation_truncated"],
     }
 
 
 def run_combined(translator: ClaudeTranslator, classical_text: str, chars: list[dict]) -> dict:
     annotated = _build_llm_text(
-        classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, KURONET_CONTEXT_BLOCK_GAP_FACTOR
+        classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, KURONET_CONTEXT_BLOCK_GAP_FACTOR,
+        mark_furigana=True,
     )
-    text_for_llm = _preprocess(annotated, strip_furigana=True)
+    text_for_llm = _preprocess(annotated, strip_furigana=False)
 
     t0 = time.perf_counter()
     result, usage = translator.translate_classical_to_english(text_for_llm)
@@ -103,7 +101,6 @@ def run_combined(translator: ClaudeTranslator, classical_text: str, chars: list[
         "modern_japanese": result["modern_japanese"],
         "english_translation": result["english_translation"],
         "usage": usage,
-        "truncated": result["truncated"],
     }
 
 
@@ -111,9 +108,10 @@ def print_dry_run(classical_text: str, chars: list[dict]) -> None:
     translator = object.__new__(ClaudeTranslator)  # skip __init__, no API key needed for prompt building
 
     annotated = _build_llm_text(
-        classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, KURONET_CONTEXT_BLOCK_GAP_FACTOR
+        classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, KURONET_CONTEXT_BLOCK_GAP_FACTOR,
+        mark_furigana=True,
     )
-    text_for_llm = _preprocess(annotated, strip_furigana=True)
+    text_for_llm = _preprocess(annotated, strip_furigana=False)
 
     two_call_prompt_1 = translator._build_classical_to_modern_prompt(text_for_llm)
     two_call_prompt_2_placeholder = translator._build_translate_to_english_prompt(
@@ -142,7 +140,6 @@ def print_run(label: str, run: dict) -> None:
     print("=" * 70)
     print(f"Latency:   {run['elapsed_sec']:.2f}s")
     print(f"Usage:     {run['usage']}")
-    print(f"Truncated: {run['truncated']}")
     print(f"Modern Japanese:\n  {run['modern_japanese']}")
     print(f"English:\n  {run['english_translation']}")
 
@@ -190,12 +187,9 @@ def main() -> None:
         print(f"Total tokens: combined uses {tok_delta:+d} vs two-call ({'fewer' if tok_delta > 0 else 'more'})")
 
     if args.repeats > 1:
-        any_trunc_two = any(r["truncated"] for r in two_call_runs)
-        any_trunc_comb = any(r["truncated"] for r in combined_runs)
         print("\n" + "=" * 70)
         print("ACROSS-REPEAT SUMMARY")
         print("=" * 70)
-        print(f"Truncation ever hit: two-call={any_trunc_two}  combined={any_trunc_comb}")
         print(
             "Compare modern_japanese across reps of the SAME variant above to gauge how much "
             "of any two-call-vs-combined difference is sampling noise rather than architecture."

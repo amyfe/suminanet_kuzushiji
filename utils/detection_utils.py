@@ -107,7 +107,7 @@ def build_detection_targets(
 
 
 def spatial_density_filter(boxes, scores, image_size,
-                           grid_size=8, density_factor=3.0,
+                           grid_size=8, density_factor=5.0,
                            avg_gt_per_image=236):
     """Suppress proposals from over-dense grid cells to remove illustration FPs.
 
@@ -155,7 +155,7 @@ def spatial_density_filter(boxes, scores, image_size,
 
 
 def spatial_density_filter_torch(boxes, scores, image_size,
-                                  grid_size=8, density_factor=3.0,
+                                  grid_size=8, density_factor=5.0,
                                   avg_gt_per_image=236):
     """Torch-tensor version of spatial_density_filter for use inside model forward passes."""
     if boxes.numel() == 0:

@@ -70,6 +70,12 @@
         "targetLangAriaLabel": "Translation language",
         "exportLabel": "EXPORT",
         "downloadBtn": "Download .txt",
+        "includeNotesLabel": "Include notes (uses more tokens)",
+        "showIntermediateLabel": "Show intermediate steps",
+        "normalizedLabel": "Normalized classical Japanese",
+        "modernLabel": "Modern Japanese",
+        "conversionNotesLabel": "Conversion notes",
+        "translationNotesLabel": "Translation notes",
         "normalization": {
             "mecab+unidic-kinsei-edo": "Normalization: MeCab + Edo-period dictionary",
             "mecab+unidic": "Normalization: MeCab + modern dictionary (Edo dictionary unavailable)",
@@ -114,21 +120,24 @@
     },
     "policy": {
         "title": "Privacy Policy",
-        "intro": "Your privacy is important to us. This policy outlines how we collect, use, and protect your personal information.",
-        "collectHeading": "Information We Collect",
-        "collectIntro": "We may collect the following types of information:",
+        "intro": "Sumina is a research prototype for transcribing and translating Kuzushiji (cursive historical Japanese) manuscripts. This page explains what happens to the images and text you submit.",
+        "collectHeading": "What We Process",
+        "collectIntro": "Using Sumina involves the following data:",
         "collectItems": [
-            "Personal identification information (name, email address, phone number)",
-            "Usage data (how you interact with our service)"
+            "Uploaded images — processed in server memory to detect and transcribe characters, then discarded once your request completes. Images are not saved to disk or retained after processing.",
+            "Transcribed text — if you request a translation, the transcribed text (including any corrections you make) is sent to our translation provider to generate the result.",
+            "IP address — held briefly in server memory to enforce per-IP rate limits, then cleared automatically; never written to disk or kept after the server restarts.",
+            "Language preference — your choice of English or German is saved in your browser's local storage only, and is never sent to our servers."
         ],
-        "useHeading": "How We Use Your Information",
-        "useIntro": "We use the collected information to:",
+        "useHeading": "How This Data Is Used",
+        "useIntro": "The data above is used solely to:",
         "useItems": [
-            "Provide and improve our services",
-            "Communicate with you about updates and offers",
-            "Analyze usage patterns to enhance user experience"
+            "Run the transcription and translation you request",
+            "Prevent abuse of the service through rate limiting"
         ],
+        "thirdPartyHeading": "Third-Party Processing",
+        "thirdPartyText": "Translation is powered by Anthropic's Claude model, accessed via the OpenRouter API. When you request a translation, the transcribed text you submit is sent to this third-party provider to generate the translation. No images are shared with this provider — only text.",
         "protectionHeading": "Data Protection",
-        "protectionText": "We implement appropriate security measures to protect your personal information from unauthorized access or disclosure."
+        "protectionText": "We do not create user accounts and do not collect names, email addresses, or other personal identifiers. Uploaded images are never stored beyond the lifetime of your request."
     }
 }

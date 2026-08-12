@@ -207,6 +207,12 @@ class KuroNetRecognizer(nn.Module):
         det_nms_iou: float = 0.50,
         det_min_box_size: float = 1.66,
 
+        # Per-cell cap on coarse proposals (suppresses illustration/noise FP
+        # clusters without discarding genuinely dense text columns)
+        density_grid: int = 8,
+        density_factor: float = 3.0,
+        avg_gt_per_image: int = 236,
+
         dropout: float = 0.1,
 
         # Background class ID (last vocab token). Predictions equal to this
@@ -231,6 +237,10 @@ class KuroNetRecognizer(nn.Module):
         self.det_top_k = int(det_top_k)
         self.det_nms_iou = float(det_nms_iou)
         self.det_min_box_size = float(det_min_box_size)
+
+        self.density_grid = int(density_grid)
+        self.density_factor = float(density_factor)
+        self.avg_gt_per_image = int(avg_gt_per_image)
 
         self.vocab_size = vocab_size
         self.use_context = bool(use_context)
@@ -366,6 +376,9 @@ class KuroNetRecognizer(nn.Module):
             top_k=self.det_top_k,
             nms_iou=self.det_nms_iou,
             min_size=self.det_min_box_size,
+            density_grid=self.density_grid,
+            density_factor=self.density_factor,
+            avg_gt_per_image=self.avg_gt_per_image,
         )
 
         return det_out, coarse_boxes_list, coarse_scores_list

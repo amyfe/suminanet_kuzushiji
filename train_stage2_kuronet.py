@@ -35,10 +35,13 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from config import (
+    AVG_GT_PER_IMAGE,
     BACKBONE_BASE_FEATURES,
     STAGE2_BATCH_SIZE,
     CHECKPOINT_DIR,
     DATA_DIR,
+    DENSITY_FACTOR,
+    DENSITY_GRID,
     DEVICE,
     FREEZE_BACKBONE,
     FREEZE_DETECTOR,
@@ -307,6 +310,10 @@ def build_kuronet_model(
         det_top_k=DET_TOP_K,
         det_nms_iou=DET_NMS_IOU,
         det_min_box_size=DET_MIN_BOX_SIZE,
+
+        density_grid=DENSITY_GRID,
+        density_factor=DENSITY_FACTOR,
+        avg_gt_per_image=AVG_GT_PER_IMAGE,
 
         dropout=STAGE2_DROPOUT_RATE,
         bg_id=bg_id,

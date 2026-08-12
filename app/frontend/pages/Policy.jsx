@@ -19,6 +19,8 @@ const Policy = () => {
       <ul>
         {useItems.map((item, i) => <li key={i}>{item}</li>)}
       </ul>
+      <h2>{t('policy.thirdPartyHeading')}</h2>
+      <p>{t('policy.thirdPartyText')}</p>
       <h2>{t('policy.protectionHeading')}</h2>
       <p>{t('policy.protectionText')}</p>
     </div>

@@ -6,7 +6,6 @@ Orchestration (normalization → modern → English) lives in translation.py.
 
 Backend selection (auto-detected from env vars):
   OPENROUTER_API_KEY  →  OpenRouter  (openai-compatible, model: anthropic/claude-sonnet-4-6)
-  ANTHROPIC_API_KEY   →  Direct Anthropic API
 """
 
 from __future__ import annotations
@@ -58,7 +57,6 @@ class ClaudeTranslator:
     def __init__(self, api_key: Optional[str] = None) -> None:
         self.client: Any
         or_key = os.environ.get("OPENROUTER_API_KEY")
-        an_key = os.environ.get("ANTHROPIC_API_KEY")
 
         if or_key and not api_key:
             import openai
@@ -70,10 +68,10 @@ class ClaudeTranslator:
             )
             self._backend = "openrouter"
         else:
-            key = api_key or an_key
+            key = api_key
             if not key:
                 raise ValueError(
-                    "API key required. Set OPENROUTER_API_KEY or ANTHROPIC_API_KEY, "
+                    "API key required. Set OPENROUTER_API_KEY, "
                     "or pass api_key=."
                 )
             self.client = anthropic.Anthropic(
@@ -88,7 +86,7 @@ class ClaudeTranslator:
     # ------------------------------------------------------------------
 
     def classical_to_modern(
-        self, text: str, mecab_reference: Optional[str] = None
+        self, text: str, mecab_reference: Optional[str] = None, include_notes: bool = True
     ) -> Tuple[Dict[str, str], Dict[str, int]]:
         """
         Convert classical/Edo-period Japanese to modern Japanese.
@@ -98,33 +96,41 @@ class ClaudeTranslator:
             archaic vocabulary/spelling. Not positionally aligned to `text` and contains
             none of its inline annotation markers — see _build_classical_to_modern_prompt.
 
+        include_notes: when False, the "notes" property is dropped from the tool
+            schema (not just discarded client-side) so Claude isn't asked to generate
+            it at all, saving output tokens.
+
         Returns (result, usage) where result has keys:
-          modern_japanese, notes, truncated
+          modern_japanese, notes (only when include_notes), truncated
         and usage has keys:
           input_tokens, output_tokens, total_tokens
         """
-        prompt = self._build_classical_to_modern_prompt(text, mecab_reference)
+        prompt = self._build_classical_to_modern_prompt(text, mecab_reference, include_notes)
+        properties = {
+            "modern_japanese": {
+                "type": "string",
+                "description": "The converted modern Japanese text",
+            },
+        }
+        required = ["modern_japanese"]
+        if include_notes:
+            properties["notes"] = {
+                "type": "string",
+                "description": "Any ambiguities or important conversion decisions (empty string if none)",
+            }
+            required.append("notes")
         result, response = self._call_structured(
             prompt,
             tool_name="provide_modern_japanese",
             description="Provide the modern Japanese conversion of classical Japanese text.",
-            properties={
-                "modern_japanese": {
-                    "type": "string",
-                    "description": "The converted modern Japanese text",
-                },
-                "notes": {
-                    "type": "string",
-                    "description": "Any ambiguities or important conversion decisions (empty string if none)",
-                },
-            },
-            required=["modern_japanese", "notes"],
+            properties=properties,
+            required=required,
             max_tokens=_estimate_max_tokens(text),
         )
         return result, self._usage(response)
 
     def _build_classical_to_modern_prompt(
-        self, text: str, mecab_reference: Optional[str] = None
+        self, text: str, mecab_reference: Optional[str] = None, include_notes: bool = True
     ) -> str:
         reference_block = ""
         if mecab_reference:
@@ -141,6 +147,11 @@ character-level uncertainty and document structure.
 Dictionary-normalized reference (MeCab + UniDic):
 {mecab_reference}"""
 
+        notes_requirement = (
+            "- Note ambiguous passages"
+            if include_notes
+            else "- Do not include any notes, explanations, or commentary — output only the converted text"
+        )
         return f"""You are an expert in classical Japanese literature, specifically Edo period texts (1603-1868).
 
 Convert the following classical Japanese text to modern Japanese (現代日本語).
@@ -150,7 +161,7 @@ Requirements:
 - Convert classical grammar forms to modern equivalents
 - Update archaic vocabulary to contemporary terms
 - Maintain the tone and register of the original
-- Note ambiguous passages
+{notes_requirement}
 
 The text was produced by an OCR model and may contain recognition errors. Use context to infer the intended meaning where possible.
 
@@ -168,33 +179,41 @@ Classical Japanese text:
     # ------------------------------------------------------------------
 
     def translate_to_english(
-        self, modern_japanese: str, classical_text: str = "", lang: str = "en"
+        self, modern_japanese: str, classical_text: str = "", lang: str = "en", include_notes: bool = True
     ) -> Tuple[Dict[str, str], Dict[str, int]]:
         """
         Translate modern Japanese to the target language (`lang`: "en" or "de").
 
+        include_notes: when False, the "translation_notes" property is dropped
+            from the tool schema so Claude isn't asked to generate it, saving
+            output tokens.
+
         Returns (result, usage) where result has keys:
-          english_translation, translation_notes, truncated
+          english_translation, translation_notes (only when include_notes), truncated
         (keys keep their "english_translation" name regardless of `lang` for
         pipeline compatibility; the value is in the requested target language)
         """
         language_name = _target_language_name(lang)
-        prompt = self._build_translate_to_english_prompt(modern_japanese, classical_text, language_name)
+        prompt = self._build_translate_to_english_prompt(modern_japanese, classical_text, language_name, include_notes)
+        properties = {
+            "english_translation": {
+                "type": "string",
+                "description": f"The {language_name} translation",
+            },
+        }
+        required = ["english_translation"]
+        if include_notes:
+            properties["translation_notes"] = {
+                "type": "string",
+                "description": "Cultural context or important decisions (empty string if none)",
+            }
+            required.append("translation_notes")
         result, response = self._call_structured(
             prompt,
             tool_name="provide_english_translation",
             description=f"Provide the {language_name} translation of modern Japanese text.",
-            properties={
-                "english_translation": {
-                    "type": "string",
-                    "description": f"The {language_name} translation",
-                },
-                "translation_notes": {
-                    "type": "string",
-                    "description": "Cultural context or important decisions (empty string if none)",
-                },
-            },
-            required=["english_translation", "translation_notes"],
+            properties=properties,
+            required=required,
             max_tokens=_estimate_max_tokens(modern_japanese),
         )
         return result, self._usage(response)
@@ -205,7 +224,7 @@ Classical Japanese text:
     # ------------------------------------------------------------------
 
     def translate_classical_to_english(
-        self, text: str, mecab_reference: Optional[str] = None, lang: str = "en"
+        self, text: str, mecab_reference: Optional[str] = None, lang: str = "en", include_notes: bool = True
     ) -> Tuple[Dict[str, str], Dict[str, int]]:
         """
         Single-request variant of classical_to_modern() + translate_to_english():
@@ -217,13 +236,44 @@ Classical Japanese text:
         `lang`: target language for the translation step ("en" or "de"); the
         modern_japanese conversion step is unaffected.
 
+        include_notes: when False, both "notes" and "translation_notes" are
+            dropped from the tool schema (not just discarded client-side) so
+            Claude isn't asked to generate them, saving output tokens.
+            modern_japanese/english_translation stay adjacent in the required
+            order either way, so the two-step generation order is unaffected.
+
         Returns (result, usage) where result has keys:
-          modern_japanese, notes, english_translation, translation_notes, truncated
+          modern_japanese, notes (only when include_notes), english_translation,
+          translation_notes (only when include_notes), truncated
         (keys keep their "english_translation" name regardless of `lang` for
         pipeline compatibility; the value is in the requested target language)
         """
         language_name = _target_language_name(lang)
-        prompt = self._build_combined_prompt(text, mecab_reference, language_name)
+        prompt = self._build_combined_prompt(text, mecab_reference, language_name, include_notes)
+        properties = {
+            "modern_japanese": {
+                "type": "string",
+                "description": "The classical text converted to modern Japanese",
+            },
+        }
+        required = ["modern_japanese"]
+        if include_notes:
+            properties["notes"] = {
+                "type": "string",
+                "description": "Any ambiguities or important conversion decisions in the classical->modern step (empty string if none)",
+            }
+            required.append("notes")
+        properties["english_translation"] = {
+            "type": "string",
+            "description": f"The {language_name} translation of the modern Japanese text",
+        }
+        required.append("english_translation")
+        if include_notes:
+            properties["translation_notes"] = {
+                "type": "string",
+                "description": "Cultural context or important decisions in the modern->English step (empty string if none)",
+            }
+            required.append("translation_notes")
         result, response = self._call_structured(
             prompt,
             tool_name="provide_modern_and_english",
@@ -231,25 +281,8 @@ Classical Japanese text:
                 f"Provide the modern Japanese conversion and the {language_name} translation "
                 "of the classical Japanese text, in that order."
             ),
-            properties={
-                "modern_japanese": {
-                    "type": "string",
-                    "description": "The classical text converted to modern Japanese",
-                },
-                "notes": {
-                    "type": "string",
-                    "description": "Any ambiguities or important conversion decisions in the classical->modern step (empty string if none)",
-                },
-                "english_translation": {
-                    "type": "string",
-                    "description": f"The {language_name} translation of the modern Japanese text",
-                },
-                "translation_notes": {
-                    "type": "string",
-                    "description": "Cultural context or important decisions in the modern->English step (empty string if none)",
-                },
-            },
-            required=["modern_japanese", "notes", "english_translation", "translation_notes"],
+            properties=properties,
+            required=required,
             # Budget must cover both generated texts, not just one -- double the
             # single-step estimate, still bounded by the same ceiling.
             max_tokens=min(TRANSLATION_MAX_TOKENS_CEILING, _estimate_max_tokens(text) * 2),
@@ -257,7 +290,7 @@ Classical Japanese text:
         return result, self._usage(response)
 
     def _build_combined_prompt(
-        self, text: str, mecab_reference: Optional[str] = None, language_name: str = "English"
+        self, text: str, mecab_reference: Optional[str] = None, language_name: str = "English", include_notes: bool = True
     ) -> str:
         reference_block = ""
         if mecab_reference:
@@ -274,6 +307,16 @@ character-level uncertainty and document structure.
 Dictionary-normalized reference (MeCab + UniDic):
 {mecab_reference}"""
 
+        step1_notes = (
+            "- Note ambiguous passages"
+            if include_notes
+            else "- Do not include any notes, explanations, or commentary for this step"
+        )
+        step2_notes = (
+            "- Note important cultural context where relevant"
+            if include_notes
+            else "- Do not include any notes, explanations, or commentary for this step"
+        )
         return f"""You are an expert in classical Japanese literature, specifically Edo period texts (1603-1868), and in translating historical Japanese into natural, fluent {language_name}.
 
 Perform two sequential conversions on the classical Japanese text below:
@@ -285,13 +328,13 @@ Requirements for step 1 (classical -> modern Japanese):
 - Convert classical grammar forms to modern equivalents
 - Update archaic vocabulary to contemporary terms
 - Maintain the tone and register of the original
-- Note ambiguous passages
+{step1_notes}
 
 Requirements for step 2 (modern Japanese -> {language_name}):
 - Read naturally in {language_name}
 - Preserve the meaning and nuance
 - Maintain appropriate formality
-- Note important cultural context where relevant
+{step2_notes}
 
 The text was produced by an OCR model and may contain recognition errors. Use context to infer the intended meaning where possible.
 
@@ -305,12 +348,17 @@ Classical Japanese text:
 {text}{reference_block}"""
 
     def _build_translate_to_english_prompt(
-        self, modern_japanese: str, classical_text: str = "", language_name: str = "English"
+        self, modern_japanese: str, classical_text: str = "", language_name: str = "English", include_notes: bool = True
     ) -> str:
         context = (
             f"\n\nOriginal classical text for reference:\n{classical_text}"
             if classical_text
             else ""
+        )
+        notes_requirement = (
+            "- Note important cultural context where relevant"
+            if include_notes
+            else "- Do not include any notes, explanations, or commentary — output only the translation"
         )
         return f"""Translate the following modern Japanese text to natural, fluent {language_name}.
 
@@ -318,7 +366,7 @@ The text is from an Edo-period Japanese document that has been converted to mode
 - Read naturally in {language_name}
 - Preserve the meaning and nuance
 - Maintain appropriate formality
-- Note important cultural context where relevant
+{notes_requirement}
 
 The text may contain "｜" markers inherited from the OCR pipeline, indicating a boundary between independent text blocks (unrelated inscriptions, captions, or marginal notes). Reflect this as a clear separation (e.g., a paragraph break) in the {language_name} translation rather than merging the blocks into one continuous narrative.
 

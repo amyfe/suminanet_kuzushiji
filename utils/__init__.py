@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 
-from config import IMAGE_SIZE, KURONET_COPY_PASTE_PROB, SAM2_MASKS_DIR, SAM2_PREPROCESSING, STAGE1_AVG_GT_PER_IMAGE
+from config import AVG_GT_PER_IMAGE, IMAGE_SIZE, KURONET_COPY_PASTE_PROB, SAM2_MASKS_DIR, SAM2_PREPROCESSING
 from model.kuronet.roi.roi_ordering import infer_reading_orientation_from_boxes, ROIReadingOrder
 
 
@@ -296,8 +296,8 @@ class KuzushijiDataset(Dataset):
             "orientation": orientation,
             "image_stem": img_path.stem,
             # Per-image GT count for adaptive spatial density filter; falls back to global
-            # STAGE1_AVG_GT_PER_IMAGE when n_gt is 0 (illustrated/blank pages).
-            "avg_gt_per_image": float(n_gt) if n_gt > 0 else STAGE1_AVG_GT_PER_IMAGE,
+            # AVG_GT_PER_IMAGE when n_gt is 0 (illustrated/blank pages).
+            "avg_gt_per_image": float(n_gt) if n_gt > 0 else AVG_GT_PER_IMAGE,
         }
         if illus_mask is not None:
             sample["illus_mask"] = illus_mask

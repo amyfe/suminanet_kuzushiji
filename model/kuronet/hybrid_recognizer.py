@@ -157,11 +157,16 @@ class HybridKuroNetRecognizer(nn.Module):
         token_use_score_branch: bool = True,
         context_hidden_dim: int = 256,
         context_num_layers: int = 1,
+        context_mode: str = "bigru",
 
         det_score_thresh: float = 0.40,
         det_top_k: int = 256,
         det_nms_iou: float = 0.5,
         det_min_box_size: float = 1.0,
+
+        density_grid: int = 8,
+        density_factor: float = 3.0,
+        avg_gt_per_image: int = 236,
 
         use_aux_head: bool = False,
         dropout: float = 0.1,
@@ -175,6 +180,10 @@ class HybridKuroNetRecognizer(nn.Module):
         self.det_top_k = int(det_top_k)
         self.det_nms_iou = float(det_nms_iou)
         self.det_min_box_size = float(det_min_box_size)
+
+        self.density_grid = int(density_grid)
+        self.density_factor = float(density_factor)
+        self.avg_gt_per_image = int(avg_gt_per_image)
 
         self.feature_projector = FeatureProjector(
             in_channels=backbone_out_channels,
@@ -215,7 +224,7 @@ class HybridKuroNetRecognizer(nn.Module):
             out_dim=context_hidden_dim,
             num_layers=int(context_num_layers),
             dropout=dropout,
-            mode="bigru",
+            mode=context_mode,
             use_layernorm=True,
             use_residual=True,
         )
@@ -261,6 +270,9 @@ class HybridKuroNetRecognizer(nn.Module):
             top_k=self.det_top_k,
             nms_iou=self.det_nms_iou,
             min_size=self.det_min_box_size,
+            density_grid=self.density_grid,
+            density_factor=self.density_factor,
+            avg_gt_per_image=self.avg_gt_per_image,
         )
 
         return det_out, coarse_boxes_list, coarse_scores_list

@@ -30,7 +30,7 @@ sys.path.insert(0, str(ROOT))
 
 from config import (
     BACKBONE_BASE_FEATURES, BACKBONE_TYPE, CHECKPOINT_DIR, DATA_DIR, DEVICE,
-    IMAGE_SIZE, STAGE1_DENSITY_FACTOR, STAGE1_DENSITY_GRID, STAGE1_AVG_GT_PER_IMAGE,
+    IMAGE_SIZE, DENSITY_FACTOR, DENSITY_GRID, AVG_GT_PER_IMAGE,
     DET_MIN_BOX_SIZE,
 )
 from model.kuronet import DetectorHead, build_backbone
@@ -163,9 +163,9 @@ def run_sweep(iou_match: float, out_dir: Path):
                     top_k=TOP_K,
                     nms_iou=nms_iou,
                     min_size=DET_MIN_BOX_SIZE,
-                    density_grid=STAGE1_DENSITY_GRID,
-                    density_factor=STAGE1_DENSITY_FACTOR,
-                    avg_gt_per_image=STAGE1_AVG_GT_PER_IMAGE,
+                    density_grid=DENSITY_GRID,
+                    density_factor=DENSITY_FACTOR,
+                    avg_gt_per_image=AVG_GT_PER_IMAGE,
                 )
                 pred_boxes = boxes_list[0].numpy() if boxes_list[0].numel() > 0 else np.zeros((0, 4), dtype=np.float32)
                 tp, fp, fn = match(gt_boxes, pred_boxes, iou_thresh=iou_match)

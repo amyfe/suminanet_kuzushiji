@@ -100,9 +100,12 @@ STAGE1_SIGMA_CEIL  = 3.0
 # Characters outside [~20px, ~42px] are always at floor or ceil; only mid-size
 # characters are sensitive to STAGE1_HEATMAP_SIGMA.
 STAGE1_SIGMA_SCALE = 0.20
-STAGE1_DENSITY_GRID          = 8     
-STAGE1_DENSITY_FACTOR        = 5.0   
-STAGE1_AVG_GT_PER_IMAGE      = 236   
+# Not Stage-1-specific: describes a dataset-wide property (avg chars/page) and a
+# proposal-density heuristic shared by Stage 1's and Stage 2's coarse-proposal
+# extraction (see KuroNetRecognizer/HybridKuroNetRecognizer density_* params).
+DENSITY_GRID          = 8
+DENSITY_FACTOR        = 5.0
+AVG_GT_PER_IMAGE      = 236
 
 
 # ============================================================
@@ -234,7 +237,7 @@ KURONET_CROP_ENCODER_SIZE    = (112, 112)
 # Phase 2 (epoch FREEZE_AFTER+1+): auto-frozen — only out_proj + crop_fusion keep training.
 #   Drops ~5.3M params from backprop → no longer bottleneck at 112px.
 KURONET_FREEZE_CROP_ENCODER       = False  # start unfrozen
-KURONET_FREEZE_CROP_ENCODER_AFTER = 8      # freeze EfficientNet-B0 weights after this epoch
+KURONET_FREEZE_CROP_ENCODER_AFTER = 5      # freeze EfficientNet-B0 weights after this epoch
 # A dense page of Kuzushiji can yield hundreds of ROIs per image; with
 # STAGE2_BATCH_SIZE=8 and DET_TOP_K up to 500, a single training batch can
 # produce ~4000 crops. When unfrozen (gradients flowing through EfficientNet-
@@ -401,3 +404,5 @@ TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = 10
 TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = 60
 MAX_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024
 TRANSCRIBE_INFERENCE_TIMEOUT_SEC = 60.0
+
+WEBSITE_CHECKPOINT_DIR = CHECKPOINT_DIR / "C_gru_efficientnet_sam2"  / "kuronet_recognizer" / "kuronet_best.pt"

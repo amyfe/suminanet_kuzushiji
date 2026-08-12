@@ -6,6 +6,7 @@ import { useState } from 'react'
 import { useLocation } from 'react-router'
 import i18next from 'i18next'
 import { columnsFromChars } from '../utils/text'
+import { apiFetch } from '../utils/api'
 
 const Workspace = () => {
   const location = useLocation()
@@ -18,10 +19,13 @@ const Workspace = () => {
   const [chars, setChars] = useState([])
   const [transcription, setTranscription] = useState(example ? example.text : '')
   const [translation, setTranslation] = useState('')
+  const [normalizedJapanese, setNormalizedJapanese] = useState('')
   const [modernJapanese, setModernJapanese] = useState('')
+  const [conversionNotes, setConversionNotes] = useState('')
   const [translationNotes, setTranslationNotes] = useState('')
   const [normalizationMethod, setNormalizationMethod] = useState('')
   const [targetLang, setTargetLang] = useState('en')
+  const [includeNotes, setIncludeNotes] = useState(true)
   const [transcribing, setTranscribing] = useState(false)
   const [translating, setTranslating] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -35,7 +39,9 @@ const Workspace = () => {
     setChars([])
     setTranscription('')
     setTranslation('')
+    setNormalizedJapanese('')
     setModernJapanese('')
+    setConversionNotes('')
     setTranslationNotes('')
     setNormalizationMethod('')
   }
@@ -101,8 +107,11 @@ const Workspace = () => {
     try {
       const form = new FormData()
       form.append('image', image)
-      const res = await fetch('/api/transcribe', { method: 'POST', body: form })
+      const res = await apiFetch('/api/transcribe', { method: 'POST', body: form })
       const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data.detail || 'transcribe failed')
+      }
       setTranscription(data.transcription)
       setChars(data.chars || [])
     } catch {
@@ -116,21 +125,25 @@ const Workspace = () => {
     if (!transcription) return
     setTranslating(true)
     setTranslation('')
+    setNormalizedJapanese('')
     setModernJapanese('')
+    setConversionNotes('')
     setTranslationNotes('')
     setNormalizationMethod('')
     try {
-      const res = await fetch('/api/translate', {
+      const res = await apiFetch('/api/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: transcription, chars, lang: targetLang }),
+        body: JSON.stringify({ text: transcription, chars, lang: targetLang, include_notes: includeNotes }),
       })
       const data = await res.json()
       if (!res.ok) {
         throw new Error(data.detail || 'translate failed')
       }
       setTranslation(data.english_translation)
+      setNormalizedJapanese(data.normalized_japanese || '')
       setModernJapanese(data.modern_japanese || '')
+      setConversionNotes(data.conversion_notes || '')
       setTranslationNotes(data.translation_notes || '')
       setNormalizationMethod(data.normalization_method || '')
     } catch {
@@ -242,11 +255,15 @@ const Workspace = () => {
             onTranslate={translate}
             translating={translating}
             translation={translation}
+            normalizedJapanese={normalizedJapanese}
             modernJapanese={modernJapanese}
+            conversionNotes={conversionNotes}
             translationNotes={translationNotes}
             normalizationMethod={normalizationMethod}
             targetLang={targetLang}
             onTargetLangChange={setTargetLang}
+            includeNotes={includeNotes}
+            onIncludeNotesChange={setIncludeNotes}
             onCopy={copyResult}
             onDownload={downloadTxt}
             copyLabel={copied ? t('workspace.copiedText') : t('workspace.copyText')}

@@ -216,7 +216,7 @@ def extract_coarse_proposals(
     nms_iou: float = 0.5,
     min_size: float = 1.0,
     density_grid: int = 8,
-    density_factor: float = 3.0,
+    density_factor: float = 5.0,
     avg_gt_per_image: int = 236,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """
