@@ -5,7 +5,7 @@ Supported types:
     'efficientnet_b2' -- EfficientNet-B2 encoder + FPN decoder, ImageNet pretrained
 
 Usage:
-    from model.kuronet.backbone import build_backbone
+    from model.suminanet.backbone import build_backbone
     backbone = build_backbone(BACKBONE_TYPE, BACKBONE_BASE_FEATURES)
 """
 
@@ -33,7 +33,7 @@ def build_backbone(backbone_type: str, base_features: int, pretrained: bool = Tr
     t = backbone_type.lower().replace("-", "_")
 
     if t == "unet":
-        from model.kuronet.unet import UNet
+        from model.suminanet.unet import UNet
         return UNet(in_channels=3, base_features=base_features)
 
     elif t == "efficientnet_b2":

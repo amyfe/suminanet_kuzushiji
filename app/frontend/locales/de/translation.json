@@ -9,14 +9,14 @@
         "tryIt": "Ausprobieren →"
     },
     "home": {
-        "heroEyebrow": "墨 SUMI · AUF KURONET AUFGEBAUT 黒",
+        "heroEyebrow": "墨 SUMI · AUF SUMINANET AUFGEBAUT 黒",
         "heroTitle": "Lesen Sie die Handschrift Edos.",
         "heroSub": "Sumina liest das kursive Kuzushiji in Ihren Scans von Holzschnitten und Manuskripten, lässt Sie den Entwurf korrigieren und macht Jahrhunderte altes Japanisch zu Englisch, das Sie tatsächlich lesen können.",
         "heroCta": "Jetzt ausprobieren →",
         "howTitle": "So funktioniert es",
         "how_steps": [
             { "step": 1, "title": "Scan hochladen", "body": "Laden Sie ein Foto oder einen Scan eines Holzschnitts oder handschriftlichen Manuskripts hoch — ob modern oder aus der Edo-Zeit." },
-            { "step": 2, "title": "Transkribieren & korrigieren", "body": "KuroNet erkennt jedes kursive Zeichen und schlägt eine Lesung vor. Sie überprüfen das Ergebnis und korrigieren, was falsch erkannt wurde." },
+            { "step": 2, "title": "Transkribieren & korrigieren", "body": "SuminaNet erkennt jedes kursive Zeichen und schlägt eine Lesung vor. Sie überprüfen das Ergebnis und korrigieren, was falsch erkannt wurde." },
             { "step": 3, "title": "Übersetzen", "body": "Erhalten Sie fließendes Englisch neben dem Original, direkt aus der korrigierten Transkription abgeleitet." }
         ],
         "examplesEyebrow": "TEXT AUSWÄHLEN · 用例",
@@ -32,7 +32,7 @@
         ],
         "exampleCta": "Im Arbeitsbereich öffnen →",
         "footerCredit": "墨奈 Sumina — 幸 by Amina Felic",
-        "footerPowered": "Zeichenerkennung unterstützt durch KuroNet (Clanuwat et al.)"
+        "footerPowered": "Zeichenerkennung unterstützt durch SuminaNet, inspiriert von KuroNet (Clanuwat et al.)"
     },
     "workspace": {
         "title": "Arbeitsbereich",
@@ -102,8 +102,8 @@
         ],
         "p2": [
             { "text": "Sumina verbindet " },
-            { "b": "KuroNet" },
-            { "text": " — das Zeichenerkennungsmodell von Tarin Clanuwat und Kolleg:innen — mit einem menschlichen Korrekturschritt und einer Übersetzung, sodass aus einem Scan eine Lesung und aus einer Lesung ein englischer Text wird. Entwickelt für Forschende, Studierende und alle, die neugierig genug sind, genau hinzusehen." }
+            { "b": "SuminaNet" },
+            { "text": ", ein hauseigenes Zeichenerkennungsmodell inspiriert von KuroNet — dem wegweisenden System von Tarin Clanuwat und Kolleg:innen — mit einem menschlichen Korrekturschritt und einer Übersetzung, sodass aus einem Scan eine Lesung und aus einer Lesung ein englischer Text wird. Entwickelt für Forschende, Studierende und alle, die neugierig genug sind, genau hinzusehen." }
         ],
         "etymology": [
             { "text": "Der Name vereint 墨 " },

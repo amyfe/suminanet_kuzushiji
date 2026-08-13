@@ -1,4 +1,4 @@
-"""kuronet subpackage exports."""
+"""suminanet subpackage exports."""
 from .unet import UNet
 from .detector import DetectorHead
 from .roi.roi_sequence_deprecated import ROISequenceEncoder

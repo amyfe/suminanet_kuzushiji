@@ -2,7 +2,7 @@
 
 Why this exists
 ---------------
-The KuroNet coverage is capped at ~84% because the IoU-matching threshold (0.45)
+The SuminaNet coverage is capped at ~84% because the IoU-matching threshold (0.45)
 drops detector proposals whose boxes don't align tightly enough with the GT characters.
 SAM2 with bounding-box prompts produces pixel-precise masks that, when converted to
 tight bounding boxes, consistently achieve higher IoU with GT — closing that gap without
@@ -92,8 +92,8 @@ from config import (
     SAM2_CHECKPOINT,
     SAM2_PROPOSALS_DIR,
 )
-from model.kuronet import DetectorHead, build_backbone
-from model.kuronet.detection.proposal_utils import extract_coarse_proposals
+from model.suminanet import DetectorHead, build_backbone
+from model.suminanet.detection.proposal_utils import extract_coarse_proposals
 from utils.vocab import VocabManager
 
 
@@ -834,7 +834,7 @@ def _run_processing_loop(
         f"Avg proposals/image: {avg_proposals:.1f}  "
         f"Avg FN-recovered/image: {avg_fn:.1f}\n"
         f"Refined proposals saved to: {output_dir}\n\n"
-        f"To use in training, pass --sam2_proposals {output_dir} to train_stage2_kuronet.py"
+        f"To use in training, pass --sam2_proposals {output_dir} to train_stage2_suminanet.py"
     )
 
 

@@ -65,8 +65,8 @@ from config import (
     BACKBONE_TYPE,
 )
 
-from model.kuronet import DetectorHead, build_backbone
-from model.kuronet.hybrid_recognizer import HybridKuroNetRecognizer
+from model.suminanet import DetectorHead, build_backbone
+from model.suminanet.hybrid_recognizer import HybridSuminaNetRecognizer
 
 from utils import KuzushijiDataset
 from utils.training_helpers.helper_stage1 import (
@@ -133,7 +133,7 @@ def _select_model_score(val_metrics: dict) -> float:
     )
 
 
-def set_trainable_modules_for_phase(model: HybridKuroNetRecognizer) -> None:
+def set_trainable_modules_for_phase(model: HybridSuminaNetRecognizer) -> None:
     for name, p in model.named_parameters():
         if name.startswith("backbone.") or name.startswith("detector.") or name.startswith("aux_head."):
             continue
@@ -257,7 +257,7 @@ def build_stage2_model(
     detector_ckpt_path: str | Path,
     vocab: VocabManager,
     overrides: Optional[dict] = None,
-) -> HybridKuroNetRecognizer:
+) -> HybridSuminaNetRecognizer:
     overrides = overrides or {}
     vocab_size = vocab.vocab_size
 
@@ -293,7 +293,7 @@ def build_stage2_model(
     backbone.load_state_dict(checkpoint[state_key])
     detector.load_state_dict(checkpoint["detector_state_dict"])
 
-    model = HybridKuroNetRecognizer(
+    model = HybridSuminaNetRecognizer(
         backbone=backbone,
         detector=detector,
         backbone_out_channels=BACKBONE_BASE_FEATURES,
@@ -336,7 +336,7 @@ def build_stage2_model(
     return model
 
 
-def get_trainable_parameters(model: HybridKuroNetRecognizer):
+def get_trainable_parameters(model: HybridSuminaNetRecognizer):
     return [p for p in model.parameters() if p.requires_grad]
 
 
@@ -488,7 +488,7 @@ def _finalize_proposal_summary(stats: dict, vocab: VocabManager, phase_settings:
 
 @torch.no_grad()
 def validate_stage2(
-    model: HybridKuroNetRecognizer,
+    model: HybridSuminaNetRecognizer,
     val_loader: DataLoader,
     vocab: VocabManager,
     phase_settings: Optional[dict] = None,
@@ -652,7 +652,7 @@ def train_stage2_hybrid(
     best_val_metrics = None
 
     print("=" * 70)
-    print("WARMUP TRAINING (ROI pipeline pre-training for KuroNet)")
+    print("WARMUP TRAINING (ROI pipeline pre-training for SuminaNet)")
     print("=" * 70)
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
     print(f"Trainable params: {sum(p.numel() for p in trainable_params):,}")
@@ -888,7 +888,7 @@ def main():
         )
 
     phase_settings = get_warmup_settings()
-    checkpoint_dir = CHECKPOINT_DIR / "kuronet_warmup"
+    checkpoint_dir = CHECKPOINT_DIR / "suminanet_warmup"
 
     train_stage2_hybrid(
         detector_ckpt_path=detector_ckpt,

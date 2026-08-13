@@ -45,6 +45,9 @@ GRADIENT_ACCUMULATION_STEPS = 1
 GRAD_CLIP = 1.0
 
 NUM_EPOCHS = 30
+DENSITY_GRID          = 8
+DENSITY_FACTOR        = 5.0
+AVG_GT_PER_IMAGE      = 236
 
 
 # ============================================================
@@ -63,8 +66,7 @@ IN_CHANNELS = 3
 
 # Backbone selection.
 # 'unet'            -- UNet from scratch (no pretrained weights)
-# 'efficientnet_b2' -- EfficientNet-B2 + FPN decoder, ImageNet pretrained,
-#                      outputs at stride=2 (H//2, W//2). Requires timm.
+# 'efficientnet_b2' -- EfficientNet-B2 + FPN decoder, ImageNet pretrained
 BACKBONE_TYPE = "efficientnet_b2"
 BACKBONE_BASE_FEATURES = 64
 
@@ -83,37 +85,21 @@ STAGE1_POS_WEIGHT = 1.536665269500476
 
 STAGE1_BBOX_WEIGHT = 0.13048169580424154
 # DIoU loss added alongside SmoothL1: directly optimises IoU (which validation measures at ≥0.5)
-# plus a centre-distance penalty that keeps predictions anchored near GT centres.
-# Weight kept equal to BBOX_WEIGHT so both objectives carry similar gradient magnitude.
-STAGE1_DIOU_WEIGHT = 0.1345315263632802
+STAGE1_DIOU_WEIGHT = STAGE1_BBOX_WEIGHT
 STAGE1_HEATMAP_SIGMA = 1.7545869700715266         
 STAGE1_FOCAL_POS_THRESHOLD = 0.479126803723303     
-
 STAGE1_EARLY_STOPPING_PATIENCE = 5   
 STAGE1_SIGMA_FLOOR = 1.5
 STAGE1_SIGMA_CEIL  = 3.0
-# Multiplier in adaptive sigma: sigma_eff = sigma * sqrt(bw * bh) * SIGMA_SCALE
-# With stride=2 (512→256 output), effective ranges at STAGE1_HEATMAP_SIGMA=0.7249:
-#   char  15px → bw=7.5  → sigma_eff = 1.09 → clamped to floor 1.5
-#   char  28px → bw=14.0 → sigma_eff = 2.03 (active range)
-#   char  42px → bw=21.0 → sigma_eff = 3.04 → clamped to ceil  3.0
-# Characters outside [~20px, ~42px] are always at floor or ceil; only mid-size
-# characters are sensitive to STAGE1_HEATMAP_SIGMA.
 STAGE1_SIGMA_SCALE = 0.20
-# Not Stage-1-specific: describes a dataset-wide property (avg chars/page) and a
-# proposal-density heuristic shared by Stage 1's and Stage 2's coarse-proposal
-# extraction (see KuroNetRecognizer/HybridKuroNetRecognizer density_* params).
-DENSITY_GRID          = 8
-DENSITY_FACTOR        = 5.0
-AVG_GT_PER_IMAGE      = 236
-
 
 # ============================================================
-# Stage 2: Hybrid Recognition (Option C)
+# Stage 2: Hybrid Recognition
 # ============================================================
 
-# Freeze policy for first stable Option-C training
 STAGE2_DROPOUT_RATE = 0.15
+SUMINANET_EPOCHS               = 50
+SUMINANET_EARLY_STOPPING_PATIENCE = 10  
 
 # -------------------------
 # Detector -> Proposal stage
@@ -152,6 +138,7 @@ STAGE2_USE_AUX_HEAD = True
 # -------------------------
 
 STAGE2_READING_ORDER_LINE_THRESH_RATIO = 0.60
+SUMINANET_READING_ORDER_CONFIDENCE = 0.5
 
 # -------------------------
 # ROI token projection
@@ -211,7 +198,7 @@ STAGE2_TRAIN_PROP_STATS_EVERY_N_STEPS = 8
 
 
 # ============================================================
-# Warmup training (ROI pipeline pre-training for KuroNet)
+# Warmup training (ROI pipeline pre-training for SuminaNet)
 # ============================================================
 
 WARMUP_EPOCHS = 40
@@ -220,120 +207,72 @@ WARMUP_LAMBDA_DELTA = 1.0
 WARMUP_LAMBDA_SCORE = 0.3
 WARMUP_LAMBDA_AUX = 1.0
 
-KURONET_CHECKPOINT_DIR       = CHECKPOINT_DIR /"kuronet_recognizer"
-KURONET_CHECKPOINT_DIR.mkdir(exist_ok=True)
+# ============================================================
+# More Stage 2 / SuminaNet hyperparameters
+# ============================================================
 
-KURONET_USE_CONTEXT          = True
-KURONET_CONTEXT_BLOCK_GAP_FACTOR = 2.5
-KURONET_COPY_PASTE_PROB      = 0.4
+SUMINANET_CHECKPOINT_DIR       = CHECKPOINT_DIR /"suminanet_recognizer"
+SUMINANET_CHECKPOINT_DIR.mkdir(exist_ok=True)
 
-KURONET_CLASSIFIER_HIDDEN    = 512
-KURONET_USE_CROP_ENCODER     = True
-# 112px → 3×3 feature map before global-avg-pool (vs 2×2 at 64/80px).
-# Meaningful spatial detail improvement for stroke discrimination (Clanuwat insight).
-KURONET_CROP_ENCODER_SIZE    = (112, 112)
+SUMINANET_USE_CONTEXT          = True
+SUMINANET_CONTEXT_BLOCK_GAP_FACTOR = 2.5
+SUMINANET_COPY_PASTE_PROB      = 0.4
+
+SUMINANET_CLASSIFIER_HIDDEN    = 512
+SUMINANET_USE_CROP_ENCODER     = True
+SUMINANET_CROP_ENCODER_SIZE    = (112, 112)
 # Two-phase freeze schedule:
 # Phase 1 (epochs 1–FREEZE_AFTER): unfrozen — EfficientNet-B0 adapts ImageNet → Kuzushiji.
 # Phase 2 (epoch FREEZE_AFTER+1+): auto-frozen — only out_proj + crop_fusion keep training.
 #   Drops ~5.3M params from backprop → no longer bottleneck at 112px.
-KURONET_FREEZE_CROP_ENCODER       = False  # start unfrozen
-KURONET_FREEZE_CROP_ENCODER_AFTER = 5      # freeze EfficientNet-B0 weights after this epoch
-# A dense page of Kuzushiji can yield hundreds of ROIs per image; with
-# STAGE2_BATCH_SIZE=8 and DET_TOP_K up to 500, a single training batch can
-# produce ~4000 crops. When unfrozen (gradients flowing through EfficientNet-
-# B0), ROICropEncoder only avoids exceeding this value by wrapping each chunk
-# in torch.utils.checkpoint -- trading recompute (redoing each chunk's
-# forward pass during backward) for staying under it. That tradeoff was
-# tuned for a 16GB GPU; on larger GPUs, set this high enough to comfortably
-# exceed a batch's typical ROI count (n_valid <= chunk_size) so the *frozen*
-# no_grad path also stays a single unchunked call, and more importantly the
-# *unfrozen* path skips checkpointing's recompute overhead entirely -- pure
-# memory-for-speed trade once memory isn't the binding constraint. Note this
-# still changes BatchNorm statistics from "computed over all N crops" to
-# "computed per chunk" whenever a batch's ROI count does exceed this value
-# (eval-mode BN uses running stats, unaffected either way).
-KURONET_CROP_ENCODER_CHUNK_SIZE   = 8192
-# Pool output size: the AdaptiveAvgPool2d target after the conv layers, before the MLP.
-# This is DISTINCT from STAGE2_ROI_SIZE:
-#   ROI_SIZE    = how finely tv_roi_align samples from the feature map (conv input resolution)
-#   POOL_OUTPUT = how many spatial cells the downstream MLP receives
-# 4×4=16 cells captures coarse stroke layout (enough for character discrimination) while
-# keeping the Linear layer small (conv_ch*16 inputs vs conv_ch*256 for a 16×16 pool).
-# Increase only if the MLP is a bottleneck — requires retraining from scratch.
-KURONET_ROI_POOL_OUTPUT_SIZE = (4, 4)
+SUMINANET_FREEZE_CROP_ENCODER       = False  # start unfrozen
+SUMINANET_FREEZE_CROP_ENCODER_AFTER = 5      # freeze EfficientNet-B0 weights after this epoch
+SUMINANET_CROP_ENCODER_CHUNK_SIZE   = 512
+SUMINANET_ROI_POOL_OUTPUT_SIZE = (4, 4)
+SUMINANET_DET_SCORE_THRESH     = 0.33821750481132784
+SUMINANET_DELTA_SCALE_XY       = 0.25
+SUMINANET_DELTA_SCALE_WH       = 0.20
 
-# Per-ROI detector threshold for KuroNet proposal extraction.
-# Intentionally lower than DET_SCORE_THRESH (Stage 1 validation threshold):
-# KuroNet's classifier filters the expanded candidate set, so casting a wider
-# net here trades a few extra FP proposals for better GT recall.
-KURONET_DET_SCORE_THRESH     = 0.33821750481132784
+SUMINANET_CER_SCORE_THRESH     = 0.35
 
-# Box delta smoothing: tanh-scaled dx/dy and dw/dh in ROIRefinementHead.
-# Larger values allow bigger shifts per step but destabilize early training.
-KURONET_DELTA_SCALE_XY       = 0.25
-KURONET_DELTA_SCALE_WH       = 0.20
-
-KURONET_CER_SCORE_THRESH     = 0.35
-
-# Number of runner-up character candidates (excluding BG) surfaced alongside
-# each transcribed char via the /api/transcribe "alternates" field, so the
-# frontend can show "next best guesses" for low-confidence chars. The chosen
-# top-1 pick is also included as alternates[0] (marked "chosen": True), so
-# the field returns up to KURONET_NUM_ALTERNATES + 1 entries in total.
-KURONET_NUM_ALTERNATES        = 3
+SUMINANET_NUM_ALTERNATES        = 3
 
 # Furigana / noise-box filter: proposals whose area is below this fraction of the
-# median character area are discarded.  Only applied when at least KURONET_FURIGANA_MIN_SAMPLES
-# characters are detected (fewer samples → unreliable median → skip filter).
-KURONET_FURIGANA_AREA_RATIO  = 0.25
-KURONET_FURIGANA_MIN_SAMPLES = 5
+# median character area are discarded.  Only applied when at least SUMINANET_FURIGANA_MIN_SAMPLES
+SUMINANET_FURIGANA_AREA_RATIO  = 0.25
+SUMINANET_FURIGANA_MIN_SAMPLES = 5
 
-KURONET_LAMBDA_CHAR          = 1.0         
-KURONET_LAMBDA_BOX           = 0.0         
-KURONET_LAMBDA_DELTA         = 0.3391212189425109       
-KURONET_LAMBDA_SCORE         = 0.25001127318731137        
-KURONET_BG_WEIGHT            = 0.06213050022661147         
-KURONET_STRONG_BG_WEIGHT     = 0.185146        
-KURONET_BG_SCORE_GATE        = 0.55
+# ============================================================
+# SuminaNet Loss / Optimizer / Training Hyperparameters
+# ============================================================
 
-# Minimum sigmoid(refine_score) for a box to "anchor" column/row geometry in
-# ROIReadingOrder's reading-order clustering. Low-confidence boxes (weak/
-# duplicate detections, gap-filled synthetic proposals) are excluded from
-# establishing column positions, then snapped to the nearest anchor-derived
-# column afterward -- otherwise their x-centers smear the gaps between real
-# columns on dense pages, collapsing column detection.
-KURONET_READING_ORDER_CONFIDENCE = 0.5
+SUMINANET_LAMBDA_CHAR          = 1.0         
+SUMINANET_LAMBDA_BOX           = 0.0         
+SUMINANET_LAMBDA_DELTA         = 0.3391212189425109       
+SUMINANET_LAMBDA_SCORE         = 0.25001127318731137        
+SUMINANET_BG_WEIGHT            = 0.06213050022661147         
+SUMINANET_STRONG_BG_WEIGHT     = 0.185146        
+SUMINANET_BG_SCORE_GATE        = 0.55
+SUMINANET_RESIDUAL_SCALE_INIT  = 0.5
 
-# Initial value for the learnable residual scale in ROIRefinementHead.
-# Stored as a sigmoid-constrained nn.Parameter (logit-parameterised).
-# sigmoid(logit(0.5)) = 0.5 — identical to the old hardcoded constant at init time.
-KURONET_RESIDUAL_SCALE_INIT  = 0.5
+SUMINANET_FOCAL_GAMMA          = 1.203618254887657
+SUMINANET_RARE_CHAR_THRESH     = 50
+SUMINANET_HARD_NEG_WEIGHT      = 1.231901422995889   
+SUMINANET_HARD_NEG_TOP_K       = 20    
+SUMINANET_LAMBDA_SCRIPT        = 0.2627635863899684
 
-KURONET_FOCAL_GAMMA          = 1.203618254887657
+SUMINANET_LR                   = 0.0004789618199206086
+SUMINANET_LR_ETA_MIN           = 1e-6       
+SUMINANET_WEIGHT_DECAY         = 0.0003042318888471685
 
-KURONET_RARE_CHAR_THRESH     = 50
 
-KURONET_HARD_NEG_WEIGHT      = 1.231901422995889   
-KURONET_HARD_NEG_TOP_K       = 20    
-KURONET_LAMBDA_SCRIPT        = 0.2627635863899684
-
-# Optimizer
-KURONET_LR                   = 0.0004789618199206086
-KURONET_LR_ETA_MIN           = 1e-6       
-KURONET_WEIGHT_DECAY         = 0.0003042318888471685
-
-# Training
-KURONET_EPOCHS               = 50
-KURONET_EARLY_STOPPING_PATIENCE = 10   # epochs without composite-score improvement before stopping
-# Effective batch = STAGE2_BATCH_SIZE * KURONET_GRAD_ACCUM_STEPS * (GPU count in
-# submit_kuronet.sh's --gres / NPROC_PER_NODE). Currently 8*1*4=32. Keep this product
-# constant when changing GPU count so LR/WEIGHT_DECAY above stay valid for the new batch.
-KURONET_GRAD_ACCUM_STEPS     = 1
-KURONET_ENABLE_TQDM          = True
-KURONET_PROGRESS_POSTFIX_N   = 70
-KURONET_LOG_PREDICTIONS      = True
-KURONET_PREDICTION_SAMPLES   = 2
-KURONET_VALIDATION_BATCHES   = None   # None = full validation set each epoch
+# Effective batch = STAGE2_BATCH_SIZE * SUMINANET_GRAD_ACCUM_STEPS * GPU count
+SUMINANET_GRAD_ACCUM_STEPS     = 1
+SUMINANET_ENABLE_TQDM          = True
+SUMINANET_PROGRESS_POSTFIX_N   = 70
+SUMINANET_LOG_PREDICTIONS      = True
+SUMINANET_PREDICTION_SAMPLES   = 2
+SUMINANET_VALIDATION_BATCHES   = None   # None = full validation set each epoch
 
 
 # ============================================================
@@ -358,51 +297,36 @@ SAM2_PROPOSALS_DIR = ROOT / "assets/sam2_proposals"
 # ============================================================
 # Translation Pipeline (Claude API resilience + OCR-confidence handling)
 # ============================================================
+WEBSITE_CHECKPOINT_DIR = CHECKPOINT_DIR / "C_gru_efficientnet_sam2"  / "suminanet_recognizer" / "suminanet_best.pt"
+OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+MODEL ="claude-sonnet-4-6"
+OPENROUTER_MODEL = "anthropic/" + MODEL
+TARGET_LANGUAGES = {"en": "English", "de": "German"}
 
-# SDK-native retry/timeout for both the OpenRouter (openai) and direct
-# Anthropic clients in ClaudeTranslator. Both SDKs already retry
-# connection errors / 408 / 409 / 429 / 5xx with exponential backoff.
 TRANSLATION_API_MAX_RETRIES = 3
 TRANSLATION_API_TIMEOUT_SEC = 30.0
 
-# Chars reaching translate_text() already survived KURONET_CER_SCORE_THRESH
+# Chars reaching translate_text() already survived SUMINANET_CER_SCORE_THRESH
 # (0.35) upstream in run_inference(); this is a second, softer "still shaky"
 # bar used to bracket-annotate individual characters for Claude.
 TRANSLATION_UNCERTAIN_SCORE_THRESH = 0.6
 
 # Minimum run length of kana between kanji before it's flagged as possible
-# furigana (a single kana between kanji is more likely grammatical).
 FURIGANA_MIN_RUN_LENGTH = 2
 
-# Output token budget for classical_to_modern / translate_to_english: scaled
-# from input character count instead of a fixed 2000, so dense pages/long
-# scholarly notes don't get silently truncated. Clamped to [FLOOR, CEILING].
 TRANSLATION_MAX_TOKENS_FLOOR = 2000
 TRANSLATION_MAX_TOKENS_CEILING = 8000
 TRANSLATION_MAX_TOKENS_CHARS_MULTIPLIER = 4
-
-# Character-count proxy for Claude's ~1500-input-token guidance (no local
-# tokenizer available; CJK text tokenizes close enough to 1:1 that a char
-# count is a reasonable, cheap stand-in). translate_text() rejects longer
-# inputs rather than silently truncating context.
 TRANSLATION_MAX_INPUT_CHARS = 1500
 
 # ============================================================
 # Backend API — Rate Limiting
 # ============================================================
 
-# Per-IP sliding-window limit on /api/translate specifically — this endpoint
-# spends paid Claude API quota. /api/transcribe (GPU-cost, no external API
-# cost) is a separate concern, tracked as pipeline_analysis.txt item 6.3.
 TRANSLATE_RATE_LIMIT_MAX_REQUESTS = 5
 TRANSLATE_RATE_LIMIT_WINDOW_SECONDS = 600
-
-# /api/transcribe has no external API cost but is GPU-bound, so it gets its
-# own (looser) sliding-window limit plus an upload size cap and inference
-# timeout — pipeline_analysis.txt item 6.3.
 TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = 10
 TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = 60
 MAX_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024
 TRANSCRIBE_INFERENCE_TIMEOUT_SEC = 60.0
 
-WEBSITE_CHECKPOINT_DIR = CHECKPOINT_DIR / "C_gru_efficientnet_sam2"  / "kuronet_recognizer" / "kuronet_best.pt"

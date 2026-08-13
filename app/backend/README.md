@@ -10,7 +10,7 @@ requests to Claude. Single Python process, no database, no background workers.
 | Framework | [FastAPI](https://fastapi.tiangolo.com/) 0.139+ on [Uvicorn](https://www.uvicorn.org/) 0.50+ (ASGI) |
 | Language | Python 3.10+ |
 | ML runtime | PyTorch 2.12+ (CUDA if available, falls back to CPU) |
-| Transcription model | KuroNet (in-house, two-stage detector + recognizer) |
+| Transcription model | SuminaNet (in-house, two-stage detector + recognizer, inspired by KuroNet) |
 | Translation model | Claude (`claude-sonnet-4-6`), via OpenRouter |
 | Japanese NLP | MeCab + UniDic (via `fugashi`) for classical→modern normalization |
 
@@ -40,11 +40,11 @@ health check.
 At startup (`lifespan` in [app.py](app.py)) the server loads **one checkpoint**:
 
 ```
-checkpoints/kuronet_recognizer/kuronet_best.pt
+checkpoints/suminanet_recognizer/suminanet_best.pt
 ```
 
 This single file is self-contained — it includes both the Stage 1 detector
-(EfficientNet-B2 + FPN) and the Stage 2 recognizer (KuroNet) weights, so it's the
+(EfficientNet-B2 + FPN) and the Stage 2 recognizer (SuminaNet) weights, so it's the
 only checkpoint the production server needs to load into memory. See the
 [top-level checkpoint inventory](../../checkpoints/README.md) for exact sizes and
 what else exists in `checkpoints/` (training-only artifacts that do **not** need to

@@ -1,4 +1,4 @@
-# model/kuronet/convlstm.py
+# model/suminanet/convlstm.py
 """
 ConvLSTM implementation (cell + stacked module).
 Simple, dependency-free implementation.

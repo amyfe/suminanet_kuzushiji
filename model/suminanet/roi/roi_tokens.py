@@ -45,7 +45,7 @@ Später könnte man relative Features zwischen Nachbartokens ergänzen, aber noc
 """
 
 
-# model/kuronet/roi/roi_tokens.py
+# model/suminanet/roi/roi_tokens.py
 
 from __future__ import annotations
 

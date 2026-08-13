@@ -9,8 +9,8 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 
-from config import AVG_GT_PER_IMAGE, IMAGE_SIZE, KURONET_COPY_PASTE_PROB, SAM2_MASKS_DIR, SAM2_PREPROCESSING
-from model.kuronet.roi.roi_ordering import infer_reading_orientation_from_boxes, ROIReadingOrder
+from config import AVG_GT_PER_IMAGE, IMAGE_SIZE, SUMINANET_COPY_PASTE_PROB, SAM2_MASKS_DIR, SAM2_PREPROCESSING
+from model.suminanet.roi.roi_ordering import infer_reading_orientation_from_boxes, ROIReadingOrder
 
 
 class KuzushijiDataset(Dataset):
@@ -242,7 +242,7 @@ class KuzushijiDataset(Dataset):
         # Applied on the resized PIL image before the tensor transform so that
         # crops are at the correct 512×512 scale. New boxes are appended in-place;
         # IoU-based GT matching in the loss is order-independent so no re-sort needed.
-        if self.copy_paste_db is not None and random.random() < KURONET_COPY_PASTE_PROB:
+        if self.copy_paste_db is not None and random.random() < SUMINANET_COPY_PASTE_PROB:
             try:
                 import cv2
                 from utils.char_augmentation import copy_paste_rare_chars

@@ -1,4 +1,4 @@
-# model/kuronet/backbone/roi_crop_encoder.py
+# model/suminanet/backbone/roi_crop_encoder.py
 """Pretrained EfficientNet-B0 applied to raw image crops per ROI.
 
 This mirrors Clanuwat's VGG-16 role: the detection backbone (UNet) localises

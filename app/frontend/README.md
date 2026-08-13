@@ -1,7 +1,7 @@
 # Frontend — Sumina
 
 Single-page React app ("Sumina") for uploading a scan, reviewing/correcting the
-KuroNet transcription, and getting an English or German translation.
+SuminaNet transcription, and getting an English or German translation.
 
 ## Stack
 

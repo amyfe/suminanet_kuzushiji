@@ -1,4 +1,4 @@
-"""Stage 2 (KuroNet) visualization helpers for thesis result analysis."""
+"""Stage 2 (SuminaNet) visualization helpers for thesis result analysis."""
 
 from __future__ import annotations
 
@@ -365,13 +365,13 @@ _VAL_LOSS_RE = re.compile(r"Val \| loss=([\d.]+)")
 _VAL_METRICS_RE = re.compile(
     r"Val \| top1=([\d.]+)\s+top5=([\d.]+)\s+CER=([\d.]+)\s+coverage=([\d.]+)"
 )
-_BEST_RE = re.compile(r"saved best: kuronet_best\.pt \(score=([\d.]+)\)")
+_BEST_RE = re.compile(r"saved best: suminanet_best\.pt \(score=([\d.]+)\)")
 _EARLY_STOP_RE = re.compile(r"Early stopping: (\d+) epochs without improvement\. best=([\d.]+)")
 
 
-def _parse_kuronet_log(log_file: "str | Path") -> tuple[list[dict], int | None]:
+def _parse_suminanet_log(log_file: "str | Path") -> tuple[list[dict], int | None]:
     """
-    Parse train_stage2_kuronet.log epoch/val summary lines.
+    Parse train_stage2_suminanet.log epoch/val summary lines.
 
     Each epoch is logged as three consecutive lines: an "Epoch N/M | Train
     loss=..." line, a "Val | loss=..." line, and a "Val | top1=... CER=..."
@@ -440,7 +440,7 @@ def plot_learning_curves(
     out_path: "str | Path" = "learning_curves.png",
 ) -> "Path | None":
     """
-    Parse train_stage2_kuronet.log and plot train/val loss + val CER/top1
+    Parse train_stage2_suminanet.log and plot train/val loss + val CER/top1
     curves, marking the checkpoint that was actually kept (best composite
     score) and the early-stopping point, if any.
 
@@ -451,7 +451,7 @@ def plot_learning_curves(
         print(f"Learning curve: log file not found ({log_file}), skipping.")
         return None
 
-    records, early_stop_epoch = _parse_kuronet_log(log_file)
+    records, early_stop_epoch = _parse_suminanet_log(log_file)
     if not records:
         print(f"Learning curve: no epoch summary lines found in {log_file}, skipping.")
         return None
@@ -517,6 +517,6 @@ def plot_learning_curves(
     lines2b, labels2b = ax2b.get_legend_handles_labels()
     ax2.legend(lines2 + lines2b, labels2 + labels2b, fontsize=7, ncol=2)
 
-    fig.suptitle("Stage 2 (KuroNet) training curves", fontsize=11)
+    fig.suptitle("Stage 2 (SuminaNet) training curves", fontsize=11)
     fig.tight_layout()
     return savefig(fig, out_path)

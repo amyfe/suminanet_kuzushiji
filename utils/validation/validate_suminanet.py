@@ -1,4 +1,4 @@
-"""Standalone validation script for KuroNetRecognizer.
+"""Standalone validation script for SuminaNetRecognizer.
 
 Runs the full validation pipeline on a saved checkpoint and prints:
   - Loss breakdown (char, box, delta, score)
@@ -10,9 +10,9 @@ Runs the full validation pipeline on a saved checkpoint and prints:
   - Prediction examples (pred vs GT)
 
 Usage:
-    python validate_kuronet.py
-    python validate_kuronet.py --ckpt checkpoints/kuronet_recognizer/kuronet_best.pt
-    python validate_kuronet.py --split val --batches 50
+    python validate_suminanet.py
+    python validate_suminanet.py --ckpt checkpoints/suminanet_recognizer/suminanet_best.pt
+    python validate_suminanet.py --batches 50
 """
 
 from __future__ import annotations
@@ -20,34 +20,39 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 from datetime import datetime
 import os
+
+# Allow running as `python utils/validation/validate_suminanet.py` (not just
+# `python -m utils.validation.validate_suminanet`) — Python only puts this
+# script's own directory on sys.path, not the repo root, so the `config`
+# import below fails without this.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
 from config import (
-    CHECKPOINT_DIR,
-    DATA_DIR,
+    WEBSITE_CHECKPOINT_DIR,
     DEVICE,
-    KURONET_CER_SCORE_THRESH,
-    KURONET_CHECKPOINT_DIR,
-    KURONET_PREDICTION_SAMPLES,
+    SUMINANET_CER_SCORE_THRESH,
+    SUMINANET_CHECKPOINT_DIR,
+    SUMINANET_PREDICTION_SAMPLES,
     STAGE2_REFINE_NEG_IOU,
     STAGE2_REFINE_POS_IOU,
     STAGE2_USE_HUNGARIAN,
 )
-from train_stage2_kuronet import (
+from train_stage2_suminanet import (
     _compute_assembled_cer,
-    _edit_distance,
     _ids_to_text,
     _top_k_accuracy,
     build_dataloaders,
-    build_kuronet_model,
-    compute_kuronet_loss,
+    build_suminanet_model,
+    compute_suminanet_loss,
     load_vocab,
 )
 from utils.stage2_targets import build_refinement_targets
@@ -58,7 +63,7 @@ from utils.training_helpers.helper_stage2 import (
 )
 
 
-def _load_kuronet_weights(model: torch.nn.Module, ckpt_path: Path) -> int:
+def _load_suminanet_weights(model: torch.nn.Module, ckpt_path: Path) -> int:
     ckpt = torch.load(ckpt_path, map_location="cpu")
     if "model_state_dict" in ckpt:
         state = ckpt["model_state_dict"]
@@ -212,9 +217,9 @@ def plot_confusion_matrix(
     ax.set_ylabel("Ground Truth", fontsize=11)
     ax.set_title(f"Confusion Matrix — top {n} error-prone classes (row-normalised)", fontsize=11)
 
-    plt.tight_layout()
-    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.tight_layout()
+    fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"Confusion matrix saved: {out_path}")
 
 
@@ -271,7 +276,6 @@ def print_per_class_error_rates(
 def save_per_class_errors_csv(
     rows: list[dict],
     out_path: Path,
-    vocab,
 ) -> dict:
     """Save ALL per-class error statistics to CSV and return a per-script-type breakdown."""
     type_stats: dict[str, dict] = {}
@@ -327,20 +331,21 @@ def save_per_class_errors_csv(
 def run_validation(
     ckpt_path: Path,
     max_batches: int | None,
-    split: str = "val",
+    out_dir: Path | None = None,
 ) -> None:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    resolved_job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("JOB_ID")
-    run_tag = f"{timestamp}_job{resolved_job_id}" if resolved_job_id else timestamp
-    out_dir = KURONET_CHECKPOINT_DIR / "validation" / run_tag
+    if out_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        resolved_job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("JOB_ID")
+        run_tag = f"{timestamp}_job{resolved_job_id}" if resolved_job_id else timestamp
+        out_dir = SUMINANET_CHECKPOINT_DIR / "validation" / run_tag
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output dir: {out_dir}")
 
     vocab = load_vocab()
     _, val_loader = build_dataloaders(vocab)
 
-    model = build_kuronet_model(vocab=vocab, load_stage1_weights=False)
-    epoch = _load_kuronet_weights(model, ckpt_path)
+    model = build_suminanet_model(vocab=vocab, load_stage1_weights=False)
+    epoch = _load_suminanet_weights(model, ckpt_path)
     model.eval()
     print(f"Loaded checkpoint: {ckpt_path}  (epoch={epoch})")
     print("=" * 70)
@@ -382,6 +387,8 @@ def run_validation(
     _bg_col = {"bg_isolated": 0, "bg_in_column": 0,
                "char_isolated": 0, "char_in_column": 0}
 
+    iso_mask = None  # set inside the loop below; kept here so it's defined even if n_batches == 0
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             if max_batches is not None and batch_idx >= max_batches:
@@ -406,10 +413,10 @@ def run_validation(
                 use_hungarian=STAGE2_USE_HUNGARIAN,
             )
 
-            loss, parts = compute_kuronet_loss(outputs, refine_targets, bg_id=bg_id)
+            loss, parts = compute_suminanet_loss(outputs, refine_targets, bg_id=bg_id)
             total_loss += float(loss.item())
             for k in loss_parts:
-                loss_parts[k] += parts.get(k, 0.0)
+                loss_parts[k] += float(parts.get(k, 0.0))
 
             sort_indices = outputs.get("sort_indices", None)
             gt_labels    = refine_targets["matched_gt_labels"]
@@ -425,7 +432,7 @@ def run_validation(
             top1_sum += _top_k_accuracy(outputs["char_logits"], gt_labels_s, pos_mask_s, k=1)
             top5_sum += _top_k_accuracy(outputs["char_logits"], gt_labels_s, pos_mask_s, k=5)
             cer_sum  += _compute_assembled_cer(outputs, gt_labels_s, pos_mask_s, vocab,
-                                              score_thresh=KURONET_CER_SCORE_THRESH)
+                                              score_thresh=SUMINANET_CER_SCORE_THRESH)
 
             bsz = images.size(0)
             n_images_tot += bsz
@@ -496,7 +503,7 @@ def run_validation(
                     _bg_col["char_isolated"]  += int((~is_bg &  iso_b).sum())
                     _bg_col["char_in_column"] += int((~is_bg & ~iso_b).sum())
 
-            if len(examples) < KURONET_PREDICTION_SAMPLES:
+            if len(examples) < SUMINANET_PREDICTION_SAMPLES:
                 valid_pred = outputs["ordered_mask"][0]
                 pred_ids_ex = outputs["char_logits"][0, valid_pred].argmax(dim=-1).tolist()
                 pred_text = _ids_to_text(pred_ids_ex, vocab)
@@ -645,7 +652,6 @@ def run_validation(
     type_breakdown = save_per_class_errors_csv(
         rows=per_class_rows,
         out_path=out_dir / "per_class_errors.csv",
-        vocab=vocab,
     )
 
     plot_confusion_matrix(
@@ -722,24 +728,28 @@ def run_validation(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate KuroNetRecognizer")
+    parser = argparse.ArgumentParser(description="Validate SuminaNetRecognizer")
     parser.add_argument(
         "--ckpt",
         type=str,
-        default=str(KURONET_CHECKPOINT_DIR / "kuronet_best.pt"),
-        help="Path to KuroNet checkpoint",
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="val",
-        help="Dataset split to evaluate on",
+        default=str(WEBSITE_CHECKPOINT_DIR),
+        help="Path to SuminaNet checkpoint",
     )
     parser.add_argument(
         "--batches",
         type=int,
         default=None,
         help="Max number of batches (None = full split)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="Output directory for metrics.json/per_class_errors.csv/confusion "
+             "matrices. Default: checkpoints/suminanet_recognizer/validation/<timestamp>. "
+             "Set this explicitly when validating a non-default checkpoint (e.g. "
+             "an archived B/C/D variant) so results don't collide with the default "
+             "checkpoint's validation history.",
     )
     args = parser.parse_args()
 
@@ -750,7 +760,7 @@ def main():
     run_validation(
         ckpt_path=ckpt_path,
         max_batches=args.batches,
-        split=args.split,
+        out_dir=Path(args.out_dir) if args.out_dir else None,
     )
 
 

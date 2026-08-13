@@ -102,7 +102,7 @@ Das Modell soll nur Forward machen
 
 """
 
-# model/kuronet/hybrid_recognizer.py
+# model/suminanet/hybrid_recognizer.py
 
 from __future__ import annotations
 
@@ -111,16 +111,16 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
-from model.kuronet.backbone.feature_projector import FeatureProjector
-from model.kuronet.context.roi_context import ROIContextEncoder
-from model.kuronet.detection.proposal_utils import extract_coarse_proposals
-from model.kuronet.roi.roi_ordering import ROIReadingOrder
-from model.kuronet.roi.roi_pool import ROIPoolEncoder
-from model.kuronet.roi.roi_refinement import ROIRefinementHead
-from model.kuronet.roi.roi_tokens import ROITokenProjector
+from model.suminanet.backbone.feature_projector import FeatureProjector
+from model.suminanet.context.roi_context import ROIContextEncoder
+from model.suminanet.detection.proposal_utils import extract_coarse_proposals
+from model.suminanet.roi.roi_ordering import ROIReadingOrder
+from model.suminanet.roi.roi_pool import ROIPoolEncoder
+from model.suminanet.roi.roi_refinement import ROIRefinementHead
+from model.suminanet.roi.roi_tokens import ROITokenProjector
 
 
-class HybridKuroNetRecognizer(nn.Module):
+class HybridSuminaNetRecognizer(nn.Module):
     """
     Option-C hybrid recognizer.
 
@@ -350,7 +350,7 @@ class HybridKuroNetRecognizer(nn.Module):
         )
 
         # Normalized (cx, cy) from refined boxes in sorted order — trains pos_proj
-        # during warmup so KuroNet inherits a useful spatial initialization.
+        # during warmup so SuminaNet inherits a useful spatial initialization.
         sorted_boxes = ordered["boxes"]
         cx = (sorted_boxes[..., 0] + sorted_boxes[..., 2]) * 0.5 / float(w_img)
         cy = (sorted_boxes[..., 1] + sorted_boxes[..., 3]) * 0.5 / float(h_img)

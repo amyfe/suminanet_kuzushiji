@@ -23,36 +23,30 @@ from config import (
     TRANSLATION_MAX_TOKENS_CEILING,
     TRANSLATION_MAX_TOKENS_CHARS_MULTIPLIER,
     TRANSLATION_MAX_TOKENS_FLOOR,
+    OPENROUTER_BASE,
+    OPENROUTER_MODEL,
+    TARGET_LANGUAGES,
+    MODEL
 )
 
 logger = logging.getLogger(__name__)
 
-_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
-_OPENROUTER_MODEL = "anthropic/claude-sonnet-4-6"
-
-_TARGET_LANGUAGES = {"en": "English", "de": "German"}
-
-
 def _target_language_name(lang: str) -> str:
     try:
-        return _TARGET_LANGUAGES[lang]
+        return TARGET_LANGUAGES[lang]
     except KeyError:
         raise ValueError(
-            f"Unsupported target language {lang!r}; expected one of {sorted(_TARGET_LANGUAGES)}"
+            f"Unsupported target language {lang!r}; expected one of {sorted(TARGET_LANGUAGES)}"
         ) from None
 
 
 def _estimate_max_tokens(text: str) -> int:
-    """Output token budget scaled from input length, clamped to
-    [TRANSLATION_MAX_TOKENS_FLOOR, TRANSLATION_MAX_TOKENS_CEILING]."""
     estimated = int(len(text) * TRANSLATION_MAX_TOKENS_CHARS_MULTIPLIER)
     return max(TRANSLATION_MAX_TOKENS_FLOOR, min(estimated, TRANSLATION_MAX_TOKENS_CEILING))
 
 
 class ClaudeTranslator:
     """Wraps the two Claude translation steps with prompt building and usage tracking."""
-
-    MODEL = "claude-sonnet-4-6"
 
     def __init__(self, api_key: Optional[str] = None) -> None:
         self.client: Any
@@ -61,7 +55,7 @@ class ClaudeTranslator:
         if or_key and not api_key:
             import openai
             self.client = openai.OpenAI(
-                base_url=_OPENROUTER_BASE,
+                base_url=OPENROUTER_BASE,
                 api_key=or_key,
                 timeout=TRANSLATION_API_TIMEOUT_SEC,
                 max_retries=TRANSLATION_API_MAX_RETRIES,
@@ -80,6 +74,7 @@ class ClaudeTranslator:
                 max_retries=TRANSLATION_API_MAX_RETRIES,
             )
             self._backend = "anthropic"
+            self.MODEL = MODEL
 
     # ------------------------------------------------------------------
     # Step 1: classical → modern Japanese
@@ -218,6 +213,33 @@ Classical Japanese text:
         )
         return result, self._usage(response)
 
+
+    def _build_translate_to_english_prompt(
+        self, modern_japanese: str, classical_text: str = "", language_name: str = "English", include_notes: bool = True
+    ) -> str:
+        context = (
+            f"\n\nOriginal classical text for reference:\n{classical_text}"
+            if classical_text
+            else ""
+        )
+        notes_requirement = (
+            "- Note important cultural context where relevant"
+            if include_notes
+            else "- Do not include any notes, explanations, or commentary — output only the translation"
+        )
+        return f"""Translate the following modern Japanese text to natural, fluent {language_name}.
+
+The text is from an Edo-period Japanese document that has been converted to modern Japanese. Your translation should:
+- Read naturally in {language_name}
+- Preserve the meaning and nuance
+- Maintain appropriate formality
+{notes_requirement}
+
+The text may contain "｜" markers inherited from the OCR pipeline, indicating a boundary between independent text blocks (unrelated inscriptions, captions, or marginal notes). Reflect this as a clear separation (e.g., a paragraph break) in the {language_name} translation rather than merging the blocks into one continuous narrative.
+
+Modern Japanese text:
+{modern_japanese}{context}"""
+
     # ------------------------------------------------------------------
     # Combined step: classical -> modern -> English in one request
     # (experimental, for comparison against the two-call pipeline above)
@@ -347,32 +369,6 @@ The text may contain inline annotations added by the OCR/preprocessing pipeline 
 Classical Japanese text:
 {text}{reference_block}"""
 
-    def _build_translate_to_english_prompt(
-        self, modern_japanese: str, classical_text: str = "", language_name: str = "English", include_notes: bool = True
-    ) -> str:
-        context = (
-            f"\n\nOriginal classical text for reference:\n{classical_text}"
-            if classical_text
-            else ""
-        )
-        notes_requirement = (
-            "- Note important cultural context where relevant"
-            if include_notes
-            else "- Do not include any notes, explanations, or commentary — output only the translation"
-        )
-        return f"""Translate the following modern Japanese text to natural, fluent {language_name}.
-
-The text is from an Edo-period Japanese document that has been converted to modern Japanese. Your translation should:
-- Read naturally in {language_name}
-- Preserve the meaning and nuance
-- Maintain appropriate formality
-{notes_requirement}
-
-The text may contain "｜" markers inherited from the OCR pipeline, indicating a boundary between independent text blocks (unrelated inscriptions, captions, or marginal notes). Reflect this as a clear separation (e.g., a paragraph break) in the {language_name} translation rather than merging the blocks into one continuous narrative.
-
-Modern Japanese text:
-{modern_japanese}{context}"""
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -394,7 +390,7 @@ Modern Japanese text:
 
         if self._backend == "openrouter":
             response = self.client.chat.completions.create(
-                model=_OPENROUTER_MODEL,
+                model=OPENROUTER_MODEL,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
                 tools=[{

@@ -9,7 +9,7 @@ import torch
 # for the deprecated helper functions below that are no longer called.
 _CHUNKED_FREE_DECODE = True
 _CHUNKED_FREE_TRAINING = True
-from model.kuronet.hybrid_recognizer import HybridKuroNetRecognizer
+from model.suminanet.hybrid_recognizer import HybridSuminaNetRecognizer
 from utils.stage2_losses import build_decoder_roi_targets_monotonic, build_decoder_roi_targets_from_bias
 from utils.vocab import VocabManager
 
@@ -161,7 +161,7 @@ def _reading_unit_spans_from_sorted_boxes(
 
 @torch.no_grad()
 def _decode_free_by_reading_units(
-    model: HybridKuroNetRecognizer,
+    model: HybridSuminaNetRecognizer,
     encoded: dict,
     orientations: list[str],
     vocab: VocabManager,

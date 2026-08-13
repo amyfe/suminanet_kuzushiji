@@ -1,4 +1,4 @@
-"""KuroNet-style per-ROI character recognizer.
+"""SuminaNet-style per-ROI character recognizer.
 
 Pipeline:
     image
@@ -15,7 +15,7 @@ Pipeline:
 At inference: argmax over classifier logits, sorted by reading order,
 decoded with vocabulary -> transcription string.
 
-This replaces the seq2seq HybridKuroNetRecognizer decoder with a direct
+This replaces the seq2seq HybridSuminaNetRecognizer decoder with a direct
 per-ROI classification head. All ROI pipeline modules are reused unchanged.
 """
 
@@ -26,15 +26,15 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
-from config import KURONET_BG_SCORE_GATE, KURONET_CROP_ENCODER_CHUNK_SIZE, KURONET_CROP_ENCODER_SIZE
-from model.kuronet.backbone.feature_projector import FeatureProjector
-from model.kuronet.backbone.roi_crop_encoder import ROICropEncoder
-from model.kuronet.context.roi_context import ROIContextEncoder
-from model.kuronet.detection.proposal_utils import extract_coarse_proposals
-from model.kuronet.roi.roi_ordering import ROIReadingOrder
-from model.kuronet.roi.roi_pool import ROIPoolEncoder
-from model.kuronet.roi.roi_refinement import ROIRefinementHead
-from model.kuronet.roi.roi_tokens import ROITokenProjector
+from config import SUMINANET_BG_SCORE_GATE, SUMINANET_CROP_ENCODER_CHUNK_SIZE, SUMINANET_CROP_ENCODER_SIZE
+from model.suminanet.backbone.feature_projector import FeatureProjector
+from model.suminanet.backbone.roi_crop_encoder import ROICropEncoder
+from model.suminanet.context.roi_context import ROIContextEncoder
+from model.suminanet.detection.proposal_utils import extract_coarse_proposals
+from model.suminanet.roi.roi_ordering import ROIReadingOrder
+from model.suminanet.roi.roi_pool import ROIPoolEncoder
+from model.suminanet.roi.roi_refinement import ROIRefinementHead
+from model.suminanet.roi.roi_tokens import ROITokenProjector
 from typing import Literal
 
 def _compute_neighbor_features(
@@ -153,14 +153,14 @@ def _compute_block_ids(
     return block_ids
 
 
-class KuroNetRecognizer(nn.Module):
+class SuminaNetRecognizer(nn.Module):
     """
-    KuroNet-style character recognizer.
+    SuminaNet-style character recognizer.
 
     Detects character boxes, classifies each one independently,
     then assembles the transcription in reading order.
 
-    Key differences from HybridKuroNetRecognizer:
+    Key differences from HybridSuminaNetRecognizer:
     - No SeqDecoderAttention, no pointer mechanism, no action/stop heads
     - Auxiliary classification head is promoted to PRIMARY output
     - Single-phase training, no teacher-forcing schedule
@@ -223,9 +223,9 @@ class KuroNetRecognizer(nn.Module):
         # When enabled, each ROI crop is fed through a frozen pretrained network and
         # the resulting features are added to roi_feats before refinement.
         use_crop_encoder: bool = True,
-        crop_encoder_size: tuple[int, int] = KURONET_CROP_ENCODER_SIZE,
+        crop_encoder_size: tuple[int, int] = SUMINANET_CROP_ENCODER_SIZE,
         freeze_crop_encoder: bool = True,
-        crop_encoder_chunk_size: int = KURONET_CROP_ENCODER_CHUNK_SIZE,
+        crop_encoder_chunk_size: int = SUMINANET_CROP_ENCODER_CHUNK_SIZE,
     ):
         super().__init__()
 
@@ -246,7 +246,7 @@ class KuroNetRecognizer(nn.Module):
         self.use_context = bool(use_context)
         self.context_block_gap_factor = float(context_block_gap_factor)
 
-        # --- ROI pipeline (identical to HybridKuroNetRecognizer) ---
+        # --- ROI pipeline (identical to HybridSuminaNetRecognizer) ---
 
         self.feature_projector = FeatureProjector(
             in_channels=backbone_out_channels,
@@ -620,7 +620,7 @@ class KuroNetRecognizer(nn.Module):
         orientations: List[str],
         vocab,
         score_thresh: float = 0.0,
-        bg_score_gate: float = KURONET_BG_SCORE_GATE,
+        bg_score_gate: float = SUMINANET_BG_SCORE_GATE,
     ) -> List[str]:
         """
         Inference: returns a transcription string per image.

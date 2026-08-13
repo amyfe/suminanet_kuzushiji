@@ -9,14 +9,14 @@
         "tryIt": "Try it →"
     },
     "home": {
-        "heroEyebrow": "墨 SUMI · BUILT ON KURONET 黒",
+        "heroEyebrow": "墨 SUMI · BUILT ON SUMINANET 黒",
         "heroTitle": "Read the hand of Edo.",
         "heroSub": "Sumina reads the cursive kuzushiji in your scans of woodblock prints and manuscripts, lets you correct the draft, and renders centuries of Japanese into English you can actually read.",
         "heroCta": "Try it now →",
         "howTitle": "How it works",
         "how_steps": [
             { "step": 1, "title": "Upload a scan", "body": "Drop in a photograph or scan of any woodblock print or handwritten manuscript — modern or Edo-era." },
-            { "step": 2, "title": "Transcribe & correct", "body": "KuroNet detects each cursive character and proposes a reading. You review and fix anything it misjudged." },
+            { "step": 2, "title": "Transcribe & correct", "body": "SuminaNet detects each cursive character and proposes a reading. You review and fix anything it misjudged." },
             { "step": 3, "title": "Translate", "body": "Get fluent English alongside the original, drawn straight from the corrected transcription." }
         ],
         "examplesEyebrow": "SELECT A TEXT · 用例",
@@ -32,7 +32,7 @@
         ],
         "exampleCta": "Open in workspace →",
         "footerCredit": "墨奈 Sumina — 幸 by Amina Felic",
-        "footerPowered": "Recognition powered by KuroNet (Clanuwat et al.)"
+        "footerPowered": "Recognition powered by SuminaNet, inspired by KuroNet (Clanuwat et al.)"
     },
     "workspace": {
         "title": "Workspace",
@@ -102,8 +102,8 @@
         ],
         "p2": [
             { "text": "Sumina pairs " },
-            { "b": "KuroNet" },
-            { "text": " — the character-recognition model built by Tarin Clanuwat and collaborators — with a human correction step and translation, so a scan becomes a reading, and a reading becomes English. Made for researchers, students, and anyone curious enough to look closely." }
+            { "b": "SuminaNet" },
+            { "text": ", an in-house character-recognition model inspired by KuroNet — the pioneering system built by Tarin Clanuwat and collaborators — with a human correction step and translation, so a scan becomes a reading, and a reading becomes English. Made for researchers, students, and anyone curious enough to look closely." }
         ],
         "etymology": [
             { "text": "The name fuses 墨 " },

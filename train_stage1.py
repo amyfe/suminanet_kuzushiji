@@ -20,7 +20,7 @@ from config import (
     SAM2_HARD_NEG_WEIGHT, SAM2_PREPROCESSING,
     SAM2_PROPOSALS_PREPROCESSING,
 )
-from model.kuronet import DetectorHead, build_backbone
+from model.suminanet import DetectorHead, build_backbone
 from utils import KuzushijiDataset
 from utils.detection_utils import build_detection_targets
 from utils.focal_loss import focal_loss_heatmap

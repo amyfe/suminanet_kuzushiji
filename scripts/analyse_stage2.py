@@ -1,6 +1,6 @@
 """Unified Stage 2 result analysis for the master's thesis.
 
-Loads a trained KuroNet checkpoint, runs detailed validation, and produces:
+Loads a trained SuminaNet checkpoint, runs detailed validation, and produces:
   1. confusion_matrix.png    — top-N character confusion heatmap + top-20 pairs
   2. cer_by_script.png       — CER breakdown: hiragana / katakana / kanji / rare kanji
   3. topk_errors.png         — fraction of wrong predictions where GT was in top-K
@@ -12,11 +12,11 @@ Optionally, with --image:
 
 Usage:
     python scripts/analyse_stage2.py \\
-        --ckpt checkpoints/kuronet_recognizer/kuronet_best.pt \\
+        --ckpt checkpoints/suminanet_recognizer/suminanet_best.pt \\
         [--out-dir results/stage2_analysis] \\
         [--split val] \\
         [--top-n 40] \\
-        [--log logs/train_stage2_kuronet.log] \\
+        [--log logs/train_stage2_suminanet.log] \\
         [--image path/to/page.jpg]
 """
 
@@ -31,8 +31,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 
-import train_stage2_kuronet as train_module
-from config import CHECKPOINT_DIR, DEVICE, KURONET_RARE_CHAR_THRESH
+import train_stage2_suminanet as train_module
+from config import WEBSITE_CHECKPOINT_DIR, DEVICE, SUMINANET_RARE_CHAR_THRESH
 from utils.training_helpers.helper_stage2 import _load_compatible_state_dict
 from visualization.stage2 import (
     draw_confidence_boxes,
@@ -46,23 +46,24 @@ from visualization.stage2 import (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 2 thesis analysis — all plots in one command")
-    p.add_argument("--ckpt", default=str(CHECKPOINT_DIR / "kuronet_recognizer" / "kuronet_best.pt"),
-                   help="KuroNet checkpoint (.pt)")
+    p.add_argument("--ckpt", default=str(WEBSITE_CHECKPOINT_DIR),
+                   help="SuminaNet checkpoint (.pt)")
     p.add_argument("--out-dir", default="results/stage2_analysis",
                    help="Directory to save output PNGs")
     p.add_argument("--split", default="val", choices=["val", "test"],
                    help="Dataset split to evaluate on")
     p.add_argument("--top-n", type=int, default=40,
                    help="Number of top classes for the confusion matrix heatmap")
-    p.add_argument("--log", default="logs/train_stage2_kuronet.log",
-                   help="Training log file for learning curves (skipped if not found)")
+    p.add_argument("--log", default="logs/train_stage2_suminanet.log",
+                   help="Training log file for learning curves (skipped if not found). "
+                        "For pre-rename runs, pass --log logs/train_stage2_suminanet.log explicitly.")
     p.add_argument("--image", default=None,
                    help="Optional: path to a page image for confidence visualization")
     return p.parse_args()
 
 
-def _load_model(ckpt_path: str | Path, vocab) -> "train_module.KuroNetRecognizer":
-    model = train_module.build_kuronet_model(vocab, load_stage1_weights=False)
+def _load_model(ckpt_path: str | Path, vocab) -> "train_module.SuminaNetRecognizer":
+    model = train_module.build_suminanet_model(vocab, load_stage1_weights=False)
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
     state = ckpt.get("model_state_dict", ckpt)
     _load_compatible_state_dict(model, state)
@@ -130,7 +131,7 @@ def main() -> None:
     # Run detailed validation
     # ----------------------------------------------------------------
     print("Running validation (return_detailed=True) ...")
-    metrics = train_module.validate_kuronet(
+    metrics = train_module.validate_suminanet(
         model=model,
         val_loader=val_loader,
         vocab=vocab,
@@ -160,7 +161,7 @@ def main() -> None:
     print("Generating CER by script...")
     p = plot_cer_by_script(
         error_counter, gt_total_counter, vocab,
-        rare_thresh=KURONET_RARE_CHAR_THRESH,
+        rare_thresh=SUMINANET_RARE_CHAR_THRESH,
         out_path=out_dir / "cer_by_script.png",
     )
     written.append(p)

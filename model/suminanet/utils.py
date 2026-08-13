@@ -1,4 +1,4 @@
-"""Small utilities for kuronet models."""
+"""Small utilities for suminanet models."""
 from typing import Callable
 import torch.nn as nn
 

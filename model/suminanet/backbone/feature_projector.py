@@ -12,7 +12,7 @@ Output:
 """
 from torch import nn
 import torch
-from model.kuronet.utils import make_gn
+from model.suminanet.utils import make_gn
 
 class FeatureProjector(nn.Module):
     """Project backbone feature maps into a shared Stage-2 feature space.

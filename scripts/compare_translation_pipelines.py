@@ -27,8 +27,8 @@ load_dotenv(ROOT / ".env")
 
 import torch
 
-from config import KURONET_CONTEXT_BLOCK_GAP_FACTOR, TRANSLATION_UNCERTAIN_SCORE_THRESH
-from model.kuronet.roi.roi_ordering import ROIReadingOrder
+from config import SUMINANET_CONTEXT_BLOCK_GAP_FACTOR, TRANSLATION_UNCERTAIN_SCORE_THRESH
+from model.suminanet.roi.roi_ordering import ROIReadingOrder
 from model.translation.anthropic import ClaudeTranslator
 from model.translation.translation import (
     EdoPeriodTranslationPipeline
@@ -88,7 +88,7 @@ def run_two_call(pipeline: EdoPeriodTranslationPipeline, classical_text: str, ch
 
 def run_combined(translator: ClaudeTranslator, classical_text: str, chars: list[dict]) -> dict:
     annotated = _build_llm_text(
-        classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, KURONET_CONTEXT_BLOCK_GAP_FACTOR,
+        classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, SUMINANET_CONTEXT_BLOCK_GAP_FACTOR,
         mark_furigana=True,
     )
     text_for_llm = _preprocess(annotated, strip_furigana=False)
@@ -108,7 +108,7 @@ def print_dry_run(classical_text: str, chars: list[dict]) -> None:
     translator = object.__new__(ClaudeTranslator)  # skip __init__, no API key needed for prompt building
 
     annotated = _build_llm_text(
-        classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, KURONET_CONTEXT_BLOCK_GAP_FACTOR,
+        classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, SUMINANET_CONTEXT_BLOCK_GAP_FACTOR,
         mark_furigana=True,
     )
     text_for_llm = _preprocess(annotated, strip_furigana=False)

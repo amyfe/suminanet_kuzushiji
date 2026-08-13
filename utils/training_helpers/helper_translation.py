@@ -1,7 +1,7 @@
 """
 Edo-period Kuzushiji translation pipeline.
 
-Pipeline:  Image → KuroNet transcription
+Pipeline:  Image → SuminaNet transcription
            → MeCab+UniDic normalization  (mecab_normalizer.py)
            → Modern Japanese             (anthropic.py  ClaudeTranslator)
            → English                     (anthropic.py  ClaudeTranslator)
@@ -13,8 +13,8 @@ Usage
   # From a pre-transcribed string:
   result = pipeline.translate_text("かくて年月を経て、遂に都へ上りけり")
 
-  # End-to-end from an image (requires KuroNet models loaded):
-  result = pipeline.process_image("page.jpg", kuronet_model=model, vocab=vocab)
+  # End-to-end from an image (requires SuminaNet models loaded):
+  result = pipeline.process_image("page.jpg", suminanet_model=model, vocab=vocab)
 
   # From a result.json produced by infer.py:
   result = pipeline.process_result_json("output/result.json")

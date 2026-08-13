@@ -1,15 +1,15 @@
-"""Optuna-based hyperparameter search for KuroNet Recognizer.
+"""Optuna-based hyperparameter search for SuminaNet Recognizer.
 
 Tunes loss weights, learning-rate, and the detector proposal threshold that
 were previously round-number guesses. Each trial runs N short epochs so the
-search stays tractable despite KuroNet's long full-training time.
+search stays tractable despite SuminaNet's long full-training time.
 
 Objective: maximise  top1 * (1 - CER)  on the validation split.
 
 Usage:
-    python train_stage2_kuronet_optuna.py
-    python train_stage2_kuronet_optuna.py --epochs 8 --n-trials 30
-    python train_stage2_kuronet_optuna.py --warmup-ckpt checkpoints/kuronet_warmup/warmup_best.pt
+    python train_stage2_suminanet_optuna.py
+    python train_stage2_suminanet_optuna.py --epochs 8 --n-trials 30
+    python train_stage2_suminanet_optuna.py --warmup-ckpt checkpoints/suminanet_warmup/warmup_best.pt
 
 EVALUATION DISCIPLINE: The Optuna objective uses the val split.  Val == test in
 this repo.  Do not add new hyperparameter ranges based on what you observe in
@@ -42,15 +42,15 @@ from optuna.visualization.matplotlib import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import train_stage2_kuronet as train_module
+import train_stage2_suminanet as train_module
 from gpu_cleanup import release_cuda_memory
 from config import (
     CHECKPOINT_DIR,
     DEVICE,
     GRAD_CLIP,
-    KURONET_CHECKPOINT_DIR,
-    KURONET_GRAD_ACCUM_STEPS,
-    KURONET_LR_ETA_MIN,
+    SUMINANET_CHECKPOINT_DIR,
+    SUMINANET_GRAD_ACCUM_STEPS,
+    SUMINANET_LR_ETA_MIN,
     NUM_WORKERS,
     USE_MIXED_PRECISION,
 )
@@ -75,17 +75,17 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     bg_strong = bg_base * bg_ratio
 
     # ----------------------------------------------------------------
-    # Patch module-level loss hyperparameters so train_epoch / compute_kuronet_loss
+    # Patch module-level loss hyperparameters so train_epoch / compute_suminanet_loss
     # pick up the trial values via Python's module-global lookup.
     # ----------------------------------------------------------------
-    train_module.KURONET_FOCAL_GAMMA       = focal_gamma
-    train_module.KURONET_LAMBDA_DELTA      = lambda_delta
-    train_module.KURONET_LAMBDA_SCORE      = lambda_score
-    train_module.KURONET_LAMBDA_SCRIPT     = lambda_script
-    train_module.KURONET_BG_WEIGHT         = bg_base
-    train_module.KURONET_STRONG_BG_WEIGHT  = bg_strong
-    train_module.KURONET_HARD_NEG_WEIGHT   = hard_neg_w
-    train_module.KURONET_DET_SCORE_THRESH  = det_score_thresh
+    train_module.SUMINANET_FOCAL_GAMMA       = focal_gamma
+    train_module.SUMINANET_LAMBDA_DELTA      = lambda_delta
+    train_module.SUMINANET_LAMBDA_SCORE      = lambda_score
+    train_module.SUMINANET_LAMBDA_SCRIPT     = lambda_script
+    train_module.SUMINANET_BG_WEIGHT         = bg_base
+    train_module.SUMINANET_STRONG_BG_WEIGHT  = bg_strong
+    train_module.SUMINANET_HARD_NEG_WEIGHT   = hard_neg_w
+    train_module.SUMINANET_DET_SCORE_THRESH  = det_score_thresh
 
     # ----------------------------------------------------------------
     # Build data, model, optimiser
@@ -99,7 +99,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
         train_loader, val_loader = train_module.build_dataloaders(vocab)
         vocab_weights = train_module.build_kanji_vocab_weights(vocab, kanji_weight=1.8).to(DEVICE)
 
-        model = train_module.build_kuronet_model(vocab, warmup_ckpt=args.warmup_ckpt)
+        model = train_module.build_suminanet_model(vocab, warmup_ckpt=args.warmup_ckpt)
         train_module.set_trainable_modules(model)
         trainable_params = train_module.get_trainable_params(model)
 
@@ -107,7 +107,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=args.epochs,
-            eta_min=KURONET_LR_ETA_MIN,
+            eta_min=SUMINANET_LR_ETA_MIN,
         )
         scaler = torch.cuda.amp.GradScaler(enabled=USE_MIXED_PRECISION)
 
@@ -126,14 +126,14 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
                 scaler=scaler,
                 vocab=vocab,
                 epoch=epoch,
-                grad_accum_steps=KURONET_GRAD_ACCUM_STEPS,
+                grad_accum_steps=SUMINANET_GRAD_ACCUM_STEPS,
                 hard_neg_pairs=None,
                 vocab_weights=vocab_weights,
                 sam2_dir=None,
             )
             scheduler.step()
 
-            val_metrics = train_module.validate_kuronet(
+            val_metrics = train_module.validate_suminanet(
                 model=model,
                 val_loader=val_loader,
                 vocab=vocab,
@@ -244,7 +244,7 @@ def generate_optuna_png_plots(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Optuna search for KuroNet loss weights and key thresholds"
+        description="Optuna search for SuminaNet loss weights and key thresholds"
     )
     parser.add_argument("--epochs",          type=int,   default=8,
                         help="Training epochs per trial (keep short; default 8)")
@@ -262,7 +262,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ckpt",     type=str,   default=None,
                         help="Warmup checkpoint for ROI pipeline warm-start (recommended)")
 
-    parser.add_argument("--study-name",  type=str, default="kuronet_optuna")
+    parser.add_argument("--study-name",  type=str, default="suminanet_optuna")
     parser.add_argument("--storage",     type=str, default="")
     parser.add_argument("--output-dir",  type=str, default="")
     parser.add_argument("--sampler",     type=str, default="tpe",
@@ -276,12 +276,12 @@ def main() -> None:
     args = parse_args()
 
     if not args.output_dir:
-        args.output_dir = str(CHECKPOINT_DIR / "optuna_kuronet")
+        args.output_dir = str(CHECKPOINT_DIR / "optuna_suminanet")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.storage:
-        args.storage = f"sqlite:///{(out_dir / 'optuna_kuronet.db').as_posix()}"
+        args.storage = f"sqlite:///{(out_dir / 'optuna_suminanet.db').as_posix()}"
 
     if args.storage.startswith("sqlite:///"):
         Path(args.storage[len("sqlite:///"):]).parent.mkdir(parents=True, exist_ok=True)
@@ -355,7 +355,7 @@ def main() -> None:
         print(f"WARNING: Optuna plot export failed (non-fatal): {exc}")
 
     print("=" * 70)
-    print("KuroNet Optuna search complete")
+    print("SuminaNet Optuna search complete")
     print(f"Best trial: {study.best_trial.number}")
     print(f"Best objective (top1 × (1 - CER)): {study.best_value:.6f}")
     print(f"Best params: {study.best_params}")
@@ -365,16 +365,16 @@ def main() -> None:
     # Print config-ready lines for the best params
     p = study.best_params
     print("\n# Paste these into config.py:")
-    print(f"KURONET_LR                = {p['lr']}")
-    print(f"KURONET_WEIGHT_DECAY      = {p['weight_decay']}")
-    print(f"KURONET_FOCAL_GAMMA       = {p['focal_gamma']}")
-    print(f"KURONET_LAMBDA_DELTA      = {p['lambda_delta']}")
-    print(f"KURONET_LAMBDA_SCORE      = {p['lambda_score']}")
-    print(f"KURONET_LAMBDA_SCRIPT     = {p['lambda_script']}")
-    print(f"KURONET_BG_WEIGHT         = {p['bg_base']}")
-    print(f"KURONET_STRONG_BG_WEIGHT  = {p['bg_base'] * p['bg_ratio']:.6f}  # bg_base={p['bg_base']:.4f} × bg_ratio={p['bg_ratio']:.4f}")
-    print(f"KURONET_HARD_NEG_WEIGHT   = {p['hard_neg_w']}")
-    print(f"KURONET_DET_SCORE_THRESH  = {p['det_score_thresh']}")
+    print(f"SUMINANET_LR                = {p['lr']}")
+    print(f"SUMINANET_WEIGHT_DECAY      = {p['weight_decay']}")
+    print(f"SUMINANET_FOCAL_GAMMA       = {p['focal_gamma']}")
+    print(f"SUMINANET_LAMBDA_DELTA      = {p['lambda_delta']}")
+    print(f"SUMINANET_LAMBDA_SCORE      = {p['lambda_score']}")
+    print(f"SUMINANET_LAMBDA_SCRIPT     = {p['lambda_script']}")
+    print(f"SUMINANET_BG_WEIGHT         = {p['bg_base']}")
+    print(f"SUMINANET_STRONG_BG_WEIGHT  = {p['bg_base'] * p['bg_ratio']:.6f}  # bg_base={p['bg_base']:.4f} × bg_ratio={p['bg_ratio']:.4f}")
+    print(f"SUMINANET_HARD_NEG_WEIGHT   = {p['hard_neg_w']}")
+    print(f"SUMINANET_DET_SCORE_THRESH  = {p['det_score_thresh']}")
 
 
 if __name__ == "__main__":

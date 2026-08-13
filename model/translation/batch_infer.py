@@ -21,13 +21,10 @@ import json
 import traceback
 from pathlib import Path
 
-import torch
+from config import SUMINANET_CER_SCORE_THRESH, WEBSITE_CHECKPOINT_DIR
+from infer import _unletterbox_boxes, load_image, load_suminanet, run_inference
+from train_stage2_suminanet import load_vocab
 
-from config import KURONET_CHECKPOINT_DIR, KURONET_CER_SCORE_THRESH
-from infer import _unletterbox_boxes, load_image, load_kuronet, run_inference
-from train_stage2_kuronet import load_vocab
-
-_DEFAULT_KURONET_CKPT = KURONET_CHECKPOINT_DIR / "kuronet_best.pt"
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
 
@@ -91,8 +88,8 @@ def main() -> None:
                         help="Directory containing page images.")
     parser.add_argument("--out", required=True,
                         help="Output directory (one sub-folder per image).")
-    parser.add_argument("--kuronet_ckpt", default=str(_DEFAULT_KURONET_CKPT),
-                        help="KuroNet checkpoint path.")
+    parser.add_argument("--suminanet_ckpt", default=str(WEBSITE_CHECKPOINT_DIR),
+                        help="SuminaNet checkpoint path.")
     parser.add_argument("--combined", default=None,
                         help="If set, write all transcriptions to this single file.")
     parser.add_argument("--pattern", default="**/*",
@@ -101,7 +98,7 @@ def main() -> None:
                         choices=["auto", "vertical", "horizontal", "other"],
                         help="Reading orientation (default: auto).")
     parser.add_argument("--score_thresh", type=float,
-                        default=KURONET_CER_SCORE_THRESH,
+                        default=SUMINANET_CER_SCORE_THRESH,
                         help="Min ROI quality score to include a char.")
     parser.add_argument("--bg_score_gate", type=float, default=0.0,
                         help="Score gate for BG suppression (0 = disabled).")
@@ -124,7 +121,7 @@ def main() -> None:
     print(f"Found {len(images)} images.")
     print("Loading vocab and model...")
     vocab = load_vocab()
-    model = load_kuronet(args.kuronet_ckpt, vocab)
+    model = load_suminanet(args.suminanet_ckpt, vocab)
     print("Model ready.\n")
 
     combined_lines: list[str] = []

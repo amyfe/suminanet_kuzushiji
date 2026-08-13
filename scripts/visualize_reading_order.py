@@ -1,6 +1,6 @@
 """Visualize ROIReadingOrder's column clustering + reading-order sequencing,
 comparing ground-truth boxes against the actual app inference pipeline
-(detector + KuroNet + ROIReadingOrder, run exactly as /api/transcribe does),
+(detector + SuminaNet + ROIReadingOrder, run exactly as /api/transcribe does),
 on a real page.
 
 Draws two panels side by side:
@@ -46,8 +46,8 @@ sys.path.insert(0, str(ROOT))
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-from config import DATA_DIR, KURONET_BG_SCORE_GATE, KURONET_CER_SCORE_THRESH
-from model.kuronet.roi.roi_ordering import ROIReadingOrder
+from config import DATA_DIR, SUMINANET_BG_SCORE_GATE, SUMINANET_CER_SCORE_THRESH
+from model.suminanet.roi.roi_ordering import ROIReadingOrder
 from utils.training_helpers.helper_translation import _detect_block_breaks, _detect_column_breaks
 
 SAMPLE_ANNOTATION = ROOT / "assets" / "data" / "annotations" / "200022050_00005_2.json"
@@ -192,22 +192,22 @@ def _run_model_panel(
     into the same original-image pixel space the GT boxes are already in.
     """
     from model.translation.infer import (
-        _DEFAULT_KURONET_CKPT,
+        _DEFAULT_SUMINANET_CKPT,
         _unletterbox_boxes,
         load_image,
-        load_kuronet,
+        load_suminanet,
         run_inference,
     )
-    from train_stage2_kuronet import load_vocab
+    from train_stage2_suminanet import load_vocab
 
-    ckpt = Path(args.ckpt) if args.ckpt else _DEFAULT_KURONET_CKPT
-    print(f"Loading vocab + KuroNet checkpoint: {ckpt}")
+    ckpt = Path(args.ckpt) if args.ckpt else _DEFAULT_SUMINANET_CKPT
+    print(f"Loading vocab + SuminaNet checkpoint: {ckpt}")
     vocab = load_vocab()
-    model = load_kuronet(ckpt, vocab)
+    model = load_suminanet(ckpt, vocab)
 
     image_tensor, orig_size, scale, pad = load_image(img_path)
 
-    print("Running app inference pipeline (detector + KuroNet + ROIReadingOrder)...")
+    print("Running app inference pipeline (detector + SuminaNet + ROIReadingOrder)...")
     result = run_inference(
         model,
         image_tensor,
@@ -241,15 +241,15 @@ def main() -> None:
     p.add_argument("--skip-model", action="store_true",
                    help="Skip loading/running the model -- render the GT panel only.")
     p.add_argument("--ckpt", type=str, default=None,
-                   help="KuroNet checkpoint for the MODEL panel (default: same as the app).")
+                   help="SuminaNet checkpoint for the MODEL panel (default: same as the app).")
     p.add_argument("--model-orientation", type=str, default="auto",
                    choices=["auto", "vertical", "horizontal"],
                    help="Orientation passed to run_inference() for the MODEL panel. "
                         "'auto' matches what the app actually sends (the frontend never "
                         "overrides orientation).")
-    p.add_argument("--score-thresh", type=float, default=KURONET_CER_SCORE_THRESH,
+    p.add_argument("--score-thresh", type=float, default=SUMINANET_CER_SCORE_THRESH,
                    help="Min ROI refine score to keep a char (matches app default).")
-    p.add_argument("--bg-score-gate", type=float, default=KURONET_BG_SCORE_GATE)
+    p.add_argument("--bg-score-gate", type=float, default=SUMINANET_BG_SCORE_GATE)
     p.add_argument("--model-gap-factor", type=float, default=1.8,
                    help="run_inference()'s internal column gap-filling threshold (vertical).")
     p.add_argument("--model-col-gap-factor", type=float, default=1.5,

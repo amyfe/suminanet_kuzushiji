@@ -4,9 +4,9 @@ proposals-per-image.
 
 Runs the frozen Stage 1 detector once per image (backbone + DetectorHead),
 caches the raw (heatmap, bbox_reg) tensors, then applies different thresholds
-post-hoc via extract_coarse_proposals — matching KuroNet's exact proposal
+post-hoc via extract_coarse_proposals — matching SuminaNet's exact proposal
 pipeline.  GT matching uses IOU_MATCH (default 0.45 = STAGE2_REFINE_POS_IOU)
-so numbers are directly comparable to KuroNet coverage.
+so numbers are directly comparable to SuminaNet coverage.
 
 Usage:
     python scripts/sweep_det_thresholds.py
@@ -33,8 +33,8 @@ from config import (
     IMAGE_SIZE, DENSITY_FACTOR, DENSITY_GRID, AVG_GT_PER_IMAGE,
     DET_MIN_BOX_SIZE,
 )
-from model.kuronet import DetectorHead, build_backbone
-from model.kuronet.detection.proposal_utils import extract_coarse_proposals
+from model.suminanet import DetectorHead, build_backbone
+from model.suminanet.detection.proposal_utils import extract_coarse_proposals
 from utils import KuzushijiDataset
 from utils.vocab import VocabManager
 
@@ -45,7 +45,7 @@ SCORE_THRESHOLDS = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40,
 
 NMS_IOU_VALUES   = [0.40, 0.50, 0.60, 0.70]   # one curve per NMS IoU value
 
-TOP_K            = 500    # same as DET_TOP_K in config during KuroNet forward
+TOP_K            = 500    # same as DET_TOP_K in config during SuminaNet forward
 
 
 # ── GT matching ─────────────────────────────────────────────────────────────
@@ -241,7 +241,7 @@ def run_sweep(iou_match: float, out_dir: Path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--iou_match", type=float, default=0.45,
-                        help="IoU threshold for GT matching (0.45=KuroNet, 0.50=Stage1 val)")
+                        help="IoU threshold for GT matching (0.45=SuminaNet, 0.50=Stage1 val)")
     parser.add_argument("--out_dir",   type=str,
                         default=str(ROOT / "checkpoints" / "det_sweep"))
     args = parser.parse_args()

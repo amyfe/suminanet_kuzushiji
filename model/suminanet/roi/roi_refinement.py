@@ -61,7 +61,7 @@ Split/Merge wäre der nächste Forschungs-Schritt, nicht der erste.
 
 
 
-# model/kuronet/roi/roi_refinement.py
+# model/suminanet/roi/roi_refinement.py
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import KURONET_DELTA_SCALE_XY, KURONET_DELTA_SCALE_WH
+from config import SUMINANET_DELTA_SCALE_XY, SUMINANET_DELTA_SCALE_WH
 
 
 class ROIRefinementHead(nn.Module):
@@ -286,8 +286,8 @@ class ROIRefinementHead(nn.Module):
             boxes=roi_boxes,
             deltas=box_deltas,
             image_size=image_size,
-            delta_scale_xy=KURONET_DELTA_SCALE_XY,
-            delta_scale_wh=KURONET_DELTA_SCALE_WH,
+            delta_scale_xy=SUMINANET_DELTA_SCALE_XY,
+            delta_scale_wh=SUMINANET_DELTA_SCALE_WH,
         )                                                                   # (B, T, 4)
 
         refine_scores = self.refine_score_head(refined_feats).squeeze(-1)   # (B, T)

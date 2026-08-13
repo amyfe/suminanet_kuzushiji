@@ -1,4 +1,4 @@
-"""Training script for KuroNetRecognizer (per-ROI character classifier).
+"""Training script for SuminaNetRecognizer (per-ROI character classifier).
 
 Single-phase training: detect boxes, refine, sort by reading order,
 classify each ROI as a Kuzushiji character.
@@ -6,10 +6,10 @@ classify each ROI as a Kuzushiji character.
 No teacher forcing, no free decoding, no pointer mechanism.
 
 Usage:
-    python train_kuronet.py
-    python train_kuronet.py --warmup-ckpt checkpoints/kuronet_warmup/warmup_best.pt
-    python train_kuronet.py --resume checkpoints/kuronet_recognizer/kuronet_best.pt
-    python train_kuronet.py --epochs 30 --lr 1e-4
+    python train_suminanet.py
+    python train_suminanet.py --warmup-ckpt checkpoints/suminanet_warmup/warmup_best.pt
+    python train_suminanet.py --resume checkpoints/suminanet_recognizer/suminanet_best.pt
+    python train_suminanet.py --epochs 30 --lr 1e-4
 """
 
 from __future__ import annotations
@@ -48,41 +48,41 @@ from config import (
     GRAD_CLIP,
     GRADIENT_ACCUMULATION_STEPS,
     IMAGE_SIZE,
-    KURONET_CHECKPOINT_DIR,
-    KURONET_CLASSIFIER_HIDDEN,
-    KURONET_CER_SCORE_THRESH,
-    KURONET_LAMBDA_SCRIPT,
-    KURONET_EARLY_STOPPING_PATIENCE,
-    KURONET_ENABLE_TQDM,
-    KURONET_EPOCHS,
-    KURONET_GRAD_ACCUM_STEPS,
-    KURONET_FOCAL_GAMMA,
-    KURONET_RARE_CHAR_THRESH,
-    KURONET_HARD_NEG_WEIGHT,
-    KURONET_HARD_NEG_TOP_K,
-    KURONET_BG_WEIGHT,
-    KURONET_STRONG_BG_WEIGHT,
-    KURONET_LAMBDA_BOX,
-    KURONET_LAMBDA_CHAR,
-    KURONET_LAMBDA_DELTA,
-    KURONET_LAMBDA_SCORE,
-    KURONET_LOG_PREDICTIONS,
-    KURONET_LR,
-    KURONET_LR_ETA_MIN,
-    KURONET_PREDICTION_SAMPLES,
-    KURONET_PROGRESS_POSTFIX_N,
+    SUMINANET_CHECKPOINT_DIR,
+    SUMINANET_CLASSIFIER_HIDDEN,
+    SUMINANET_CER_SCORE_THRESH,
+    SUMINANET_LAMBDA_SCRIPT,
+    SUMINANET_EARLY_STOPPING_PATIENCE,
+    SUMINANET_ENABLE_TQDM,
+    SUMINANET_EPOCHS,
+    SUMINANET_GRAD_ACCUM_STEPS,
+    SUMINANET_FOCAL_GAMMA,
+    SUMINANET_RARE_CHAR_THRESH,
+    SUMINANET_HARD_NEG_WEIGHT,
+    SUMINANET_HARD_NEG_TOP_K,
+    SUMINANET_BG_WEIGHT,
+    SUMINANET_STRONG_BG_WEIGHT,
+    SUMINANET_LAMBDA_BOX,
+    SUMINANET_LAMBDA_CHAR,
+    SUMINANET_LAMBDA_DELTA,
+    SUMINANET_LAMBDA_SCORE,
+    SUMINANET_LOG_PREDICTIONS,
+    SUMINANET_LR,
+    SUMINANET_LR_ETA_MIN,
+    SUMINANET_PREDICTION_SAMPLES,
+    SUMINANET_PROGRESS_POSTFIX_N,
     STAGE2_ROI_SIZE,
-    KURONET_ROI_POOL_OUTPUT_SIZE,
-    KURONET_RESIDUAL_SCALE_INIT,
-    KURONET_USE_CONTEXT,
-    KURONET_CONTEXT_BLOCK_GAP_FACTOR,
-    KURONET_USE_CROP_ENCODER,
-    KURONET_CROP_ENCODER_SIZE,
-    KURONET_CROP_ENCODER_CHUNK_SIZE,
-    KURONET_FREEZE_CROP_ENCODER,
-    KURONET_FREEZE_CROP_ENCODER_AFTER,
-    KURONET_VALIDATION_BATCHES,
-    KURONET_WEIGHT_DECAY,
+    SUMINANET_ROI_POOL_OUTPUT_SIZE,
+    SUMINANET_RESIDUAL_SCALE_INIT,
+    SUMINANET_USE_CONTEXT,
+    SUMINANET_CONTEXT_BLOCK_GAP_FACTOR,
+    SUMINANET_USE_CROP_ENCODER,
+    SUMINANET_CROP_ENCODER_SIZE,
+    SUMINANET_CROP_ENCODER_CHUNK_SIZE,
+    SUMINANET_FREEZE_CROP_ENCODER,
+    SUMINANET_FREEZE_CROP_ENCODER_AFTER,
+    SUMINANET_VALIDATION_BATCHES,
+    SUMINANET_WEIGHT_DECAY,
     NUM_WORKERS,
     STAGE2_CONTEXT_HIDDEN_DIM,
     STAGE2_CONTEXT_NUM_LAYERS,
@@ -90,7 +90,7 @@ from config import (
     DET_MIN_BOX_SIZE,
     DET_NMS_IOU,
     DET_TOP_K,
-    KURONET_DET_SCORE_THRESH,
+    SUMINANET_DET_SCORE_THRESH,
     STAGE2_DROPOUT_RATE,
     STAGE2_PROJ_DIM,
     STAGE2_REFINE_HIDDEN_DIM,
@@ -106,8 +106,8 @@ from config import (
     BACKBONE_TYPE,
 )
 
-from model.kuronet import DetectorHead, build_backbone
-from model.kuronet.kuronet_recognizer import KuroNetRecognizer
+from model.suminanet import DetectorHead, build_backbone
+from model.suminanet.suminanet_recognizer import SuminaNetRecognizer
 
 from utils import KuzushijiDataset
 from utils.char_augmentation import compute_char_frequencies, compute_sample_weights, get_rare_chars
@@ -163,9 +163,9 @@ def build_dataloaders(vocab: VocabManager, world_size: int = 1):
         train_ann_files = sorted(ann_dir.glob("*.json"))
 
     char_freq = compute_char_frequencies(train_ann_files)
-    rare_chars = get_rare_chars(char_freq, threshold=KURONET_RARE_CHAR_THRESH)
+    rare_chars = get_rare_chars(char_freq, threshold=SUMINANET_RARE_CHAR_THRESH)
     print(
-        f"[augmentation] rare chars (freq < {KURONET_RARE_CHAR_THRESH}): "
+        f"[augmentation] rare chars (freq < {SUMINANET_RARE_CHAR_THRESH}): "
         f"{len(rare_chars)} classes  ({len(rare_chars)/max(1,len(char_freq))*100:.1f}% of vocab)"
     )
 
@@ -188,7 +188,7 @@ def build_dataloaders(vocab: VocabManager, world_size: int = 1):
     sample_weights = compute_sample_weights(
         items=train_dataset.items,
         char_counter=char_freq,
-        threshold=KURONET_RARE_CHAR_THRESH,
+        threshold=SUMINANET_RARE_CHAR_THRESH,
         boost_scale=1.5,
     )
     # Under DDP, each rank gets its own independent WeightedRandomSampler
@@ -238,16 +238,16 @@ def build_dataloaders(vocab: VocabManager, world_size: int = 1):
 # Model construction
 # ---------------------------------------------------------------------------
 
-def build_kuronet_model(
+def build_suminanet_model(
     vocab: VocabManager,
     warmup_ckpt: Optional[str | Path] = None,
     load_stage1_weights: bool = True,
-) -> KuroNetRecognizer:
+) -> SuminaNetRecognizer:
     """
-    Build KuroNetRecognizer.
+    Build SuminaNetRecognizer.
 
     Loads backbone + detector weights from Stage 1 checkpoint (unless
-    load_stage1_weights=False, e.g. at inference/eval, where a full KuroNet
+    load_stage1_weights=False, e.g. at inference/eval, where a full SuminaNet
     checkpoint is loaded on top right after and would overwrite them anyway).
     Optionally warm-starts shared ROI pipeline from warmup checkpoint.
     """
@@ -278,11 +278,11 @@ def build_kuronet_model(
         print(f"Loaded Stage 1 weights from {stage1_ckpt} (backbone={backbone_type})")
     else:
         print(f"Skipping Stage 1 checkpoint read (backbone={backbone_type}); "
-              f"weights will be loaded from the KuroNet checkpoint instead.")
+              f"weights will be loaded from the SuminaNet checkpoint instead.")
 
     bg_id = vocab.bg_id if hasattr(vocab, "bg_id") and vocab.BG_TOKEN in vocab.char2id else None
 
-    model = KuroNetRecognizer(
+    model = SuminaNetRecognizer(
         backbone=backbone,
         detector=detector,
         backbone_out_channels=BACKBONE_BASE_FEATURES,
@@ -290,23 +290,23 @@ def build_kuronet_model(
 
         proj_dim=STAGE2_PROJ_DIM,
         roi_size=STAGE2_ROI_SIZE,
-        roi_pool_output_size=KURONET_ROI_POOL_OUTPUT_SIZE,
+        roi_pool_output_size=SUMINANET_ROI_POOL_OUTPUT_SIZE,
         roi_feat_dim=STAGE2_ROI_FEAT_DIM,
         refine_hidden_dim=STAGE2_REFINE_HIDDEN_DIM,
-        residual_scale_init=KURONET_RESIDUAL_SCALE_INIT,
+        residual_scale_init=SUMINANET_RESIDUAL_SCALE_INIT,
         token_dim=STAGE2_TOKEN_DIM,
         token_hidden_dim=STAGE2_TOKEN_HIDDEN_DIM,
         token_use_score_branch=STAGE2_TOKEN_USE_SCORE_BRANCH,
 
-        use_context=KURONET_USE_CONTEXT,
+        use_context=SUMINANET_USE_CONTEXT,
         context_hidden_dim=STAGE2_CONTEXT_HIDDEN_DIM,
         context_num_layers=STAGE2_CONTEXT_NUM_LAYERS,
         context_mode=STAGE2_CONTEXT_MODE,
-        context_block_gap_factor=KURONET_CONTEXT_BLOCK_GAP_FACTOR,
+        context_block_gap_factor=SUMINANET_CONTEXT_BLOCK_GAP_FACTOR,
 
-        classifier_hidden_dim=KURONET_CLASSIFIER_HIDDEN,
+        classifier_hidden_dim=SUMINANET_CLASSIFIER_HIDDEN,
 
-        det_score_thresh=KURONET_DET_SCORE_THRESH,
+        det_score_thresh=SUMINANET_DET_SCORE_THRESH,
         det_top_k=DET_TOP_K,
         det_nms_iou=DET_NMS_IOU,
         det_min_box_size=DET_MIN_BOX_SIZE,
@@ -318,10 +318,10 @@ def build_kuronet_model(
         dropout=STAGE2_DROPOUT_RATE,
         bg_id=bg_id,
 
-        use_crop_encoder=KURONET_USE_CROP_ENCODER,
-        crop_encoder_size=KURONET_CROP_ENCODER_SIZE,
-        freeze_crop_encoder=KURONET_FREEZE_CROP_ENCODER,
-        crop_encoder_chunk_size=KURONET_CROP_ENCODER_CHUNK_SIZE,
+        use_crop_encoder=SUMINANET_USE_CROP_ENCODER,
+        crop_encoder_size=SUMINANET_CROP_ENCODER_SIZE,
+        freeze_crop_encoder=SUMINANET_FREEZE_CROP_ENCODER,
+        crop_encoder_chunk_size=SUMINANET_CROP_ENCODER_CHUNK_SIZE,
     ).to(DEVICE, memory_format=torch.channels_last)
 
     if FREEZE_BACKBONE:
@@ -334,16 +334,16 @@ def build_kuronet_model(
             p.requires_grad = False
         model.detector.eval()
 
-    # Guard: warmup aux_head_context → KuroNet classifier weight transfer.
+    # Guard: warmup aux_head_context → SuminaNet classifier weight transfer.
     # aux_head_context is Linear(STAGE2_CONTEXT_HIDDEN_DIM, STAGE2_REFINE_HIDDEN_DIM).
-    # classifier   is Linear(STAGE2_CONTEXT_HIDDEN_DIM, KURONET_CLASSIFIER_HIDDEN).
+    # classifier   is Linear(STAGE2_CONTEXT_HIDDEN_DIM, SUMINANET_CLASSIFIER_HIDDEN).
     # The first layer transfers only if both hidden dims match.
     # This is only relevant when a warmup checkpoint is provided; a plain resume or
-    # fresh-start training with KURONET_CLASSIFIER_HIDDEN != STAGE2_REFINE_HIDDEN_DIM is fine.
-    if warmup_ckpt is not None and STAGE2_REFINE_HIDDEN_DIM != KURONET_CLASSIFIER_HIDDEN:
+    # fresh-start training with SUMINANET_CLASSIFIER_HIDDEN != STAGE2_REFINE_HIDDEN_DIM is fine.
+    if warmup_ckpt is not None and STAGE2_REFINE_HIDDEN_DIM != SUMINANET_CLASSIFIER_HIDDEN:
         print(
             f"WARNING: STAGE2_REFINE_HIDDEN_DIM ({STAGE2_REFINE_HIDDEN_DIM}) != "
-            f"KURONET_CLASSIFIER_HIDDEN ({KURONET_CLASSIFIER_HIDDEN}) — "
+            f"SUMINANET_CLASSIFIER_HIDDEN ({SUMINANET_CLASSIFIER_HIDDEN}) — "
             f"warmup aux_head_context → classifier weight transfer will be skipped."
         )
 
@@ -358,7 +358,7 @@ def build_kuronet_model(
             _load_compatible_state_dict(model, state)
 
             # Warmup trained aux_head_context (Linear(384,256)→ReLU→Dropout→Linear(256,V))
-            # which maps exactly to KuroNet's classifier when KURONET_CLASSIFIER_HIDDEN=256.
+            # which maps exactly to SuminaNet's classifier when SUMINANET_CLASSIFIER_HIDDEN=256.
             # _load_compatible_state_dict cannot map them because the key names differ,
             # so copy the weights explicitly here.
             _AUX_TO_CLASSIFIER = {
@@ -385,10 +385,10 @@ def build_kuronet_model(
                 print("Classifier fully warm-started from aux_head_context (4/4 tensors).")
             elif n_copied > 0:
                 print(f"Classifier partially warm-started from aux_head_context ({n_copied}/4 tensors).")
-            elif STAGE2_REFINE_HIDDEN_DIM != KURONET_CLASSIFIER_HIDDEN:
+            elif STAGE2_REFINE_HIDDEN_DIM != SUMINANET_CLASSIFIER_HIDDEN:
                 print(
                     f"Classifier warm-start skipped: hidden dim mismatch "
-                    f"({STAGE2_REFINE_HIDDEN_DIM} vs {KURONET_CLASSIFIER_HIDDEN}) — "
+                    f"({STAGE2_REFINE_HIDDEN_DIM} vs {SUMINANET_CLASSIFIER_HIDDEN}) — "
                     f"classifier randomly initialized."
                 )
             else:
@@ -399,7 +399,7 @@ def build_kuronet_model(
     return model
 
 
-def set_trainable_modules(model: KuroNetRecognizer) -> None:
+def set_trainable_modules(model: SuminaNetRecognizer) -> None:
     """Freeze backbone + detector; train all other components."""
     for p in model.parameters():
         p.requires_grad = True
@@ -413,7 +413,7 @@ def set_trainable_modules(model: KuroNetRecognizer) -> None:
             p.requires_grad = False
 
 
-def get_trainable_params(model: KuroNetRecognizer):
+def get_trainable_params(model: SuminaNetRecognizer):
     return [p for p in model.parameters() if p.requires_grad]
 
 
@@ -438,7 +438,7 @@ def build_kanji_vocab_weights(vocab: "VocabManager", kanji_weight: float = 1.8) 
     return weights
 
 
-def compute_kuronet_loss(
+def compute_suminanet_loss(
     outputs: dict,
     refine_targets: dict,
     bg_id: Optional[int] = None,
@@ -447,7 +447,7 @@ def compute_kuronet_loss(
     vocab_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     """
-    Single-phase KuroNet loss.
+    Single-phase SuminaNet loss.
 
     Character classification loss is computed on sorted (reading-order) features,
     so labels/masks are reordered via sort_indices before calling aux_classification_loss.
@@ -501,7 +501,7 @@ def compute_kuronet_loss(
         aux_logits=outputs["char_logits"],
         target_labels=gt_labels_sorted,
         pos_mask=pos_mask_sorted,
-        gamma=KURONET_FOCAL_GAMMA,
+        gamma=SUMINANET_FOCAL_GAMMA,
         ignore_index=-1,
         vocab_weights=vocab_weights,
     )
@@ -522,7 +522,7 @@ def compute_kuronet_loss(
             hn_mask      = torch.isin(batch_keys, hn_keys)
             if hn_mask.any():
                 loss_hn   = F.cross_entropy(logits_valid[hn_mask], gt_valid[hn_mask])
-                loss_char = loss_char + KURONET_HARD_NEG_WEIGHT * loss_hn
+                loss_char = loss_char + SUMINANET_HARD_NEG_WEIGHT * loss_hn
 
     # Background supervision: FP proposals learn to predict <BG>.
     # Only applied to truly isolated negatives (small group / oversized box) — likely
@@ -538,11 +538,11 @@ def compute_kuronet_loss(
             # larger column satisfies both conditions).
             not_furi = ~furi_mask if furi_mask is not None else torch.ones_like(iso_mask)
             iso_neg  = iso_mask & not_furi & neg_mask_sorted
-            loss_bg = KURONET_STRONG_BG_WEIGHT * background_classification_loss(
+            loss_bg = SUMINANET_STRONG_BG_WEIGHT * background_classification_loss(
                 char_logits=outputs["char_logits"], neg_mask=iso_neg, bg_id=bg_id,
             )
         else:
-            loss_bg = KURONET_BG_WEIGHT * background_classification_loss(
+            loss_bg = SUMINANET_BG_WEIGHT * background_classification_loss(
                 char_logits=outputs["char_logits"],
                 neg_mask=neg_mask_sorted,
                 bg_id=bg_id,
@@ -552,7 +552,7 @@ def compute_kuronet_loss(
 
     # --- Script-type auxiliary loss ---
     loss_script = loss_char.new_tensor(0.0)
-    if KURONET_LAMBDA_SCRIPT > 0.0 and vocab is not None and "script_logits" in outputs:
+    if SUMINANET_LAMBDA_SCRIPT > 0.0 and vocab is not None and "script_logits" in outputs:
         script_labels = _build_script_label_tensor(
             gt_labels=gt_labels_sorted,
             pos_mask=pos_mask_sorted,
@@ -567,12 +567,12 @@ def compute_kuronet_loss(
             loss_script = F.cross_entropy(sl_flat[valid], lbl_flat[valid])
 
     total = (
-        KURONET_LAMBDA_CHAR   * loss_char
-        + KURONET_LAMBDA_BOX   * loss_box
-        + KURONET_LAMBDA_DELTA * loss_delta
-        + KURONET_LAMBDA_SCORE * loss_score
+        SUMINANET_LAMBDA_CHAR   * loss_char
+        + SUMINANET_LAMBDA_BOX   * loss_box
+        + SUMINANET_LAMBDA_DELTA * loss_delta
+        + SUMINANET_LAMBDA_SCORE * loss_score
         + loss_bg
-        + KURONET_LAMBDA_SCRIPT * loss_script
+        + SUMINANET_LAMBDA_SCRIPT * loss_script
     )
 
     return total, {
@@ -742,8 +742,8 @@ def _compute_assembled_cer(
 # Validation
 # ---------------------------------------------------------------------------
 
-def validate_kuronet(
-    model: KuroNetRecognizer,
+def validate_suminanet(
+    model: SuminaNetRecognizer,
     val_loader: DataLoader,
     vocab: VocabManager,
     max_batches: Optional[int] = None,
@@ -752,7 +752,7 @@ def validate_kuronet(
     return_detailed: bool = False,
 ) -> dict:
     """
-    Validation loop for KuroNetRecognizer.
+    Validation loop for SuminaNetRecognizer.
 
     Returns:
         top1_acc, top5_acc, coverage, assembled_cer, avg_iou,
@@ -847,7 +847,7 @@ def validate_kuronet(
                     use_hungarian=STAGE2_USE_HUNGARIAN,
                 )
 
-                loss, parts = compute_kuronet_loss(outputs, refine_targets, bg_id=bg_id, vocab=vocab,
+                loss, parts = compute_suminanet_loss(outputs, refine_targets, bg_id=bg_id, vocab=vocab,
                                                   vocab_weights=vocab_weights)
             total_loss += float(loss.item())
             for k in loss_parts:
@@ -868,7 +868,7 @@ def validate_kuronet(
             top1_sum += _top_k_accuracy(outputs["char_logits"], gt_labels_s, pos_mask_s, k=1)
             top5_sum += _top_k_accuracy(outputs["char_logits"], gt_labels_s, pos_mask_s, k=5)
             cer_sum  += _compute_assembled_cer(outputs, gt_labels_s, pos_mask_s, vocab,
-                                              score_thresh=KURONET_CER_SCORE_THRESH)
+                                              score_thresh=SUMINANET_CER_SCORE_THRESH)
 
             bsz = images.size(0)
 
@@ -883,11 +883,11 @@ def validate_kuronet(
                     _gt_text = _ids_to_text(gt_labels_s[b][_valid_b].tolist(), vocab)
                     if not _gt_text:
                         continue
-                    if KURONET_CER_SCORE_THRESH > 0.0 and _rs is not None and _si is not None:
+                    if SUMINANET_CER_SCORE_THRESH > 0.0 and _rs is not None and _si is not None:
                         _sorted_pos = _om[b].nonzero(as_tuple=True)[0]
                         _orig_pos   = _si[b][_sorted_pos]
                         _scores     = torch.sigmoid(_rs[b][_orig_pos])
-                        _sorted_pos = _sorted_pos[_scores >= KURONET_CER_SCORE_THRESH]
+                        _sorted_pos = _sorted_pos[_scores >= SUMINANET_CER_SCORE_THRESH]
                     else:
                         _sorted_pos = _om[b].nonzero(as_tuple=True)[0]
                     _pred_text = _ids_to_text(_cl[b, _sorted_pos].argmax(dim=-1).tolist(), vocab)
@@ -941,8 +941,8 @@ def validate_kuronet(
                 iou_02_sum += covered
 
             # --- CER score-threshold audit ---
-            # Count how many ordered proposals survive vs are filtered by KURONET_CER_SCORE_THRESH
-            if KURONET_CER_SCORE_THRESH > 0.0:
+            # Count how many ordered proposals survive vs are filtered by SUMINANET_CER_SCORE_THRESH
+            if SUMINANET_CER_SCORE_THRESH > 0.0:
                 rs = outputs.get("refine_scores")
                 si = outputs.get("sort_indices")
                 om = outputs["ordered_mask"]
@@ -953,7 +953,7 @@ def validate_kuronet(
                     if rs is not None and si is not None:
                         orig = si[b][sorted_pos]
                         scores = torch.sigmoid(rs[b][orig])
-                        kept = int((scores >= KURONET_CER_SCORE_THRESH).sum().item())
+                        kept = int((scores >= SUMINANET_CER_SCORE_THRESH).sum().item())
                     else:
                         kept = sorted_pos.numel()
                     cer_thresh_kept     += kept
@@ -1022,7 +1022,7 @@ def validate_kuronet(
                             script_correct[sname] += 1
 
             # Log prediction examples
-            if len(examples) < KURONET_PREDICTION_SAMPLES and KURONET_LOG_PREDICTIONS:
+            if len(examples) < SUMINANET_PREDICTION_SAMPLES and SUMINANET_LOG_PREDICTIONS:
                 valid_pred = outputs["ordered_mask"][0]
                 pred_ids_ex = outputs["char_logits"][0, valid_pred].argmax(dim=-1).tolist()
                 pred_text = _ids_to_text(pred_ids_ex, vocab)
@@ -1103,11 +1103,11 @@ def validate_kuronet(
     # Coverage gap breakdown
     print(
         f"Coverage gap | Stage-1-equiv recall (IoU>0.2): {stage1_equiv_recall:.4f}"
-        f"  KuroNet coverage (IoU>0.45): {det_recall:.4f}"
+        f"  SuminaNet coverage (IoU>0.45): {det_recall:.4f}"
         f"  → IoU-threshold gap: {iou_gap_pp:.2f} pp"
     )
     print(
-        f"CER thresh={KURONET_CER_SCORE_THRESH:.2f} audit |"
+        f"CER thresh={SUMINANET_CER_SCORE_THRESH:.2f} audit |"
         f" kept={cer_thresh_kept}  filtered={cer_thresh_filtered}"
         f"  filter_rate={cer_thresh_filter_rate:.3f}"
         f"  (ROIs removed from CER string assembly)"
@@ -1194,12 +1194,12 @@ def validate_kuronet(
             return True
         return False
 
-    # Scan up to 3× top-K candidates so filtering still yields KURONET_HARD_NEG_TOP_K pairs
+    # Scan up to 3× top-K candidates so filtering still yields SUMINANET_HARD_NEG_TOP_K pairs
     top_k_pairs = [
         (int(gt), int(pr))
-        for (gt, pr), _ in error_counter.most_common(KURONET_HARD_NEG_TOP_K * 3)
+        for (gt, pr), _ in error_counter.most_common(SUMINANET_HARD_NEG_TOP_K * 3)
         if not _exclude_hard_neg(int(gt), int(pr))
-    ][:KURONET_HARD_NEG_TOP_K]
+    ][:SUMINANET_HARD_NEG_TOP_K]
     metrics["hard_neg_pairs"] = top_k_pairs
 
     return metrics
@@ -1289,7 +1289,7 @@ def _sync() -> float:
 
 
 def train_epoch(
-    model: KuroNetRecognizer,
+    model: SuminaNetRecognizer,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scaler: torch.cuda.amp.GradScaler,
@@ -1324,7 +1324,7 @@ def train_epoch(
     bar = tqdm(
         train_loader,
         desc=f"Epoch {epoch}",
-        disable=disable_tqdm or not KURONET_ENABLE_TQDM,
+        disable=disable_tqdm or not SUMINANET_ENABLE_TQDM,
         dynamic_ncols=True,
     )
 
@@ -1390,7 +1390,7 @@ def train_epoch(
                         loss = loss + p.sum() * 0.0
                 parts = {k: loss.detach() for k in loss_parts}
             else:
-                loss, parts = compute_kuronet_loss(
+                loss, parts = compute_suminanet_loss(
                     outputs, refine_targets, bg_id=bg_id, hn_keys=hn_keys, vocab=vocab,
                     vocab_weights=vocab_weights,
                 )
@@ -1453,7 +1453,7 @@ def train_epoch(
                 f"metrics={t_metrics/n*1000:.0f}  (all ms)"
             )
 
-        if (batch_idx + 1) % KURONET_PROGRESS_POSTFIX_N == 0:
+        if (batch_idx + 1) % SUMINANET_PROGRESS_POSTFIX_N == 0:
             bar.set_postfix({
                 "loss": f"{total_loss / n_batches:.4f}",
                 "char": f"{loss_parts['loss_char'] / n_batches:.4f}",
@@ -1476,15 +1476,15 @@ def train_epoch(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train KuroNet per-ROI classifier")
+    parser = argparse.ArgumentParser(description="Train SuminaNet per-ROI classifier")
     parser.add_argument("--warmup-ckpt", type=str, default=None,
                         help="Path to warmup checkpoint for ROI pipeline warm-start")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to KuroNet checkpoint to resume from")
-    parser.add_argument("--epochs", type=int, default=KURONET_EPOCHS)
-    parser.add_argument("--lr", type=float, default=KURONET_LR)
-    parser.add_argument("--weight-decay", type=float, default=KURONET_WEIGHT_DECAY)
-    parser.add_argument("--grad-accum", type=int, default=KURONET_GRAD_ACCUM_STEPS)
+                        help="Path to SuminaNet checkpoint to resume from")
+    parser.add_argument("--epochs", type=int, default=SUMINANET_EPOCHS)
+    parser.add_argument("--lr", type=float, default=SUMINANET_LR)
+    parser.add_argument("--weight-decay", type=float, default=SUMINANET_WEIGHT_DECAY)
+    parser.add_argument("--grad-accum", type=int, default=SUMINANET_GRAD_ACCUM_STEPS)
     parser.add_argument(
         "--sam2_proposals",
         type=str,
@@ -1543,7 +1543,7 @@ def main():
     # it silently undoes that reassignment and every rank ends up writing to the same
     # log file / console again (world_size copies of every line).
     if rank == 0:
-        _log_fh = open(log_dir / "train_stage2_kuronet.log", "a")
+        _log_fh = open(log_dir / "train_stage2_suminanet.log", "a")
         sys.stdout = _Tee(sys.__stdout__, _log_fh)
         sys.stderr = _Tee(sys.__stderr__, _log_fh)
 
@@ -1551,7 +1551,7 @@ def main():
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(log_dir / 'train_stage2_kuronet.log'),
+                logging.FileHandler(log_dir / 'train_stage2_suminanet.log'),
                 logging.StreamHandler()
             ]
         )
@@ -1565,10 +1565,10 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     logger.info("=" * 70)
-    logger.info("KURONET RECOGNIZER TRAINING (per-ROI classifier)")
+    logger.info("SUMINANET RECOGNIZER TRAINING (per-ROI classifier)")
     logger.info("=" * 70)
 
-    KURONET_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    SUMINANET_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
     vocab = load_vocab()
     train_loader, val_loader = build_dataloaders(vocab, world_size=world_size)
@@ -1588,7 +1588,7 @@ def main():
             print(f"SAM2 proposals: {sam2_dir}  ({n_files} files)")
 
     # Build model
-    model = build_kuronet_model(
+    model = build_suminanet_model(
         vocab=vocab,
         warmup_ckpt=args.warmup_ckpt,
     )
@@ -1648,14 +1648,14 @@ def main():
         optimizer,
         T_0=20,
         T_mult=1,
-        eta_min=KURONET_LR_ETA_MIN,
+        eta_min=SUMINANET_LR_ETA_MIN,
         last_epoch=start_epoch - 2,
     )
     # fp16 mixed precision (Turing GPUs have no bf16 tensor core path); GradScaler
     # guards against fp16 underflow during backward.
     scaler = torch.cuda.amp.GradScaler(enabled=USE_MIXED_PRECISION)
 
-    hard_neg_path = KURONET_CHECKPOINT_DIR / "hard_neg_pairs.json"
+    hard_neg_path = SUMINANET_CHECKPOINT_DIR / "hard_neg_pairs.json"
 
     for epoch in range(start_epoch, args.epochs + 1):
         # Load confusion pairs saved by the previous epoch's validation
@@ -1700,11 +1700,11 @@ def main():
         # collective at all, so other ranks need no coordination here.
         if rank == 0:
             raw_model = model.module if is_distributed else model
-            val_metrics = validate_kuronet(
+            val_metrics = validate_suminanet(
                 model=raw_model,
                 val_loader=val_loader,
                 vocab=vocab,
-                max_batches=KURONET_VALIDATION_BATCHES,
+                max_batches=SUMINANET_VALIDATION_BATCHES,
                 vocab_weights=vocab_weights,
                 sam2_dir=sam2_dir,
             )
@@ -1723,13 +1723,13 @@ def main():
                 print(f"  Mined pairs: {decoded}")
 
         # Two-phase crop encoder freeze: unfreeze for domain adaptation, then freeze to save compute.
-        # Triggered once when epoch crosses KURONET_FREEZE_CROP_ENCODER_AFTER.
+        # Triggered once when epoch crosses SUMINANET_FREEZE_CROP_ENCODER_AFTER.
         # Depends only on the plain epoch counter (identical on every rank),
         # so this runs unconditionally on all ranks -- no broadcast needed.
         raw_model = model.module if is_distributed else model
         if (
-            KURONET_FREEZE_CROP_ENCODER_AFTER > 0
-            and epoch == KURONET_FREEZE_CROP_ENCODER_AFTER
+            SUMINANET_FREEZE_CROP_ENCODER_AFTER > 0
+            and epoch == SUMINANET_FREEZE_CROP_ENCODER_AFTER
             and raw_model.roi_crop_encoder is not None
             and not raw_model.roi_crop_encoder.freeze_encoder
         ):
@@ -1779,20 +1779,20 @@ def main():
             }
 
             # Save epoch checkpoint (atomic write: .tmp → final path, safe on crash)
-            epoch_path = KURONET_CHECKPOINT_DIR / f"kuronet_epoch{epoch}.pt"
+            epoch_path = SUMINANET_CHECKPOINT_DIR / f"suminanet_epoch{epoch}.pt"
             _atomic_save(ckpt_state, epoch_path)
 
             if is_best:
-                best_path = KURONET_CHECKPOINT_DIR / "kuronet_best.pt"
+                best_path = SUMINANET_CHECKPOINT_DIR / "suminanet_best.pt"
                 _atomic_save(ckpt_state, best_path)
-                print(f"✅ saved best: kuronet_best.pt (score={score:.4f})")
+                print(f"✅ saved best: suminanet_best.pt (score={score:.4f})")
 
             # Keep last 2 epoch checkpoints + best
-            prune_to_keep_last_n(KURONET_CHECKPOINT_DIR, keep=2)
+            prune_to_keep_last_n(SUMINANET_CHECKPOINT_DIR, keep=2)
 
             should_stop = (
-                KURONET_EARLY_STOPPING_PATIENCE > 0
-                and patience_ctr >= KURONET_EARLY_STOPPING_PATIENCE
+                SUMINANET_EARLY_STOPPING_PATIENCE > 0
+                and patience_ctr >= SUMINANET_EARLY_STOPPING_PATIENCE
             )
             if should_stop:
                 print(
@@ -1814,7 +1814,7 @@ def main():
 
     print("=" * 70)
     print(f"TRAINING COMPLETE")
-    print(f"Best checkpoint: {KURONET_CHECKPOINT_DIR / 'kuronet_best.pt'}")
+    print(f"Best checkpoint: {SUMINANET_CHECKPOINT_DIR / 'suminanet_best.pt'}")
     print("=" * 70)
 
     if is_distributed:

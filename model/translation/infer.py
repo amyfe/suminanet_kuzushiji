@@ -9,7 +9,7 @@ Outputs
 Usage
 -----
   python infer.py --image path/to/page.jpg
-  python infer.py --image page.jpg --kuronet_ckpt checkpoints/kuronet_recognizer/kuronet_best.pt --out out/
+  python infer.py --image page.jpg --suminanet_ckpt checkpoints/suminanet_recognizer/suminanet_best.pt --out out/
   python infer.py --image page.jpg --orientation horizontal --score_thresh 0.0
 """
 
@@ -31,14 +31,14 @@ from config import (
     CHECKPOINT_DIR,
     DEVICE,
     IMAGE_SIZE,
-    KURONET_BG_SCORE_GATE,
-    KURONET_CHECKPOINT_DIR,
-    KURONET_CER_SCORE_THRESH,
-    KURONET_NUM_ALTERNATES,
+    SUMINANET_BG_SCORE_GATE,
+    SUMINANET_CER_SCORE_THRESH,
+    SUMINANET_NUM_ALTERNATES,
+    WEBSITE_CHECKPOINT_DIR
 )
-from model.kuronet.kuronet_recognizer import KuroNetRecognizer
-from model.kuronet.roi.roi_ordering import infer_reading_orientation_from_boxes
-from train_stage2_kuronet import build_kuronet_model, load_vocab
+from model.suminanet.suminanet_recognizer import SuminaNetRecognizer
+from model.suminanet.roi.roi_ordering import infer_reading_orientation_from_boxes
+from train_stage2_suminanet import build_suminanet_model, load_vocab
 from utils.detection_utils import _extract_all_peaks
 from utils.training_helpers.helper_stage2 import _normalize_orientation_label
 from utils.text_normalization import unicode_token_to_char
@@ -47,8 +47,6 @@ _TRANSFORM = T.Compose([
     T.ToTensor(),
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
-
-_DEFAULT_KURONET_CKPT = KURONET_CHECKPOINT_DIR / "kuronet_best.pt"
 
 
 # ---------------------------------------------------------------------------
@@ -90,9 +88,9 @@ def _align_compile_keys(model_state: dict, ckpt_state: dict) -> dict:
     return out
 
 
-def load_kuronet(kuronet_ckpt: str | Path, vocab) -> torch.nn.Module:
-    model = build_kuronet_model(vocab, load_stage1_weights=False)
-    ckpt = torch.load(kuronet_ckpt, map_location=DEVICE)
+def load_suminanet(suminanet_ckpt: str | Path, vocab) -> torch.nn.Module:
+    model = build_suminanet_model(vocab, load_stage1_weights=False)
+    ckpt = torch.load(suminanet_ckpt, map_location=DEVICE)
     state = ckpt.get("model_state_dict", ckpt)
     state = _align_compile_keys(model.state_dict(), state)
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -317,7 +315,7 @@ def _augment_with_column_gaps(
 # ---------------------------------------------------------------------------
 
 def _infer_orientation_from_s1(
-    model: KuroNetRecognizer,
+    model: SuminaNetRecognizer,
     image_tensor: torch.Tensor,
 ) -> tuple[str, list, list]:
     """
@@ -354,18 +352,18 @@ def _infer_orientation_from_s1(
 # ---------------------------------------------------------------------------
 
 def run_inference(
-    model: KuroNetRecognizer,
+    model: SuminaNetRecognizer,
     image_tensor: torch.Tensor,
     vocab,
     orientation: str = "auto",
-    score_thresh: float = KURONET_CER_SCORE_THRESH,
-    bg_score_gate: float = KURONET_BG_SCORE_GATE,
+    score_thresh: float = SUMINANET_CER_SCORE_THRESH,
+    bg_score_gate: float = SUMINANET_BG_SCORE_GATE,
     fill_gaps: bool = True,
     gap_factor: float = 1.8,
     col_gap_factor: float = 1.5,
 ) -> dict:
     """
-    Run the full KuroNet forward pass on one image.
+    Run the full SuminaNet forward pass on one image.
 
     Returns
     -------
@@ -505,18 +503,18 @@ def run_inference(
         x1, y1, x2, y2 = boxes_sorted[i].tolist()
 
         # Candidate list for this ROI: the chosen pick plus up to
-        # KURONET_NUM_ALTERNATES runner-up classes, so the frontend can show
+        # SUMINANET_NUM_ALTERNATES runner-up classes, so the frontend can show
         # "other candidates" for low-confidence chars without ever losing the
         # model's own top pick from the list (it's always alternates[0]).
         probs = logits_b[i].softmax(dim=-1)
-        topk_probs, topk_ids = probs.topk(KURONET_NUM_ALTERNATES + 2)
+        topk_probs, topk_ids = probs.topk(SUMINANET_NUM_ALTERNATES + 2)
         alternates: list[dict] = [{
             "char":   ch,
             "prob":   round(float(probs[p_id]), 3),
             "chosen": True,
         }]
         for alt_prob, alt_id in zip(topk_probs.tolist(), topk_ids.tolist()):
-            if len(alternates) >= KURONET_NUM_ALTERNATES + 1:
+            if len(alternates) >= SUMINANET_NUM_ALTERNATES + 1:
                 break
             if alt_id == p_id or (model.bg_id is not None and alt_id == model.bg_id):
                 continue
@@ -557,17 +555,17 @@ def main() -> None:
     )
     parser.add_argument("--image", required=True,
                         help="Path to input image (JPG/PNG).")
-    parser.add_argument("--kuronet_ckpt", default=str(_DEFAULT_KURONET_CKPT),
-                        help=f"KuroNet checkpoint (default: {_DEFAULT_KURONET_CKPT}).")
+    parser.add_argument("--suminanet_ckpt", default=str(WEBSITE_CHECKPOINT_DIR),
+                        help=f"SuminaNet checkpoint (default: {WEBSITE_CHECKPOINT_DIR}).")
     parser.add_argument("--out", default="output",
                         help="Output directory (default: output/).")
     parser.add_argument("--orientation", default="auto",
                         choices=["auto", "vertical", "horizontal", "other"],
                         help="Reading orientation. 'auto' infers from detected boxes (default).")
     parser.add_argument("--score_thresh", type=float,
-                        default=KURONET_CER_SCORE_THRESH,
+                        default=SUMINANET_CER_SCORE_THRESH,
                         help="Min ROI refine score to include a char (0 = keep all).")
-    parser.add_argument("--bg_score_gate", type=float, default=KURONET_BG_SCORE_GATE,
+    parser.add_argument("--bg_score_gate", type=float, default=SUMINANET_BG_SCORE_GATE,
                         help="Quality gate for BG relabeling: proposals above this score "
                              "predicted as BG are relabeled to the best non-BG class "
                              "(0 = disabled).")
@@ -585,8 +583,8 @@ def main() -> None:
     print("Loading vocab...")
     vocab = load_vocab()
 
-    print(f"Loading KuroNet: {args.kuronet_ckpt}")
-    model = load_kuronet(args.kuronet_ckpt, vocab)
+    print(f"Loading SuminaNet: {args.suminanet_ckpt}")
+    model = load_suminanet(args.suminanet_ckpt, vocab)
     print("Model ready.")
 
     print(f"Loading image: {args.image}")
@@ -619,7 +617,7 @@ def main() -> None:
         "chars":               result["chars"],
         "image_size_original": list(orig_size),
         "image_size_model":    model_size,
-        "kuronet_ckpt":        str(args.kuronet_ckpt),
+        "suminanet_ckpt":        str(args.suminanet_ckpt),
         "score_thresh":        args.score_thresh,
     }
     json_path = out_dir / "result.json"

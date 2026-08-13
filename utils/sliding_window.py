@@ -99,7 +99,7 @@ def sliding_window_detect(
         all_boxes:  (N, 4) xyxy merged boxes in full-image coordinates
         all_scores: (N,)   detection scores
     """
-    from model.kuronet.detection.proposal_utils import extract_coarse_proposals
+    from model.suminanet.detection.proposal_utils import extract_coarse_proposals
 
     _, H, W = image.shape
     tiles = _make_tiles(image, tile_size=tile_size, overlap=overlap)

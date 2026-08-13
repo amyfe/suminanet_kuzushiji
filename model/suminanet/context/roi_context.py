@@ -1,4 +1,4 @@
-# model/kuronet/context/roi_context.py
+# model/suminanet/context/roi_context.py
 
 from __future__ import annotations
 

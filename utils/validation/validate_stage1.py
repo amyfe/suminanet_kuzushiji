@@ -28,7 +28,7 @@ from config import (DATA_DIR, DEVICE, IMAGE_SIZE, CHECKPOINT_DIR,
                     DET_SCORE_THRESH, DET_TOP_K, DET_NMS_IOU, DET_MIN_BOX_SIZE,
                     DENSITY_GRID, DENSITY_FACTOR, AVG_GT_PER_IMAGE,
                     BACKBONE_BASE_FEATURES, BACKBONE_TYPE, STAGE1_FOCAL_POS_THRESHOLD)
-from model.kuronet import DetectorHead, build_backbone
+from model.suminanet import DetectorHead, build_backbone
 from utils import KuzushijiDataset
 from utils.detection_utils import spatial_density_filter, _extract_all_peaks, fill_detection_gaps
 from utils.vocab import VocabManager

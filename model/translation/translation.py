@@ -1,7 +1,7 @@
 """
 Edo-period Kuzushiji translation pipeline.
 
-Pipeline:  Image → KuroNet transcription
+Pipeline:  Image → SuminaNet transcription
            → MeCab+UniDic normalization  (mecab_normalizer.py)
            → Modern Japanese             (anthropic.py  ClaudeTranslator)
            → English                     (anthropic.py  ClaudeTranslator)
@@ -11,8 +11,8 @@ Usage
   # From a pre-transcribed string:
   result = pipeline.translate_text("かくて年月を経て、遂に都へ上りけり")
 
-  # End-to-end from an image (requires KuroNet models loaded):
-  result = pipeline.process_image("page.jpg", kuronet_model=model, vocab=vocab)
+  # End-to-end from an image (requires SuminaNet models loaded):
+  result = pipeline.process_image("page.jpg", suminanet_model=model, vocab=vocab)
 
   # From a result.json produced by infer.py:
   result = pipeline.process_result_json("output/result.json")
@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from config import (
-    KURONET_CONTEXT_BLOCK_GAP_FACTOR,
+    SUMINANET_CONTEXT_BLOCK_GAP_FACTOR,
     TRANSLATION_MAX_INPUT_CHARS,
     TRANSLATION_UNCERTAIN_SCORE_THRESH,
 )
@@ -77,7 +77,7 @@ class EdoPeriodTranslationPipeline:
     def transcribe_image(
         self,
         image_path: str | Path,
-        kuronet_model,
+        suminanet_model,
         vocab,
         score_thresh: float = 0.0,
         bg_score_gate: float = 0.5,
@@ -86,7 +86,7 @@ class EdoPeriodTranslationPipeline:
 
         image_tensor, _, _, _ = load_image(image_path)
         result = run_inference(
-            kuronet_model,
+            suminanet_model,
             image_tensor,
             vocab,
             score_thresh=score_thresh,
@@ -143,7 +143,7 @@ class EdoPeriodTranslationPipeline:
 
         if chars:
             annotated = _build_llm_text(
-                classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, KURONET_CONTEXT_BLOCK_GAP_FACTOR,
+                classical_text, chars, TRANSLATION_UNCERTAIN_SCORE_THRESH, SUMINANET_CONTEXT_BLOCK_GAP_FACTOR,
                 mark_furigana=strip_furigana,
             )
             # this _preprocess call now only does stray-char/whitespace cleanup.
@@ -199,7 +199,7 @@ class EdoPeriodTranslationPipeline:
     def process_image(
         self,
         image_path: str | Path,
-        kuronet_model,
+        suminanet_model,
         vocab,
         strip_furigana: bool = True,
         normalize_historical: bool = True,
@@ -208,7 +208,7 @@ class EdoPeriodTranslationPipeline:
     ) -> Dict:
         classical = self.transcribe_image(
             image_path,
-            kuronet_model,
+            suminanet_model,
             vocab,
             score_thresh=score_thresh,
             bg_score_gate=bg_score_gate,

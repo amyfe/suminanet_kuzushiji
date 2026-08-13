@@ -42,7 +42,7 @@ detector_idx
 
 """
 
-# model/kuronet/detection/proposal_utils.py
+# model/suminanet/detection/proposal_utils.py
 
 from __future__ import annotations
 

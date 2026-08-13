@@ -38,7 +38,7 @@ roi_mask:         (B, T)
 roi_boxes_padded: (B, T, 4)
 roi_scores:       (B, T)
 """
-# model/kuronet/roi/roi_pool.py
+# model/suminanet/roi/roi_pool.py
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ import torch
 import torch.nn as nn
 from torchvision.ops import roi_align as tv_roi_align
 
-from model.kuronet.utils import make_gn
+from model.suminanet.utils import make_gn
 
 
 class ROIPoolEncoder(nn.Module):

@@ -40,7 +40,7 @@ from pydantic import BaseModel
 from config import (
     DEVICE,
     IMAGE_SIZE,
-    KURONET_CER_SCORE_THRESH,
+    SUMINANET_CER_SCORE_THRESH,
     MAX_UPLOAD_SIZE_BYTES,
     TRANSCRIBE_INFERENCE_TIMEOUT_SEC,
     TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
@@ -49,8 +49,8 @@ from config import (
     TRANSLATE_RATE_LIMIT_WINDOW_SECONDS,
     WEBSITE_CHECKPOINT_DIR
 )
-from model.translation.infer import _TRANSFORM, load_kuronet, run_inference, _unletterbox_boxes
-from train_stage2_kuronet import load_vocab
+from model.translation.infer import _TRANSFORM, load_suminanet, run_inference, _unletterbox_boxes
+from train_stage2_suminanet import load_vocab
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +107,8 @@ async def lifespan(app: FastAPI):
     print("Loading vocab...", flush=True)
     try:
         vocab = load_vocab()
-        print(f"Loading KuroNet from {WEBSITE_CHECKPOINT_DIR}...", flush=True)
-        model = load_kuronet(WEBSITE_CHECKPOINT_DIR, vocab)
+        print(f"Loading SuminaNet from {WEBSITE_CHECKPOINT_DIR}...", flush=True)
+        model = load_suminanet(WEBSITE_CHECKPOINT_DIR, vocab)
         _state["vocab"] = vocab
         _state["model"] = model
         _state["ready"] = True
@@ -207,7 +207,7 @@ async def transcribe(
     http_request: Request,
     image: UploadFile = File(...),
     orientation: str = Form(default="auto"),
-    score_thresh: float = Form(default=KURONET_CER_SCORE_THRESH),
+    score_thresh: float = Form(default=SUMINANET_CER_SCORE_THRESH),
 ):
     if not _state["ready"]:
         raise HTTPException(503, detail=_state["error"] or "Model not loaded yet.")

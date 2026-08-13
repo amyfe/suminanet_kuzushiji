@@ -47,7 +47,7 @@ Den musst du später empirisch prüfen.
 Das passt zu deiner aktuellen Padding-Logik. Wenn du später irgendwo Löcher in der Sequenz hast, musst du das robuster machen.
 """
 
-# model/kuronet/roi/roi_ordering.py
+# model/suminanet/roi/roi_ordering.py
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ from typing import List, Optional
 
 import torch
 
-from config import KURONET_READING_ORDER_CONFIDENCE, STAGE2_READING_ORDER_LINE_THRESH_RATIO
+from config import SUMINANET_READING_ORDER_CONFIDENCE, STAGE2_READING_ORDER_LINE_THRESH_RATIO
 
 
 def infer_reading_orientation_from_boxes(boxes, debug: bool = False) -> str:
@@ -222,7 +222,7 @@ class ROIReadingOrder:
         """
         if scores is None:
             return torch.ones(n, dtype=torch.bool, device=device)
-        anchor = torch.sigmoid(scores.detach()) >= KURONET_READING_ORDER_CONFIDENCE
+        anchor = torch.sigmoid(scores.detach()) >= SUMINANET_READING_ORDER_CONFIDENCE
         if int(anchor.sum().item()) < 3:
             return torch.ones(n, dtype=torch.bool, device=device)
         return anchor
