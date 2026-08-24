@@ -85,8 +85,15 @@ class HistoricalJapaneseNormalizer:
     def _try_load_mecab(self) -> None:
         try:
             import fugashi
+        except Exception:
+            return  # heuristic fallback
 
-            # 0. Bundled Edo dict — always try first
+        # Each tier gets its own try/except so a failure in a higher-priority
+        # dict (e.g. a read-only filesystem blocking the Edo zip extraction)
+        # degrades to the next tier instead of aborting straight to heuristic.
+
+        # 0. Bundled Edo dict — always try first
+        try:
             _project_root = Path(__file__).resolve().parent.parent.parent
             _zip = _project_root / "assets" / "translation_dict" / "unidic-kinsei-edo-v202512.zip"
             _edo = _zip.with_suffix("")  # …/unidic-kinsei-edo-v202512/
@@ -98,24 +105,30 @@ class HistoricalJapaneseNormalizer:
                 self._tagger = fugashi.Tagger(f'-d "{_edo}"')
                 self._method = "mecab+unidic-kinsei-edo"
                 return
+        except Exception:
+            pass
 
-            # 1. UNIDIC_EDO_DIR env var — custom/override Edo dict path
+        # 1. UNIDIC_EDO_DIR env var — custom/override Edo dict path
+        try:
             edo_dir = os.environ.get("UNIDIC_EDO_DIR", "")
             if edo_dir:
                 self._tagger = fugashi.Tagger(f'-d "{edo_dir}"')
                 self._method = "mecab+unidic-kinsei-edo"
                 return
+        except Exception:
+            pass
 
-            # 2. Full modern UniDic (pip install unidic && python -m unidic download)
-            try:
-                import unidic
-                self._tagger = fugashi.Tagger(f'-d "{unidic.DICDIR}"')
-                self._method = "mecab+unidic"
-                return
-            except Exception:
-                pass
+        # 2. Full modern UniDic (pip install unidic && python -m unidic download)
+        try:
+            import unidic
+            self._tagger = fugashi.Tagger(f'-d "{unidic.DICDIR}"')
+            self._method = "mecab+unidic"
+            return
+        except Exception:
+            pass
 
-            # 3. unidic-lite (pip install unidic-lite, self-contained)
+        # 3. unidic-lite (pip install unidic-lite, self-contained)
+        try:
             import unidic_lite
             self._tagger = fugashi.Tagger(f'-d "{unidic_lite.DICDIR}"')
             self._method = "mecab+unidic-lite"
