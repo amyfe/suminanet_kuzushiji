@@ -83,13 +83,20 @@ pulled by `git clone` there.
    URL if `bootstrap.sh`'s hardcoded one starts failing.
 
 2. **Copy the production checkpoint** — only the one file, not the whole
-   (gitignored, multi-GB) `checkpoints/` tree:
+   (gitignored, multi-GB) `checkpoints/` tree. `checkpoints/` is entirely
+   gitignored, so `git clone` never creates the destination directory —
+   create it first, or `scp` fails with "No such file or directory":
    ```bash
+   ssh user@your-vps mkdir -p /opt/sumina/repo/checkpoints/suminanet_recognizer
    scp checkpoints/suminanet_recognizer/suminanet_best.pt \
        user@your-vps:/opt/sumina/repo/checkpoints/suminanet_recognizer/suminanet_best.pt
    ```
    (Adjust the path to match whatever `config.py`'s `WEBSITE_CHECKPOINT_DIR`
-   actually resolves to at deploy time — see the Phase A note above.)
+   actually resolves to at deploy time — see the Phase A note above.) Run
+   this from your own machine, in the project root — `checkpoints/.../
+   suminanet_best.pt` here is the LOCAL source path, the part after the `:`
+   is the path on the VPS. The file this creates on the VPS is a completely
+   independent copy — your local file is untouched.
 
 3. **Copy the built frontend**:
    ```bash

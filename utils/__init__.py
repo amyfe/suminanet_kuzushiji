@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 import torchvision.transforms as T
 
 from config import AVG_GT_PER_IMAGE, IMAGE_SIZE, SUMINANET_COPY_PASTE_PROB, SAM2_MASKS_DIR, SAM2_PREPROCESSING
-from model.suminanet.roi.roi_ordering import infer_reading_orientation_from_boxes, ROIReadingOrder
+from model.suminanet.roi.roi_ordering import infer_reading_orientation_from_boxes
 from utils.letterbox import letterbox_pil, letterbox_boxes_forward
 
 
@@ -79,9 +79,6 @@ class KuzushijiDataset(Dataset):
         # Copy-paste crop database — built after self.items is populated below.
         # Set to None here; assigned in _build_copy_paste_db() called at the end of __init__.
         self.copy_paste_db: Optional[Dict[str, List[np.ndarray]]] = None
-
-        # Cached once per dataset instance — do not instantiate fresh on every __getitem__ call.
-        self.roi_order = ROIReadingOrder()
 
         # ---------------------------
         # Sammle alle Annotationen
@@ -228,15 +225,17 @@ class KuzushijiDataset(Dataset):
             boxes = letterbox_boxes_forward(boxes, scale, pad)
 
         # ---------------------------
-        # OCR CRITICAL: Sort boxes in reading order
+        # OCR CRITICAL: boxes/labels stay in raw annotation-array order.
+        # Annotators already record characters in reading order; re-deriving
+        # order geometrically via ROIReadingOrder.sort_single() was found to
+        # *corrupt* that already-correct order on ~44% of annotation files
+        # (column-clustering collapse, sparse-page orientation
+        # misclassification, and cursive-stroke bounding-box overlap all
+        # contribute — see THESIS_SUPERVISOR_NOTES.tex and
+        # scripts/onetime_scripts/evaluate_excluded_pages_transcription.py's
+        # gt_text_for_page(), which uses the same raw-order pattern). Do not
+        # reintroduce a geometric re-sort here.
         # ---------------------------
-        if len(boxes) > 0:
-            boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
-            mask = torch.ones((boxes_tensor.size(0),), dtype=torch.bool)
-            _, _, sort_idx, _col_ids = self.roi_order.sort_single(boxes_tensor, mask, orientation)
-            sorted_indices = sort_idx.detach().cpu().tolist()
-            boxes = [boxes[i] for i in sorted_indices]
-            labels = [labels[i] for i in sorted_indices]
 
         # Option C: copy-paste rare character crops (40% of training steps).
         # Applied on the resized PIL image before the tensor transform so that
