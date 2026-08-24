@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { columnsOf, columnsFromChars } from '../utils/text'
 import { Animation } from '../components/LoadingIndicator'
 import i18next from 'i18next'
@@ -45,6 +45,10 @@ export default function TranscriptionPanel({
   }
   const [dragOverIdx, setDragOverIdx] = useState(null)
   const [showIntermediate, setShowIntermediate] = useState(false)
+
+  useEffect(() => {
+    if (!includeNotes) setShowIntermediate(false)
+  }, [includeNotes])
 
   // Prefer true column boundaries from the detected char boxes (matches the
   // manuscript's actual layout). Only valid while chars still matches the
@@ -192,7 +196,7 @@ export default function TranscriptionPanel({
             <p className="result-caption result-caption--warn">⚠ {normText}</p>
           )}
 
-          {(normalizedJapanese || modernJapanese || conversionNotes || translationNotes || (normText && !normDegraded)) && (
+          {includeNotes && (normalizedJapanese || modernJapanese || conversionNotes || translationNotes || (normText && !normDegraded)) && (
             <>
               <label className="intermediate-toggle">
                 <input

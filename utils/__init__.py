@@ -11,6 +11,7 @@ import torchvision.transforms as T
 
 from config import AVG_GT_PER_IMAGE, IMAGE_SIZE, SUMINANET_COPY_PASTE_PROB, SAM2_MASKS_DIR, SAM2_PREPROCESSING
 from model.suminanet.roi.roi_ordering import infer_reading_orientation_from_boxes, ROIReadingOrder
+from utils.letterbox import letterbox_pil, letterbox_boxes_forward
 
 
 class KuzushijiDataset(Dataset):
@@ -43,6 +44,9 @@ class KuzushijiDataset(Dataset):
         self.root_dir = Path(root_dir)
         self.annotations_dir = self.root_dir / "annotations"
         self.resize_to = resize if resize is not None else IMAGE_SIZE
+        assert self.resize_to[0] == self.resize_to[1], (
+            f"letterbox resize requires a square target size, got {self.resize_to}"
+        )
         self.use_sequences = use_sequences
         self.vocab = vocab
         self.split = split
@@ -164,10 +168,8 @@ class KuzushijiDataset(Dataset):
 
             orig_w, orig_h = img_pil.size
             if (orig_w, orig_h) != (new_w, new_h):
-                img_pil = img_pil.resize((new_w, new_h), Image.Resampling.BILINEAR)
-                sx = new_w / orig_w
-                sy = new_h / orig_h
-                boxes_sc = [[x1 * sx, y1 * sy, x2 * sx, y2 * sy] for (x1, y1, x2, y2) in boxes]
+                img_pil, scale, pad = letterbox_pil(img_pil, new_w)
+                boxes_sc = letterbox_boxes_forward(boxes, scale, pad)
             else:
                 boxes_sc = list(boxes)
 
@@ -222,10 +224,8 @@ class KuzushijiDataset(Dataset):
         new_w, new_h = self.resize_to
 
         if (orig_w, orig_h) != (new_w, new_h):
-            image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
-            sx = new_w / orig_w
-            sy = new_h / orig_h
-            boxes = [[x1*sx, y1*sy, x2*sx, y2*sy] for (x1,y1,x2,y2) in boxes]
+            image, scale, pad = letterbox_pil(image, new_w)
+            boxes = letterbox_boxes_forward(boxes, scale, pad)
 
         # ---------------------------
         # OCR CRITICAL: Sort boxes in reading order
@@ -291,7 +291,7 @@ class KuzushijiDataset(Dataset):
         sample = {
             "image": image,
             "boxes": boxes,
-            "labels": torch.tensor(label_ids, dtype=torch.long) if label_ids else None,
+            "labels": torch.tensor(label_ids, dtype=torch.long) if label_ids is not None else None,
             "raw_labels": labels,
             "orientation": orientation,
             "image_stem": img_path.stem,

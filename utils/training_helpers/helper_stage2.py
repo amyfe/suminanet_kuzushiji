@@ -29,8 +29,73 @@ __all__ = [
 ]
 
 
-def _load_compatible_state_dict(module: torch.nn.Module, state_dict: dict) -> None:
-    """Load only tensors whose names and shapes match the current module."""
+def _load_compatible_state_dict(
+    module: torch.nn.Module,
+    state_dict: dict,
+    *,
+    ckpt_context_mode: Optional[str] = None,
+    ckpt_vocab_hash: Optional[str] = None,
+    current_vocab_hash: Optional[str] = None,
+    ckpt_backbone_type: Optional[str] = None,
+) -> None:
+    """Load only tensors whose names and shapes match the current module.
+
+    ckpt_context_mode, if given, is checked against module.context_encoder.mode
+    and raises on mismatch. At STAGE2_CONTEXT_NUM_LAYERS=2, switching gru<->bigru
+    changes the shape of exactly one RNN key (context_encoder.rnn.weight_ih_l1)
+    while the rest coincidentally keep matching shapes, so the shape-based skip
+    logic below would otherwise silently reinitialize that one layer instead of
+    raising -- a partially-corrupted recurrent layer that trains/evals with no
+    error.
+
+    ckpt_vocab_hash/current_vocab_hash, if both given, are compared and raise on
+    mismatch for the same reason: the vocab is rebuilt fresh from the annotation
+    corpus on every run, so a classifier head trained against an older vocab could
+    otherwise be silently reinitialized (different vocab_size) or, worse, silently
+    kept with now-wrong char-to-ID semantics (same vocab_size, different mapping).
+
+    ckpt_backbone_type, if given, is checked against module.backbone_type and
+    raises on mismatch. 'unet' and 'efficientnet_b2' backbones share no key
+    names or shapes at all, so every backbone.* tensor would land in
+    skipped_keys and the backbone would silently stay randomly initialized
+    instead of loading the checkpoint's trained weights -- the model still
+    runs and produces output, just garbage, with no error anywhere.
+    """
+    current_mode = getattr(getattr(module, "context_encoder", None), "mode", None)
+    if ckpt_context_mode is not None and current_mode is not None and ckpt_context_mode != current_mode:
+        raise ValueError(
+            f"Context-mode mismatch: checkpoint was trained with context_mode="
+            f"'{ckpt_context_mode}' but the current model is configured with "
+            f"STAGE2_CONTEXT_MODE='{current_mode}'. Loading anyway would silently "
+            f"corrupt one RNN layer (gru/bigru coincidentally share most tensor "
+            f"shapes). Set STAGE2_CONTEXT_MODE='{ckpt_context_mode}' to match this "
+            f"checkpoint, or use a checkpoint trained with '{current_mode}'."
+        )
+
+    current_backbone_type = getattr(module, "backbone_type", None)
+    if ckpt_backbone_type is not None and current_backbone_type is not None and ckpt_backbone_type != current_backbone_type:
+        raise ValueError(
+            f"Backbone-type mismatch: checkpoint was trained with backbone_type="
+            f"'{ckpt_backbone_type}' but the current model was built with "
+            f"backbone_type='{current_backbone_type}'. Loading anyway would silently "
+            f"skip every backbone.* tensor (unet/efficientnet_b2 share no key names "
+            f"or shapes), leaving the backbone randomly initialized instead of "
+            f"raising. Build the model with backbone_type_override="
+            f"'{ckpt_backbone_type}' (or config.BACKBONE_TYPE='{ckpt_backbone_type}') "
+            f"to match this checkpoint."
+        )
+
+    if ckpt_vocab_hash is not None and current_vocab_hash is not None and ckpt_vocab_hash != current_vocab_hash:
+        raise ValueError(
+            f"Vocab mismatch: checkpoint was trained with vocab_hash='{ckpt_vocab_hash}' "
+            f"but the current vocab (rebuilt from assets/data/annotations/) hashes to "
+            f"'{current_vocab_hash}'. Loading anyway risks silently corrupting the "
+            f"classifier head if vocab_size coincidentally matches (shape-based skip "
+            f"logic would treat it as compatible), or leaving it randomly reinitialized "
+            f"if not. Use the vocab this checkpoint was trained with, or retrain/fine-tune "
+            f"from scratch against the current vocab."
+        )
+
     current_state = module.state_dict()
     compatible_state = {}
     skipped_keys: list[str] = []

@@ -14,7 +14,6 @@ Usage:
     python scripts/analyse_stage2.py \\
         --ckpt checkpoints/suminanet_recognizer/suminanet_best.pt \\
         [--out-dir results/stage2_analysis] \\
-        [--split val] \\
         [--top-n 40] \\
         [--log logs/train_stage2_suminanet.log] \\
         [--image path/to/page.jpg]
@@ -50,8 +49,6 @@ def parse_args() -> argparse.Namespace:
                    help="SuminaNet checkpoint (.pt)")
     p.add_argument("--out-dir", default="results/stage2_analysis",
                    help="Directory to save output PNGs")
-    p.add_argument("--split", default="val", choices=["val", "test"],
-                   help="Dataset split to evaluate on")
     p.add_argument("--top-n", type=int, default=40,
                    help="Number of top classes for the confusion matrix heatmap")
     p.add_argument("--log", default="logs/train_stage2_suminanet.log",
@@ -66,7 +63,12 @@ def _load_model(ckpt_path: str | Path, vocab) -> "train_module.SuminaNetRecogniz
     model = train_module.build_suminanet_model(vocab, load_stage1_weights=False)
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
     state = ckpt.get("model_state_dict", ckpt)
-    _load_compatible_state_dict(model, state)
+    _load_compatible_state_dict(
+        model, state,
+        ckpt_context_mode=ckpt.get("context_mode"),
+        ckpt_vocab_hash=ckpt.get("vocab_hash"),
+        current_vocab_hash=vocab.content_hash(),
+    )
     epoch = ckpt.get("epoch", "?")
     print(f"Loaded checkpoint {ckpt_path}  (epoch={epoch})")
     model.eval()

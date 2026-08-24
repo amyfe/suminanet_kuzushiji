@@ -172,6 +172,8 @@ class ROIReadingOrder:
         gaps: torch.Tensor,
         fallback: float,
         min_jump_ratio: float = 2.5,
+        weak_jump_ratio: float = 1.6,
+        weak_jump_scale_frac: float = 0.4,
     ) -> float:
         """
         Separate within-column/row jitter gaps from real column/row-boundary
@@ -195,17 +197,85 @@ class ROIReadingOrder:
         gaps to detect a reliable elbow, or when no jump stands out clearly
         (e.g. a single column with uniform jitter — nothing should be
         treated as a boundary).
+
+        No-elbow-found does NOT always mean "single column, everything's
+        jitter", though: on tightly-refined boxes (e.g. SuminaNet's ROI
+        refinement snapping same-column boxes to near-identical x-centers),
+        every within-column gap can fall below `noise_floor` and get
+        filtered out, leaving `positive` containing *only* real,
+        evenly-spaced inter-column gaps -- flat in ratio terms (no elbow)
+        but sitting at character-width scale rather than jitter scale.
+        Falling back to `fallback` (~1.5x character width) in that case can
+        exceed this page's actual (tighter) column pitch and wrongly merge
+        every column into one, so the *scale* of the surviving gaps, not
+        just their ratio pattern, decides which case applies.
+
+        Page skew can also depress the elbow ratio below `min_jump_ratio`
+        without moving *where* the elbow is: on assets/data/annotations/
+        brsk004_014.json (a visibly rotated scan), the elbow-argmax already
+        landed exactly on the true column boundary (ratio ~2.04 at the
+        35.5->72.5 gap transition, correctly recovering the page's 12
+        columns when checked manually) but the strict `min_jump_ratio=2.5`
+        gate rejected it, falling through to `fallback` -- which exceeded
+        even the largest real gap on that page, collapsing all 389 boxes
+        into a single column. Uniform per-page rotation widens each
+        column's own x-center spread (skew smears same-column boxes further
+        apart as y increases), inflating the jitter tail enough to blur the
+        ratio against the real-boundary floor, even though the boundary's
+        *location* is still exactly right. The `weak_jump_ratio` /
+        `weak_jump_scale_frac` tier below corroborates a below-threshold
+        ratio with an absolute, character-width-anchored sanity check
+        instead of loosening `min_jump_ratio` globally (which would also
+        relax acceptance for every page whose largest *coincidental* noise
+        ratio happens to land in that band, including genuine single-column
+        pages) -- it only fires when the candidate boundary gap is itself
+        already a substantial fraction of a real character width, which
+        ordinary within-column jitter should not be.
+
+        `weak_jump_ratio=1.6` (not e.g. 1.8) because the anchor-scored,
+        real-inference path is noisier than the clean GT case above: on
+        brsk004_014's own *predicted* boxes (this same page, run through
+        the actual detector+SuminaNet pipeline, not hand-labeled GT), model
+        localization noise stacks on top of the page skew and depresses the
+        true elbow ratio further, to ~1.65 -- still the correct split
+        location (would recover ~12-13 columns), just even harder to trust
+        by ratio alone. Calibrated via a 300-file random sample sweep over
+        assets/data/annotations/ comparing candidate settings against the
+        already-shipped 1.8/0.4 tier: 1.6 is the loosest value that also
+        fixes the model-inference case, and going looser (down to 1.4)
+        recovers no further pages in that sample -- i.e. 1.6 sits on the
+        conservative edge of what's needed, not a wide-open threshold.
         """
-        positive = gaps[gaps > 1e-6]
+        noise_floor = max(1e-6, 0.05 * fallback)
+        positive = gaps[gaps > noise_floor]
         if positive.numel() < 3:
             return fallback
         sorted_gaps, _ = positive.sort()
         ratios = sorted_gaps[1:] / sorted_gaps[:-1].clamp_min(1e-6)
         elbow_idx = int(ratios.argmax().item())
-        if float(ratios[elbow_idx].item()) < min_jump_ratio:
-            return fallback
-        # Geometric mean of the two gap values straddling the elbow.
-        return float((sorted_gaps[elbow_idx] * sorted_gaps[elbow_idx + 1]).sqrt().item())
+        elbow_ratio = float(ratios[elbow_idx].item())
+        boundary_gap = float(sorted_gaps[elbow_idx + 1].item())
+        if float(sorted_gaps[0].item()) >= 0.5 * fallback:
+            # All surviving gaps already sit at character-width scale, not
+            # jitter scale -- there's no jitter tail left to separate from
+            # real gaps (it was fully absorbed by noise_floor), so the
+            # ratio-elbow question below doesn't apply: treat every
+            # surviving gap as a real boundary, whatever its ratio to its
+            # neighbors. Must run before the elbow checks -- e.g. a page
+            # with column gaps [131, 242, 246, 247, 251] (all real; no
+            # jitter at all) has its largest ratio jump at 131->242
+            # (~1.85, clears weak_jump_ratio), which would wrongly discard
+            # the genuine 131-gap boundary if checked first.
+            return float(sorted_gaps[0].item()) - 1e-3
+
+        strong_elbow = elbow_ratio >= min_jump_ratio
+        corroborated_weak_elbow = (
+            elbow_ratio >= weak_jump_ratio and boundary_gap >= weak_jump_scale_frac * fallback
+        )
+        if strong_elbow or corroborated_weak_elbow:
+            # Geometric mean of the two gap values straddling the elbow.
+            return float((sorted_gaps[elbow_idx] * sorted_gaps[elbow_idx + 1]).sqrt().item())
+        return fallback
 
     @staticmethod
     def _confidence_anchor_mask(
@@ -460,6 +530,7 @@ class ROIReadingOrder:
         self,
         boxes: torch.Tensor,    # (N, 4)  valid sorted boxes
         orientation: str,
+        scores: Optional[torch.Tensor] = None,
         min_col_size: int = 3,
         size_ratio: float = 3.0,
         furi_ratio: float = 2.5,
@@ -472,6 +543,13 @@ class ROIReadingOrder:
         furigana: sub-columns whose median area is furi_ratio× smaller than an adjacent
                   close group.  These are likely real kana gloss characters — no BG
                   supervision so the classifier can learn them as real characters.
+
+        scores, if given, gate which boxes contribute to each group's "typical size"
+        statistic (see _confidence_anchor_mask) -- otherwise a handful of low-
+        confidence boxes sharing a group with one genuinely large real character
+        (e.g. gap-filled candidates near a large decorative title character) can drag
+        the group's typical size down, spuriously flagging the real character as
+        oversized/isolated and dropping it from the transcription.
         """
         n = boxes.size(0)
         if n == 0:
@@ -510,15 +588,41 @@ class ROIReadingOrder:
 
         # Vectorized group stats — groups are contiguous in the sorted-by-center order.
         group_counts = torch.bincount(group_ids_sorted, minlength=num_groups)   # (G,)
-        group_ends   = group_counts.cumsum(0)                                    # (G,)
-        group_starts = group_ends - group_counts                                 # (G,)
 
-        # Median area per group: take the area at the median sorted position.
-        # (Groups are ordered by primary axis, not by area, so this is a positional
-        # median — close enough to the true median for a 3× outlier threshold.)
-        med_pos      = (group_starts + group_counts // 2).clamp(0, n - 1)       # (G,)
-        areas_sorted = areas[sorted_idx]                                          # (n,)
-        group_med_areas = areas_sorted[med_pos]                                   # (G,)
+        # Typical area per group, from confidence-anchored boxes only where
+        # available (falls back to all boxes in the group when none are anchors)
+        # -- see this method's docstring for why unfiltered low-confidence boxes
+        # would corrupt this statistic. Mean rather than true median so it stays
+        # a simple vectorized scatter_add over an arbitrary anchor subset.
+        areas_sorted  = areas[sorted_idx]                                         # (n,)
+        # Deliberately NOT _confidence_anchor_mask: that helper falls back to
+        # "trust every box" when fewer than 3 clear the confidence bar, which
+        # is right for gap-based group *detection* (need several points to see
+        # a pattern) but wrong here -- a single confident box is still a useful
+        # "what does a real character look like" reference, and reverting to
+        # "trust everyone" is exactly the dilution this fix exists to avoid.
+        # A group with zero confident boxes still falls back via `has_anchor`
+        # below, just per-group instead of globally.
+        if scores is None:
+            anchor = torch.ones(n, dtype=torch.bool, device=boxes.device)
+        else:
+            anchor = torch.sigmoid(scores.detach()) >= SUMINANET_READING_ORDER_CONFIDENCE
+        anchor_sorted = anchor[sorted_idx]                                        # (n,)
+
+        anchor_area_sum = areas_sorted.new_zeros(num_groups)
+        anchor_area_sum.scatter_add_(0, group_ids_sorted, areas_sorted * anchor_sorted.to(areas_sorted.dtype))
+        anchor_count = torch.zeros(num_groups, dtype=torch.long, device=boxes.device)
+        anchor_count.scatter_add_(0, group_ids_sorted, anchor_sorted.long())
+
+        all_area_sum = areas_sorted.new_zeros(num_groups)
+        all_area_sum.scatter_add_(0, group_ids_sorted, areas_sorted)
+
+        has_anchor = anchor_count > 0
+        group_med_areas = torch.where(
+            has_anchor,
+            anchor_area_sum / anchor_count.clamp_min(1).to(areas_sorted.dtype),
+            all_area_sum / group_counts.clamp_min(1).to(areas_sorted.dtype),
+        )                                                                         # (G,)
 
         # Group centers: mean of sorted_c values within each group
         coord_sum = sorted_c.new_zeros(num_groups)
@@ -698,7 +802,12 @@ class ROIReadingOrder:
                 ordering_primary_mono[b] = mono
                 ordering_primary_viol[b] = viol
 
-                iso, furi = self._compute_isolation_mask(sorted_boxes[b, :valid_t], orientations[b])
+                iso_scores_b = (
+                    refine_scores_b[result[-2]][:valid_t] if refine_scores_b is not None else None
+                )
+                iso, furi = self._compute_isolation_mask(
+                    sorted_boxes[b, :valid_t], orientations[b], scores=iso_scores_b,
+                )
                 isolation_masks[b, :valid_t] = iso
                 furigana_masks[b, :valid_t]  = furi
 

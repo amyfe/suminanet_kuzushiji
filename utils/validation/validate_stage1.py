@@ -15,6 +15,7 @@ New:
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
+import sys
 import cv2
 import numpy as np
 from tqdm import tqdm
@@ -23,6 +24,12 @@ import os
 from datetime import datetime
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+
+# Allow running as `python utils/validation/validate_stage1.py` (not just
+# `python -m utils.validation.validate_stage1`) — Python only puts this
+# script's own directory on sys.path, not the repo root, so the `config`
+# import below fails without this.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from config import (DATA_DIR, DEVICE, IMAGE_SIZE, CHECKPOINT_DIR,
                     DET_SCORE_THRESH, DET_TOP_K, DET_NMS_IOU, DET_MIN_BOX_SIZE,

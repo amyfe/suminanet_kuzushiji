@@ -7,6 +7,7 @@ import deTranslation from './locales/de/translation.json';
 
 const storedLng = localStorage.getItem('i18nextLng');
 const initialLng = ['de', 'en'].includes(storedLng) ? storedLng : 'en';
+document.documentElement.lang = initialLng;
 
 i18next.init({
   lng: initialLng,

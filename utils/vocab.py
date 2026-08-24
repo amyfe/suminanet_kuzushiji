@@ -114,3 +114,11 @@ class VocabManager:
         with open(path, 'r', encoding='utf-8') as f:
             char2id = json.load(f)
         return cls(char2id)
+
+    def content_hash(self) -> str:
+        """Deterministic hash of the full char2id mapping (not just its size) --
+        catches vocab drift where two vocabs happen to have the same vocab_size
+        but different character-to-ID assignments, which a size-only check would miss."""
+        import hashlib
+        payload = repr(sorted(self.char2id.items())).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()[:16]

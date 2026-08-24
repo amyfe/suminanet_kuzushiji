@@ -22,7 +22,7 @@ live in an in-process dict/deque, so this design assumes a **single backend proc
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | Model load status (`ready`, `device`, `error`) — use as the deploy health check |
+| `GET` | `/api/health` | Model load status (`ready`, `device`, `error`, `last_gpu_oom_fallback_at`) — use as the deploy health check |
 | `POST` | `/api/transcribe` | Upload an image → character boxes + transcription |
 | `POST` | `/api/translate` | Classical Japanese text → normalized modern Japanese → English/German via Claude |
 
@@ -37,15 +37,20 @@ health check.
 
 ## Model loading
 
-At startup (`lifespan` in [app.py](app.py)) the server loads **one checkpoint**:
+At startup (`lifespan` in [app.py](app.py)) the server loads **one checkpoint**, at
+the path `WEBSITE_CHECKPOINT_DIR` resolves to in [`config.py`](../../config.py):
 
 ```
-checkpoints/suminanet_recognizer/suminanet_best.pt
+checkpoints/E_final_countdown/suminanet_recognizer/suminanet_best.pt
 ```
 
-This single file is self-contained — it includes both the Stage 1 detector
-(EfficientNet-B2 + FPN) and the Stage 2 recognizer (SuminaNet) weights, so it's the
-only checkpoint the production server needs to load into memory. See the
+This is a manually curated pointer — `WEBSITE_CHECKPOINT_DIR` in `config.py` is the
+single source of truth for which checkpoint is "production"; nothing keeps it in
+sync automatically as new training runs complete (see `_warn_if_stale_checkpoint()`
+in `app.py`, which only warns, it doesn't switch). This single file is self-contained
+— it includes both the Stage 1 detector (EfficientNet-B2 + FPN) and the Stage 2
+recognizer (SuminaNet) weights, so it's the only checkpoint the production server
+needs to load into memory. See the
 [top-level checkpoint inventory](../../checkpoints/README.md) for exact sizes and
 what else exists in `checkpoints/` (training-only artifacts that do **not** need to
 ship to production).
@@ -53,6 +58,27 @@ ship to production).
 If the model fails to load, `/api/health` reports the error and `/api/transcribe`
 returns `503` — the process stays up so orchestration can retry/restart it or route
 around it, rather than crashing at boot.
+
+### Shared-GPU robustness
+
+If `config.py`'s `DEVICE` is `"cuda"`, the server keeps **two** copies of the model
+loaded: a GPU-resident one (the one actually used per request) and a CPU-resident
+one, held purely as a fallback. This matters when the GPU isn't dedicated to this
+process — e.g. running on a shared research node where other jobs can saturate the
+card at any time:
+
+- **At startup**, loading the GPU copy is retried up to `GPU_LOAD_MAX_RETRIES` times
+  (`config.py`, default 3, `GPU_LOAD_RETRY_DELAY_SEC` apart) on a CUDA OOM. If it
+  never succeeds, the server starts in CPU-only mode rather than failing to boot —
+  the CPU copy always loads first and unconditionally, since building it never
+  touches CUDA.
+- **Per request**, a CUDA OOM during inference (not any other error) is retried once
+  on the CPU copy transparently — slower for that one request, but the caller gets a
+  real result instead of an unexplainable 500.
+- `/api/health`'s `device` field reports the actual steady-state mode (`"gpu"` or
+  `"cpu-only"`), and `last_gpu_oom_fallback_at` is the timestamp of the most recent
+  per-request fallback, so contention from other processes on the node is visible
+  rather than silent.
 
 ## Configuration
 
@@ -85,8 +111,9 @@ the model into memory and enforce rate limits per-process instead of globally.
 
 ## Hardware requirements
 
-- CPU-only works (falls back automatically) but is slow for transcription; a CUDA
-  GPU is recommended for the detector/recognizer forward pass.
+- CPU-only works (either because no CUDA device is present, or as the automatic
+  per-request/startup fallback described above) but is slow for transcription; a
+  CUDA GPU is recommended for the detector/recognizer forward pass.
 - No GPU is required for the translation step (that's an API call to Claude).
 - See [`../../INSTALL.md`](../../INSTALL.md) for full system dependencies (MeCab,
   UniDic download, SAM2 weights — SAM2 is training-only, **not** loaded at inference).

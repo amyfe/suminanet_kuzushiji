@@ -111,6 +111,14 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
+from config import (
+    DET_SCORE_THRESH,
+    DET_TOP_K,
+    DET_NMS_IOU,
+    DET_MIN_BOX_SIZE,
+    DENSITY_FACTOR,
+    STAGE2_CONTEXT_MODE,
+)
 from model.suminanet.backbone.feature_projector import FeatureProjector
 from model.suminanet.context.roi_context import ROIContextEncoder
 from model.suminanet.detection.proposal_utils import extract_coarse_proposals
@@ -157,15 +165,15 @@ class HybridSuminaNetRecognizer(nn.Module):
         token_use_score_branch: bool = True,
         context_hidden_dim: int = 256,
         context_num_layers: int = 1,
-        context_mode: str = "bigru",
+        context_mode: str = STAGE2_CONTEXT_MODE,
 
-        det_score_thresh: float = 0.40,
-        det_top_k: int = 256,
-        det_nms_iou: float = 0.5,
-        det_min_box_size: float = 1.0,
+        det_score_thresh: float = DET_SCORE_THRESH,
+        det_top_k: int = DET_TOP_K,
+        det_nms_iou: float = DET_NMS_IOU,
+        det_min_box_size: float = DET_MIN_BOX_SIZE,
 
         density_grid: int = 8,
-        density_factor: float = 3.0,
+        density_factor: float = DENSITY_FACTOR,
         avg_gt_per_image: int = 236,
 
         use_aux_head: bool = False,
@@ -208,7 +216,7 @@ class HybridSuminaNetRecognizer(nn.Module):
             dropout=dropout,
         )
 
-        self.roi_order = ROIReadingOrder(line_merge_thresh_ratio=0.6)
+        self.roi_order = ROIReadingOrder()
 
         self.roi_tokens = ROITokenProjector(
             roi_feat_dim=roi_feat_dim,

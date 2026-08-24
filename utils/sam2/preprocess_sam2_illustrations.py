@@ -39,12 +39,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import List
 import torch
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+
+# Allow running as `python utils/sam2/preprocess_sam2_illustrations.py` (not
+# just `python -m utils.sam2.preprocess_sam2_illustrations`) — Python only
+# puts this script's own directory on sys.path, not the repo root, so the
+# `config` import below fails without this.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from config import (
     DATA_DIR,
@@ -59,6 +66,7 @@ from config import (
     SAM2_ILLUS_STABILITY_THRESH,
     SAM2_MASKS_DIR,
 )
+from utils.letterbox import letterbox_pil
 
 
 # ---------------------------------------------------------------------------
@@ -300,10 +308,14 @@ def run_preprocessing(
             min_overlap_frac=min_overlap_frac,
         )
 
-        # Resize to training resolution using nearest-neighbour.
+        # Letterbox to training resolution using nearest-neighbour, matching
+        # KuzushijiDataset's letterboxing so masks stay pixel-aligned with images.
         if illus_mask.max() > 0.01:
-            pil_mask = Image.fromarray(illus_mask, mode="F").resize(
-                (train_w, train_h), Image.Resampling.NEAREST
+            pil_mask, _, _ = letterbox_pil(
+                Image.fromarray(illus_mask, mode="F"),
+                train_w,
+                resample=Image.Resampling.NEAREST,
+                fill=0.0,
             )
             illus_mask_resized = np.array(pil_mask, dtype=np.float32)
             n_with_illus += 1

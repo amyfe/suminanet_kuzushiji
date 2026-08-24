@@ -26,7 +26,7 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
-from config import SUMINANET_BG_SCORE_GATE, SUMINANET_CROP_ENCODER_CHUNK_SIZE, SUMINANET_CROP_ENCODER_SIZE
+from config import SUMINANET_CROP_ENCODER_CHUNK_SIZE, SUMINANET_CROP_ENCODER_SIZE
 from model.suminanet.backbone.feature_projector import FeatureProjector
 from model.suminanet.backbone.roi_crop_encoder import ROICropEncoder
 from model.suminanet.context.roi_context import ROIContextEncoder
@@ -273,7 +273,7 @@ class SuminaNetRecognizer(nn.Module):
             residual_scale=residual_scale_init,
         )
 
-        self.roi_order = ROIReadingOrder(line_merge_thresh_ratio=0.6)
+        self.roi_order = ROIReadingOrder()
 
         # --- Pretrained ROI crop encoder (EfficientNet-B0, Clanuwat VGG-16 equivalent) ---
         # Fused via concat+project rather than simple addition so the network can
@@ -612,97 +612,3 @@ class SuminaNetRecognizer(nn.Module):
         script_logits = self.script_classifier(encoded["context_feats"])   # (B, T, 4)
 
         return {**encoded, "char_logits": char_logits, "script_logits": script_logits}
-
-    @torch.no_grad()
-    def transcribe(
-        self,
-        images: torch.Tensor,
-        orientations: List[str],
-        vocab,
-        score_thresh: float = 0.0,
-        bg_score_gate: float = SUMINANET_BG_SCORE_GATE,
-    ) -> List[str]:
-        """
-        Inference: returns a transcription string per image.
-
-        For each image:
-          1. Run forward pass
-          2. Argmax over char_logits to get predicted char IDs
-          3. Filter by roi_mask (and optionally refine_score threshold)
-          4. Score-gated BG suppression: if sigmoid(refine_score) > bg_score_gate
-             AND pred == bg_id, override with best non-BG class.
-          5. ROIs are already in reading order from sort_batch
-          6. Decode IDs with vocab -> list of chars -> join as string
-
-        Args:
-            score_thresh: minimum refine_score (sigmoid) to include an ROI.
-                          0.0 = include all valid ROIs (roi_mask only).
-            bg_score_gate: minimum refine_score (sigmoid) above which a BG
-                           prediction is suppressed and replaced with the best
-                           non-BG class.  0.0 disables the gate.
-        """
-        self.eval()
-        outputs = self.forward(images, orientations)
-
-        char_logits = outputs["char_logits"]        # (B, T, V)
-        ordered_mask = outputs["ordered_mask"]      # (B, T)
-        refine_scores = outputs["refine_scores"]    # (B, T) - unordered
-        sort_indices = outputs["sort_indices"]      # (B, T) - maps ordered -> original
-
-        bsz = images.size(0)
-        results: List[str] = []
-
-        for b in range(bsz):
-            mask_b = ordered_mask[b]  # (T,)
-
-            if score_thresh > 0.0 and sort_indices is not None:
-                # Reorder refine_scores into sorted order for filtering
-                si = sort_indices[b]  # (T,)
-                valid_si = si[mask_b]
-                if refine_scores is None:
-                    raise ValueError("refine_scores must be provided for score_thresh filtering.")
-                scores_ordered = refine_scores[b].index_select(0, valid_si)
-                score_mask = torch.sigmoid(scores_ordered) >= score_thresh
-                valid_positions = mask_b.nonzero(as_tuple=True)[0][score_mask]
-            else:
-                valid_positions = mask_b.nonzero(as_tuple=True)[0]
-
-            if valid_positions.numel() == 0:
-                results.append("")
-                continue
-
-            logits_b = char_logits[b, valid_positions]  # (N_valid, V)
-            pred_ids = logits_b.argmax(dim=-1).tolist()  # (N_valid,)
-
-            # Score-gated BG suppression: a high-quality proposal (high refine_score)
-            # predicted as BG is likely a real character misclassified.
-            # Override its prediction with the best non-BG class.
-            if (
-                self.bg_id is not None
-                and bg_score_gate > 0.0
-                and sort_indices is not None
-                and refine_scores is not None
-            ):
-                si_b = sort_indices[b]
-                orig_positions = si_b[valid_positions]   # map sorted -> original order
-                raw_scores = refine_scores[b].index_select(0, orig_positions)
-                roi_quality = torch.sigmoid(raw_scores)  # (N_valid,)
-
-                suppressed: List[int] = []
-                for i, p_id in enumerate(pred_ids):
-                    if p_id == self.bg_id and float(roi_quality[i]) > bg_score_gate:
-                        lgt = logits_b[i].clone()
-                        lgt[self.bg_id] = float("-inf")
-                        suppressed.append(int(lgt.argmax().item()))
-                    else:
-                        suppressed.append(p_id)
-                pred_ids = suppressed
-
-            # Filter remaining background predictions
-            if self.bg_id is not None:
-                pred_ids = [p for p in pred_ids if p != self.bg_id]
-
-            chars = vocab.decode(pred_ids, remove_special=True)
-            results.append("".join(chars))
-
-        return results

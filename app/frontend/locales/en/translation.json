@@ -22,6 +22,8 @@
         "examplesEyebrow": "SELECT A TEXT · 用例",
         "examplesTitle": "Examples to try",
         "examplesSub": "Public-domain Edo-period verse. Pick one to drop its text straight into the workspace, ready to translate.",
+        "furtherExamplesPre": "More examples are available in the workspace of CODH",
+        "furtherExamplesLink": "Kuzushiji Recognition",
         "examples": [
             { "id": "furuike", "title": "The Old Pond", "author": "松尾芭蕉 · Bashō", "year": "c.1686", "text": "古池や蛙飛び込む水の音" },
             { "id": "natsukusa", "title": "Summer Grasses", "author": "松尾芭蕉 · Bashō", "year": "1689", "text": "夏草や兵どもが夢の跡" },
@@ -105,6 +107,11 @@
             { "b": "SuminaNet" },
             { "text": ", an in-house character-recognition model inspired by KuroNet — the pioneering system built by Tarin Clanuwat and collaborators — with a human correction step and translation, so a scan becomes a reading, and a reading becomes English. Made for researchers, students, and anyone curious enough to look closely." }
         ],
+        "p3": [
+            { "text": "Sumina is a research prototype, not a commercial product. It is free to use, and we do not collect personal information. Please see our " },
+            { "a": { "href": "/policy" }, "text": "privacy policy" },
+            { "text": " for details. The model was trained using data from CODH. Translation is performed using the Mecab and Unidic for normalization and the Claude API (Somnet model) for translation." }
+        ],
         "etymology": [
             { "text": "The name fuses 墨 " },
             { "b": "sumi" },
@@ -116,7 +123,10 @@
             { "b": "sachi" },
             { "text": " (\"fortune\") for Felic." }
         ],
-        "photoAlt": "Illustration of daily life in the Edo period"
+        "photoAlt": "Illustration of daily life in the Edo period",
+        "sourceCredit": {
+            "title": "Sources: "
+        }
     },
     "policy": {
         "title": "Privacy Policy",
@@ -138,6 +148,46 @@
         "thirdPartyHeading": "Third-Party Processing",
         "thirdPartyText": "Translation is powered by Anthropic's Claude model, accessed via the OpenRouter API. When you request a translation, the transcribed text you submit is sent to this third-party provider to generate the translation. No images are shared with this provider — only text.",
         "protectionHeading": "Data Protection",
-        "protectionText": "We do not create user accounts and do not collect names, email addresses, or other personal identifiers. Uploaded images are never stored beyond the lifetime of your request."
+        "protectionText": "We do not create user accounts and do not collect names, email addresses, or other personal identifiers. Uploaded images are never stored beyond the lifetime of your request.",
+        "detailedSections": [
+            {
+                "heading": "Responsible party",
+                "paragraphs": [
+                    "Amina Felic, Hammarskjöldring 156, 60439 Frankfurt am Main, Germany.",
+                    "Email: felic.amina@gmail.com",
+                    "This privacy policy explains which personal data we process, for what purposes, and to what extent as part of providing the Sumina application."
+                ]
+            },
+            {
+                "heading": "Overview of processing",
+                "paragraphs": [
+                    "We process uploaded images to detect and transcribe manuscript characters and to generate translations. The images are processed only in server memory for the duration of the request and are not stored on disk.",
+                    "We process transcribed text when a translation is requested. The text may be sent to a translation provider to generate the output. We do not share images with that provider.",
+                    "We process IP addresses temporarily to enforce rate limits. The values are held only in memory and are cleared automatically.",
+                    "We process the user choice of language only in the browser's local storage and never send it to our servers."
+                ]
+            },
+            {
+                "heading": "Legal basis and purpose",
+                "paragraphs": [
+                    "The processing is based on our legitimate interest in operating and securing the application and on the contract between the user and the service provider for the requested transcription and translation functionality.",
+                    "The purposes are to provide the requested service, prevent misuse and abuse, and ensure technical reliability of the application."
+                ]
+            },
+            {
+                "heading": "Security measures",
+                "paragraphs": [
+                    "We use technical and organizational safeguards proportionate to the risk, including access controls, encrypted HTTPS connections, and short-lived in-memory processing. We do not keep user accounts, personal profiles, or persistent image storage.",
+                    "We do not collect names, email addresses, or other identifying personal data as part of the standard transcription process."
+                ]
+            },
+            {
+                "heading": "Rights of data subjects",
+                "paragraphs": [
+                    "If you submit data to the service, you may request confirmation of processing, access to your data, correction, deletion, or restriction of processing in accordance with the applicable data protection law.",
+                    "If you believe your rights have been violated, you may also contact the relevant data protection authority."
+                ]
+            }
+        ]
     }
 }

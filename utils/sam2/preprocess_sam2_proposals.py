@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import List, Tuple
 
@@ -75,6 +76,12 @@ import torchvision.transforms as T
 from PIL import Image
 RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 from tqdm import tqdm
+
+# Allow running as `python utils/sam2/preprocess_sam2_proposals.py` (not just
+# `python -m utils.sam2.preprocess_sam2_proposals`) — Python only puts this
+# script's own directory on sys.path, not the repo root, so the `config`
+# import below fails without this.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from config import (
     AVG_GT_PER_IMAGE,
@@ -94,6 +101,7 @@ from config import (
 )
 from model.suminanet import DetectorHead, build_backbone
 from model.suminanet.detection.proposal_utils import extract_coarse_proposals
+from utils.letterbox import letterbox_pil
 from utils.vocab import VocabManager
 
 
@@ -671,8 +679,8 @@ def _run_processing_loop(
             continue
 
         try:
-            pil_img = Image.open(img_path).convert("RGB").resize(
-                (w_img, h_img), RESAMPLE_LANCZOS
+            pil_img, _, _ = letterbox_pil(
+                Image.open(img_path).convert("RGB"), w_img, resample=RESAMPLE_LANCZOS
             )
         except Exception as e:
             print(f"WARNING: could not open {img_path}: {e}")

@@ -16,6 +16,7 @@ const About = () => {
   const t = i18next.t.bind(i18next)
   const p1 = t('about.p1', { returnObjects: true })
   const p2 = t('about.p2', { returnObjects: true })
+  const p3 = t('about.p3', { returnObjects: true })
   const etymology = t('about.etymology', { returnObjects: true })
 
   return (
@@ -33,12 +34,12 @@ const About = () => {
           <h2>{t('about.title')}</h2>
           <p>{renderSegments(p1)}</p>
           <p>{renderSegments(p2)}</p>
+          <p>{renderSegments(p3)}</p>
           <div className="about-etymology">
             {t('about.creditLine')}
             <br />
             {renderSegments(etymology)}
           </div>
-          <img src={edoImg} alt={t('about.photoAlt')} className="about-photo" />
         </div>
       </section>
     </div>

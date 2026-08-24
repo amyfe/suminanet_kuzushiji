@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import matplotlib.pyplot as plt
 import numpy as np
 
-from visualization.common import BAR_ALPHA, GRID_ALPHA, MARKER_SIZE, savefig
+from visualization.common import BAR_ALPHA, GRID_ALPHA, MARKER_SIZE, cjk_font_prop, pastel_color, savefig
 
 if TYPE_CHECKING:
     from utils.vocab import VocabManager
@@ -104,13 +104,25 @@ def plot_confusion_matrix(
     )[:20]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    cjk6 = cjk_font_prop(6)
+    cjk9 = cjk_font_prop(9)
 
     # Heatmap
     im = ax1.imshow(mat, cmap="YlOrRd", aspect="auto")
     ax1.set_xticks(range(top_n))
     ax1.set_yticks(range(top_n))
-    ax1.set_xticklabels(labels, rotation=90, fontsize=6)
-    ax1.set_yticklabels(labels, fontsize=6)
+    if cjk6 is not None:
+        ax1.set_xticklabels(labels, rotation=90)
+        ax1.set_yticklabels(labels)
+        for txt in ax1.get_xticklabels():
+            txt.set_fontproperties(cjk6)
+        for txt in ax1.get_yticklabels():
+            txt.set_fontproperties(cjk6)
+    else:
+        # Fallback: show Unicode codepoints (readable without a CJK font)
+        cp_labels = [f"U+{ord(c):04X}" if c else "?" for c in labels]
+        ax1.set_xticklabels(cp_labels, rotation=90, fontsize=6)
+        ax1.set_yticklabels(cp_labels, fontsize=6)
     ax1.set_xlabel("Predicted character")
     ax1.set_ylabel("Ground-truth character")
     ax1.set_title(f"Top-{top_n} character confusion matrix")
@@ -122,7 +134,12 @@ def plot_confusion_matrix(
     y_pos = range(len(pair_labels))
     ax2.barh(y_pos, pair_counts, align="center", color="steelblue", alpha=BAR_ALPHA)
     ax2.set_yticks(y_pos)
-    ax2.set_yticklabels(pair_labels, fontsize=9)
+    if cjk9 is not None:
+        ax2.set_yticklabels(pair_labels)
+        for txt in ax2.get_yticklabels():
+            txt.set_fontproperties(cjk9)
+    else:
+        ax2.set_yticklabels(pair_labels, fontsize=9)
     ax2.invert_yaxis()
     ax2.set_xlabel("Error count")
     ax2.set_title("Top-20 most confused pairs (GT→Pred)")
@@ -188,8 +205,21 @@ def plot_cer_by_script(
     ]
     totals = [tot for _, tot in groups.values()]
 
+    # Matches the canonical script-type palette used across dataset_analysis
+    # and checkpoint_compare.py (hiragana/katakana/kanji/other), so the same
+    # script always reads as the same color across every plot suite. Kanji
+    # (rare) is a pastel tint of Kanji (common)'s red rather than its own
+    # hue, so it reads as "still kanji" instead of colliding with another
+    # script's canonical color.
+    group_colors = {
+        "Hiragana":        "#4C72B0",
+        "Katakana":        "#55A868",
+        "Kanji\n(common)": "#C44E52",
+        "Kanji\n(rare)":   pastel_color("#C44E52"),
+        "Other":           "#DD8452",
+    }
     fig, ax = plt.subplots(figsize=(9, 5))
-    colors = ["#4C72B0", "#55A868", "#C44E52", "#DD8452", "#8172B2"]
+    colors = [group_colors[name] for name in group_names]
     bars = ax.bar(group_names, error_rates, color=colors, alpha=BAR_ALPHA)
 
     for bar, rate, tot in zip(bars, error_rates, totals):
@@ -357,13 +387,14 @@ def draw_confidence_boxes(
 # Learning curves (train/val over epochs) — justifies the chosen epoch budget
 # ---------------------------------------------------------------------------
 
+_NUM = r"(?:[\d.]+|nan)"  # training instability occasionally logs literal "nan"
 _EPOCH_RE = re.compile(
-    r"Epoch\s+(\d+)/\d+\s+\|\s+Train loss=([\d.]+)\s+\(char=([\d.]+),\s*bg=([\d.]+),"
-    r"\s*delta=([\d.]+),\s*score=([\d.]+)\)\s+\|\s+train_top1=([\d.]+)"
+    rf"Epoch\s+(\d+)/\d+\s+\|\s+Train loss=({_NUM})\s+\(char={_NUM},\s*bg={_NUM},"
+    rf"\s*delta={_NUM},\s*score={_NUM}\)\s+\|\s+train_top1=({_NUM})"
 )
-_VAL_LOSS_RE = re.compile(r"Val \| loss=([\d.]+)")
+_VAL_LOSS_RE = re.compile(rf"Val \| loss=({_NUM})")
 _VAL_METRICS_RE = re.compile(
-    r"Val \| top1=([\d.]+)\s+top5=([\d.]+)\s+CER=([\d.]+)\s+coverage=([\d.]+)"
+    rf"Val \| top1=({_NUM})\s+top5=({_NUM})\s+CER=({_NUM})\s+coverage=({_NUM})"
 )
 _BEST_RE = re.compile(r"saved best: suminanet_best\.pt \(score=([\d.]+)\)")
 _EARLY_STOP_RE = re.compile(r"Early stopping: (\d+) epochs without improvement\. best=([\d.]+)")
@@ -389,7 +420,7 @@ def _parse_suminanet_log(log_file: "str | Path") -> tuple[list[dict], int | None
                 pending = {
                     "epoch":      int(m.group(1)),
                     "train_loss": float(m.group(2)),
-                    "train_top1": float(m.group(7)),
+                    "train_top1": float(m.group(3)),
                 }
                 continue
 
@@ -401,6 +432,7 @@ def _parse_suminanet_log(log_file: "str | Path") -> tuple[list[dict], int | None
             m = _VAL_METRICS_RE.search(line)
             if m and pending and "val_cer" not in pending:
                 pending["val_top1"] = float(m.group(1))
+                pending["val_top5"] = float(m.group(2))
                 pending["val_cer"]  = float(m.group(3))
                 records.append(pending)
                 pending = {}
@@ -433,6 +465,50 @@ def _split_runs(records: list[dict]) -> list[list[dict]]:
             current.append(rec)
     runs.append(current)
     return runs
+
+
+def merge_log_records(log_files: list["str | Path"]) -> tuple[list[dict], int | None]:
+    """Concatenate + dedupe per-epoch records across one or more log files
+    covering a single checkpoint's training history (e.g. a fresh run plus
+    one or more resumes).
+
+    The training script preserves true/global epoch numbers across resumes
+    (a resumed job's first logged epoch is checkpoint_epoch + 1, not 1), so
+    passing `log_files` in chronological order and letting a later file's
+    record for a given epoch overwrite an earlier one's is correct: it's
+    always the most recent/complete rerun of that epoch. A single-file
+    input degenerates to _parse_suminanet_log's own output.
+
+    Returns an epoch-ascending, duplicate-free record list plus an
+    early-stop epoch (if any). Missing files are skipped with a printed
+    warning rather than raising. An early-stop signal from an earlier file
+    is dropped if a later file's records extend past it (e.g. training was
+    resumed from a pre-early-stop checkpoint and continued further) — a
+    stale "early stop" marker sitting in the middle of a continuing curve
+    would be actively misleading rather than informative.
+    """
+    merged: dict[int, dict] = {}
+    last_early_stop: int | None = None
+    for log_file in log_files:
+        log_file = Path(log_file)
+        if not log_file.exists():
+            print(f"merge_log_records: log file not found ({log_file}), skipping.")
+            continue
+        records, early_stop_epoch = _parse_suminanet_log(log_file)
+        for rec in records:
+            merged[rec["epoch"]] = rec
+        if early_stop_epoch is not None:
+            last_early_stop = early_stop_epoch
+    max_epoch = max(merged) if merged else None
+    if last_early_stop is not None and max_epoch is not None and last_early_stop < max_epoch:
+        last_early_stop = None
+    return [merged[ep] for ep in sorted(merged)], last_early_stop
+
+
+def _normalize_log_files(log_files: "str | Path | list[str | Path]") -> list[Path]:
+    if isinstance(log_files, (str, Path)):
+        return [Path(log_files)]
+    return [Path(p) for p in log_files]
 
 
 def plot_learning_curves(
@@ -518,5 +594,103 @@ def plot_learning_curves(
     ax2.legend(lines2 + lines2b, labels2 + labels2b, fontsize=7, ncol=2)
 
     fig.suptitle("Stage 2 (SuminaNet) training curves", fontsize=11)
+    fig.tight_layout()
+    return savefig(fig, out_path)
+
+
+def _latest_best_epoch(records: list[dict]) -> int | None:
+    best_ep = None
+    for r in records:
+        if r.get("is_best"):
+            best_ep = r["epoch"]
+    return best_ep
+
+
+def plot_loss_cer_curve(
+    log_files: "str | Path | list[str | Path]",
+    out_path: "str | Path" = "training_curve_loss_cer.png",
+) -> "Path | None":
+    """Train/val loss (left axis) + val CER (right axis) vs. true epoch
+    number, merged/deduped across `log_files` via merge_log_records.
+
+    Unlike plot_learning_curves, resumes are NOT stitched nose-to-tail on
+    the x-axis — a resumed epoch keeps its real epoch number, and the
+    latest file's value for it wins. Returns None if no file exists or
+    nothing parses.
+    """
+    records, early_stop_epoch = merge_log_records(_normalize_log_files(log_files))
+    if not records:
+        print(f"Training curve (loss/CER): no epoch summary lines found in {log_files}, skipping.")
+        return None
+
+    epochs     = [r["epoch"] for r in records]
+    train_loss = [r.get("train_loss") for r in records]
+    val_loss   = [r.get("val_loss") for r in records]
+    val_cer    = [r.get("val_cer") for r in records]
+    best_ep    = _latest_best_epoch(records)
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    ax2 = ax1.twinx()
+    ax1.plot(epochs, train_loss, "-", color="#4C72B0", linewidth=1.5, label="Train loss")
+    ax1.plot(epochs, val_loss, "--", color="#C44E52", linewidth=1.5, label="Val loss")
+    ax2.plot(epochs, val_cer, "-", color="#55A868", linewidth=1.5,
+              marker="o", markersize=MARKER_SIZE, label="Val CER")
+
+    if best_ep is not None:
+        ax1.axvline(best_ep, color="crimson", linestyle="--", linewidth=1.0,
+                    alpha=0.7, label=f"Best checkpoint (epoch {best_ep})")
+    if early_stop_epoch is not None:
+        ax1.axvline(early_stop_epoch, color="black", linestyle=":", linewidth=1.2,
+                    alpha=0.7, label=f"Early stop (epoch {early_stop_epoch})")
+
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax2.set_ylabel("Val CER")
+    ax1.set_title("Stage 2 (SuminaNet) training curve: loss + CER")
+    ax1.grid(True, alpha=GRID_ALPHA)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
+    fig.tight_layout()
+    return savefig(fig, out_path)
+
+
+def plot_top1_top5_curve(
+    log_files: "str | Path | list[str | Path]",
+    out_path: "str | Path" = "training_curve_top1_top5.png",
+) -> "Path | None":
+    """Val top-1 / top-5 accuracy vs. true epoch number, merged/deduped
+    across `log_files` via merge_log_records. See plot_loss_cer_curve for
+    the epoch-numbering convention. Returns None if nothing parses.
+    """
+    records, early_stop_epoch = merge_log_records(_normalize_log_files(log_files))
+    if not records:
+        print(f"Training curve (top1/top5): no epoch summary lines found in {log_files}, skipping.")
+        return None
+
+    epochs   = [r["epoch"] for r in records]
+    val_top1 = [r.get("val_top1") for r in records]
+    val_top5 = [r.get("val_top5") for r in records]
+    best_ep  = _latest_best_epoch(records)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, val_top1, "-", color="#4C72B0", linewidth=1.5,
+            marker="o", markersize=MARKER_SIZE, label="Val top-1")
+    ax.plot(epochs, val_top5, "-", color="#DD8452", linewidth=1.5,
+            marker="o", markersize=MARKER_SIZE, label="Val top-5")
+
+    if best_ep is not None:
+        ax.axvline(best_ep, color="crimson", linestyle="--", linewidth=1.0,
+                   alpha=0.7, label=f"Best checkpoint (epoch {best_ep})")
+    if early_stop_epoch is not None:
+        ax.axvline(early_stop_epoch, color="black", linestyle=":", linewidth=1.2,
+                   alpha=0.7, label=f"Early stop (epoch {early_stop_epoch})")
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Accuracy")
+    ax.set_ylim(0.7, 1.02)
+    ax.set_title("Stage 2 (SuminaNet) training curve: top-1 / top-5 accuracy")
+    ax.grid(True, alpha=GRID_ALPHA)
+    ax.legend(fontsize=8)
     fig.tight_layout()
     return savefig(fig, out_path)

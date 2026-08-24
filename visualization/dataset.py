@@ -9,25 +9,28 @@ from __future__ import annotations
 import collections
 from pathlib import Path
 
-import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
-from visualization.common import BAR_ALPHA, GRID_ALPHA, savefig
+from visualization.common import BAR_ALPHA, GRID_ALPHA, cjk_font_prop, savefig
 
-# ---------------------------------------------------------------------------
-# Font helper — Droid Sans Fallback covers all hiragana/katakana/kanji
-# ---------------------------------------------------------------------------
+# Representative aged-paper tone, sampled from the dataset's scanned pages
+# (median of non-white/non-ink pixels in an existing gallery render — see
+# plot_char_variant_gallery), so gallery cells blend into one page instead
+# of floating as mismatched rectangles on a white canvas.
+PAPER_BG_COLOR = (216, 204, 166)
 
-_DROID_PATH = "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"
-
-
-def _jp_font(size: int = 10) -> fm.FontProperties | None:
-    p = Path(_DROID_PATH)
-    if p.exists():
-        return fm.FontProperties(fname=str(p), size=size)
-    return None
+# These figures get placed on an A4 thesis page near full page width, several
+# with 2-3 subplots sharing that width — matplotlib's defaults (~8-10pt) turn
+# unreadable once a 14in-wide figure is shrunk to ~6.3in on paper. Sized for
+# that print context rather than for on-screen viewing.
+FS_SUPTITLE = 17
+FS_TITLE    = 15
+FS_LABEL    = 14
+FS_TICK     = 12
+FS_LEGEND   = 13
+FS_ANNOT    = 12
 
 
 # ---------------------------------------------------------------------------
@@ -80,14 +83,15 @@ def plot_zipf_curve(
     total = sum(freqs)
     cum_frac = np.cumsum(freqs) / total
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
     # --- Left: log-log frequency vs rank ---
-    ax1.loglog(ranks, freqs, "b-", linewidth=1.5, alpha=0.85)
-    ax1.set_xlabel("Character rank (log)")
-    ax1.set_ylabel("Frequency (log)")
-    ax1.set_title("Character frequency distribution (Zipf law)")
+    ax1.loglog(ranks, freqs, "b-", linewidth=2.2, alpha=0.85)
+    ax1.set_xlabel("Character rank (log)", fontsize=FS_LABEL)
+    ax1.set_ylabel("Frequency (log)", fontsize=FS_LABEL)
+    ax1.set_title("Character frequency distribution (Zipf law)", fontsize=FS_TITLE)
     ax1.grid(True, which="both", alpha=GRID_ALPHA)
+    ax1.tick_params(axis="both", labelsize=FS_TICK)
 
     # Annotate key cutoffs
     for k, color, label_txt in [
@@ -96,37 +100,38 @@ def plot_zipf_curve(
         (500, "green",  "Top 500"),
     ]:
         if k <= len(freqs):
-            ax1.axvline(k, color=color, linestyle="--", linewidth=1.1)
+            ax1.axvline(k, color=color, linestyle="--", linewidth=1.6)
             ax1.text(k * 1.05, freqs[0] * 0.6 ** ([10, 100, 500].index(k) + 1),
                      f"{label_txt}\n{cum_frac[k-1]*100:.1f}% coverage",
-                     color=color, fontsize=8)
+                     color=color, fontsize=FS_ANNOT)
 
-    ax1.axhline(5, color="grey", linestyle=":", linewidth=0.8, alpha=0.6)
-    ax1.text(1.5, 6, "freq = 5 (rare threshold)", fontsize=7, color="grey")
+    ax1.axhline(5, color="grey", linestyle=":", linewidth=1.2, alpha=0.6)
+    ax1.text(1.5, 6, "freq = 5 (rare threshold)", fontsize=FS_ANNOT, color="grey")
 
     # --- Right: cumulative coverage curve ---
-    ax2.plot(ranks, cum_frac * 100, "b-", linewidth=1.5)
-    ax2.set_xlabel("Vocabulary size (top-K characters)")
-    ax2.set_ylabel("Cumulative character coverage (%)")
-    ax2.set_title("Cumulative coverage vs. vocabulary size")
+    ax2.plot(ranks, cum_frac * 100, "b-", linewidth=2.2)
+    ax2.set_xlabel("Vocabulary size (top-K characters)", fontsize=FS_LABEL)
+    ax2.set_ylabel("Cumulative character coverage (%)", fontsize=FS_LABEL)
+    ax2.set_title("Cumulative coverage vs. vocabulary size", fontsize=FS_TITLE)
     ax2.set_xscale("log")
     ax2.grid(True, which="both", alpha=GRID_ALPHA)
     ax2.set_ylim(0, 101)
+    ax2.tick_params(axis="both", labelsize=FS_TICK)
 
     for k, color in [(100, "orange"), (500, "green"), (1000, "purple")]:
         if k <= len(cum_frac):
             cov = cum_frac[k - 1] * 100
-            ax2.axvline(k, color=color, linestyle="--", linewidth=1.0)
-            ax2.axhline(cov, color=color, linestyle=":", linewidth=0.8, alpha=0.5)
-            ax2.scatter([k], [cov], color=color, s=60, zorder=5)
+            ax2.axvline(k, color=color, linestyle="--", linewidth=1.5)
+            ax2.axhline(cov, color=color, linestyle=":", linewidth=1.2, alpha=0.5)
+            ax2.scatter([k], [cov], color=color, s=90, zorder=5)
             ax2.text(k * 1.08, cov - 3, f"K={k}: {cov:.1f}%",
-                     color=color, fontsize=8)
+                     color=color, fontsize=FS_ANNOT)
 
     fig.suptitle(
         f"Dataset: {len(label_counts):,} unique classes  |  "
         f"{total:,} total instances  |  "
         f"{sum(1 for v in label_counts.values() if v == 1):,} hapax legomena",
-        fontsize=10,
+        fontsize=FS_SUPTITLE,
     )
     fig.tight_layout()
     return savefig(fig, out_path)
@@ -159,25 +164,30 @@ def plot_script_distribution(
     classes   = [classes_by_script.get(s, 0) for s in script_order]
     total_inst = sum(instances)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
     # --- Left: pie of instances ---
-    wedge_labels = [
-        f"{s}\n{instances[i]:,}\n({instances[i]/total_inst*100:.1f}%)"
-        for i, s in enumerate(script_order)
-        if instances[i] > 0
-    ]
+    # Labels go in a legend rather than directly on the wedges: this script's
+    # distribution is typically dominated by one or two scripts (Kanji/
+    # Hiragana), leaving Katakana/Other as slivers whose on-wedge labels
+    # collide at larger font sizes since they all land at nearly the same
+    # angle — a legend has no such overlap regardless of wedge size.
     non_zero_inst  = [v for v in instances if v > 0]
     non_zero_color = [colors[i] for i, v in enumerate(instances) if v > 0]
-    ax1.pie(
+    wedges, _ = ax1.pie(
         non_zero_inst,
-        labels=wedge_labels,
         colors=non_zero_color,
-        autopct=None,
         startangle=140,
         wedgeprops={"linewidth": 0.8, "edgecolor": "white"},
     )
-    ax1.set_title("Character instances by script type")
+    legend_labels = [
+        f"{s}: {instances[i]:,} ({instances[i]/total_inst*100:.1f}%)"
+        for i, s in enumerate(script_order)
+        if instances[i] > 0
+    ]
+    ax1.legend(wedges, legend_labels, fontsize=FS_LEGEND, loc="upper center",
+               bbox_to_anchor=(0.5, -0.02), ncol=1)
+    ax1.set_title("Character instances by script type", fontsize=FS_TITLE)
 
     # --- Right: grouped bar of unique classes ---
     x = np.arange(len(script_order))
@@ -201,22 +211,23 @@ def plot_script_distribution(
             h = bar.get_height()
             if h > 0:
                 ax2.text(bar.get_x() + bar.get_width() / 2, h + 5,
-                         f"{h:,}", ha="center", va="bottom", fontsize=7)
-        ax2.legend(fontsize=9)
-        ax2.set_title("Unique character classes per script (train vs val)")
+                         f"{h:,}", ha="center", va="bottom", fontsize=FS_ANNOT)
+        ax2.legend(fontsize=FS_LEGEND)
+        ax2.set_title("Unique character classes per script (train vs val)", fontsize=FS_TITLE)
     else:
         bars = ax2.bar(x, classes, color=colors, alpha=BAR_ALPHA)
         for bar, c in zip(bars, classes):
             ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 5,
-                     f"{c:,}", ha="center", va="bottom", fontsize=9)
-        ax2.set_title("Unique character classes per script type")
+                     f"{c:,}", ha="center", va="bottom", fontsize=FS_ANNOT)
+        ax2.set_title("Unique character classes per script type", fontsize=FS_TITLE)
 
     ax2.set_xticks(x)
-    ax2.set_xticklabels(script_order)
-    ax2.set_ylabel("Number of unique character classes")
+    ax2.set_xticklabels(script_order, fontsize=FS_TICK)
+    ax2.set_ylabel("Number of unique character classes", fontsize=FS_LABEL)
+    ax2.tick_params(axis="y", labelsize=FS_TICK)
     ax2.grid(axis="y", alpha=GRID_ALPHA)
 
-    fig.suptitle("Dataset script-type breakdown", fontsize=11)
+    fig.suptitle("Dataset script-type breakdown", fontsize=FS_SUPTITLE)
     fig.tight_layout()
     return savefig(fig, out_path)
 
@@ -262,7 +273,7 @@ def plot_class_imbalance(
     labels = [b[2] for b in BUCKETS]
     total_inst = sum(bucket_instances)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6.5))
 
     # --- Left: stacked bar — classes per bucket, coloured by script ---
     bottom = np.zeros(len(BUCKETS))
@@ -273,14 +284,15 @@ def plot_class_imbalance(
 
     for xi, tot in enumerate(bottom):
         if tot > 0:
-            ax1.text(xi, tot + 5, f"{int(tot):,}", ha="center", va="bottom", fontsize=8)
+            ax1.text(xi, tot + 5, f"{int(tot):,}", ha="center", va="bottom", fontsize=FS_ANNOT)
 
     ax1.set_xticks(x)
-    ax1.set_xticklabels(labels, fontsize=8)
-    ax1.set_xlabel("Frequency bucket (occurrences in dataset)")
-    ax1.set_ylabel("Number of unique character classes")
-    ax1.set_title("Class distribution by frequency bucket")
-    ax1.legend(fontsize=8)
+    ax1.set_xticklabels(labels, fontsize=FS_TICK)
+    ax1.set_xlabel("Frequency bucket (occurrences in dataset)", fontsize=FS_LABEL)
+    ax1.set_ylabel("Number of unique character classes", fontsize=FS_LABEL)
+    ax1.set_title("Class distribution by frequency bucket", fontsize=FS_TITLE)
+    ax1.legend(fontsize=FS_LEGEND)
+    ax1.tick_params(axis="y", labelsize=FS_TICK)
     ax1.grid(axis="y", alpha=GRID_ALPHA)
 
     # --- Right: instance share per bucket ---
@@ -291,13 +303,14 @@ def plot_class_imbalance(
     for bar, pct in zip(bars, inst_pcts):
         if pct > 0.1:
             ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,
-                     f"{pct:.1f}%", ha="center", va="bottom", fontsize=8)
+                     f"{pct:.1f}%", ha="center", va="bottom", fontsize=FS_ANNOT)
 
     ax2.set_xticks(x)
-    ax2.set_xticklabels(labels, fontsize=8)
-    ax2.set_xlabel("Frequency bucket")
-    ax2.set_ylabel("Share of total character instances (%)")
-    ax2.set_title("Instance share per frequency bucket")
+    ax2.set_xticklabels(labels, fontsize=FS_TICK)
+    ax2.set_xlabel("Frequency bucket", fontsize=FS_LABEL)
+    ax2.set_ylabel("Share of total character instances (%)", fontsize=FS_LABEL)
+    ax2.set_title("Instance share per frequency bucket", fontsize=FS_TITLE)
+    ax2.tick_params(axis="y", labelsize=FS_TICK)
     ax2.grid(axis="y", alpha=GRID_ALPHA)
 
     # Add rare-threshold line on left panel
@@ -306,8 +319,8 @@ def plot_class_imbalance(
     )
     if rare_bucket_idx is not None:
         ax1.axvline(rare_bucket_idx + 0.5, color="grey", linestyle="--",
-                    linewidth=1.2, label=f"rare threshold ({rare_thresh})")
-        ax1.legend(fontsize=8)
+                    linewidth=1.6, label=f"rare threshold ({rare_thresh})")
+        ax1.legend(fontsize=FS_LEGEND)
 
     n_rare   = sum(1 for v in label_counts.values() if v < rare_thresh)
     n_common = len(label_counts) - n_rare
@@ -315,7 +328,7 @@ def plot_class_imbalance(
         f"Class imbalance: {n_rare:,} rare classes (< {rare_thresh} occurrences)  |  "
         f"{n_common:,} common classes  |  "
         f"top-10 chars = {sum(v for _, v in label_counts.most_common(10))/total_inst*100:.1f}% of instances",
-        fontsize=9,
+        fontsize=FS_SUPTITLE - 3,
     )
     fig.tight_layout()
     return savefig(fig, out_path)
@@ -330,6 +343,7 @@ def plot_top_characters(
     top_n: int = 40,
     rare_thresh: int = 50,
     out_path: "str | Path" = "top_characters.png",
+    title: "str | None" = None,
 ) -> Path:
     """
     Horizontal bar chart of the top-N most frequent characters.
@@ -350,9 +364,9 @@ def plot_top_characters(
     }
     bar_colors = [script_color.get(s, "#999999") for s in scripts]
 
-    jp_fp = _jp_font(size=9)
+    jp_fp = cjk_font_prop(size=13)
 
-    fig, ax = plt.subplots(figsize=(10, max(6, top_n * 0.28)))
+    fig, ax = plt.subplots(figsize=(11, max(7, top_n * 0.32)))
     y_pos = np.arange(len(top))[::-1]   # highest freq at top
 
     bars = ax.barh(y_pos, counts, color=bar_colors, alpha=BAR_ALPHA, height=0.7)
@@ -365,29 +379,36 @@ def plot_top_characters(
         for yi, (char, label_code) in zip(y_pos, zip(chars, labels)):
             # Draw character in Japanese font
             ax.text(-max(counts) * 0.002, yi, char, fontproperties=jp_fp,
-                    ha="right", va="center", fontsize=11)
-            ax.text(-max(counts) * 0.12, yi, label_code,
-                    ha="right", va="center", fontsize=7, color="grey")
+                    ha="right", va="center", fontsize=15)
+            # Anchored well inside the left xlim (below) so the "U+XXXX"
+            # string renders fully between the axes border and x=0 instead
+            # of being clipped by the left spine.
+            ax.text(-max(counts) * 0.085, yi, label_code,
+                    ha="right", va="center", fontsize=FS_ANNOT - 2, color="grey")
         ax.set_yticklabels([""] * len(top))
-        ax.set_xlim(-max(counts) * 0.15, max(counts) * 1.12)
+        ax.set_xlim(-max(counts) * 0.18, max(counts) * 1.12)
     else:
-        ax.set_yticklabels(tick_labels, fontsize=8)
+        ax.set_yticklabels(tick_labels, fontsize=FS_TICK)
 
     # Frequency labels on bars
     for bar, cnt in zip(bars, counts):
         ax.text(bar.get_width() + max(counts) * 0.005, bar.get_y() + bar.get_height() / 2,
-                f"{cnt:,}", va="center", fontsize=7)
+                f"{cnt:,}", va="center", fontsize=FS_ANNOT)
 
-    # Legend for script colours
+    # Legend for script colours — only for scripts actually present, so a
+    # single-script call (e.g. Kanji-only) doesn't show unused swatches.
     from matplotlib.patches import Patch
+    present_scripts = set(scripts)
     legend_els = [Patch(facecolor=c, alpha=BAR_ALPHA, label=s)
-                  for s, c in script_color.items()]
-    ax.legend(handles=legend_els, fontsize=8, loc="lower right")
+                  for s, c in script_color.items() if s in present_scripts]
+    if len(legend_els) > 1:
+        ax.legend(handles=legend_els, fontsize=FS_LEGEND, loc="lower right")
 
-    ax.set_xlabel("Frequency (total occurrences in dataset)")
-    ax.set_title(f"Top-{top_n} most frequent characters in the dataset")
+    ax.set_xlabel("Frequency (total occurrences in dataset)", fontsize=FS_LABEL)
+    ax.set_title(title or f"Top-{top_n} most frequent characters in the dataset", fontsize=FS_TITLE)
+    ax.tick_params(axis="x", labelsize=FS_TICK)
     ax.grid(axis="x", alpha=GRID_ALPHA)
-    ax.axvline(rare_thresh, color="grey", linestyle=":", linewidth=0.8)
+    ax.axvline(rare_thresh, color="grey", linestyle=":", linewidth=1.2)
 
     fig.tight_layout()
     return savefig(fig, out_path)
@@ -405,7 +426,7 @@ def plot_chars_per_image(
     """
     Histogram of character count per page, optionally split by train/val.
     """
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(10, 6))
 
     if split_chars_per_image:
         colors_map = {"train": "#4C72B0", "val": "#C44E52"}
@@ -417,22 +438,23 @@ def plot_chars_per_image(
 
     median_v = float(np.median(chars_per_image))
     mean_v   = float(np.mean(chars_per_image))
-    ax.axvline(median_v, color="crimson", linestyle="--", linewidth=1.5,
+    ax.axvline(median_v, color="crimson", linestyle="--", linewidth=2.0,
                label=f"Median = {median_v:.0f}")
-    ax.axvline(mean_v, color="orange", linestyle="--", linewidth=1.5,
+    ax.axvline(mean_v, color="orange", linestyle="--", linewidth=2.0,
                label=f"Mean = {mean_v:.0f}")
 
-    ax.set_xlabel("Characters per page image")
-    ax.set_ylabel("Number of images")
-    ax.set_title("Distribution of character count per page")
-    ax.legend(fontsize=9)
+    ax.set_xlabel("Characters per page image", fontsize=FS_LABEL)
+    ax.set_ylabel("Number of images", fontsize=FS_LABEL)
+    ax.set_title("Distribution of character count per page", fontsize=FS_TITLE)
+    ax.tick_params(axis="both", labelsize=FS_TICK)
+    ax.legend(fontsize=FS_LEGEND)
     ax.grid(True, alpha=GRID_ALPHA)
 
     p10 = int(np.percentile(chars_per_image, 10))
     p90 = int(np.percentile(chars_per_image, 90))
     ax.text(0.98, 0.95,
             f"P10={p10}  median={median_v:.0f}  P90={p90}\nmax={max(chars_per_image)}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=9,
+            transform=ax.transAxes, ha="right", va="top", fontsize=FS_ANNOT,
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
 
     fig.tight_layout()
@@ -460,7 +482,7 @@ def plot_split_overview(
     width = 0.25
     colors = ["#4C72B0", "#55A868", "#C44E52"]
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.5))
 
     for ax, vals, title, color in zip(
         axes,
@@ -471,14 +493,15 @@ def plot_split_overview(
         bars = ax.bar(x, vals, color=color, alpha=BAR_ALPHA, width=0.5)
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.01,
-                    f"{v:,}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+                    f"{v:,}", ha="center", va="bottom", fontsize=FS_ANNOT + 1, fontweight="bold")
         ax.set_xticks(x)
-        ax.set_xticklabels([s.capitalize() for s in splits], fontsize=11)
-        ax.set_title(title, fontsize=10)
+        ax.set_xticklabels([s.capitalize() for s in splits], fontsize=FS_TICK)
+        ax.set_title(title, fontsize=FS_TITLE - 1)
+        ax.tick_params(axis="y", labelsize=FS_TICK)
         ax.grid(axis="y", alpha=GRID_ALPHA)
         ax.set_ylim(0, max(vals) * 1.18)
 
-    fig.suptitle("Dataset split summary", fontsize=12)
+    fig.suptitle("Dataset split summary", fontsize=FS_SUPTITLE)
     fig.tight_layout()
     return savefig(fig, out_path)
 
@@ -535,7 +558,7 @@ def plot_augmentation_comparison(
     torch.manual_seed(seed)
     rare_img = rare_transform(img)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5.5))
+    fig, axes = plt.subplots(1, 3, figsize=(17, 6.5))
     panels = [
         (img,         "Original"),
         (classic_img, "Classic augmentation\n(ColorJitter ±0.2, applied to all training images)"),
@@ -543,10 +566,10 @@ def plot_augmentation_comparison(
     ]
     for ax, (im, title) in zip(axes, panels):
         ax.imshow(im)
-        ax.set_title(title, fontsize=10)
+        ax.set_title(title, fontsize=FS_TITLE - 1)
         ax.axis("off")
 
-    fig.suptitle(f"Augmentation strength comparison — {Path(image_path).name}", fontsize=12)
+    fig.suptitle(f"Augmentation strength comparison — {Path(image_path).name}", fontsize=FS_SUPTITLE)
     fig.tight_layout()
     return savefig(fig, out_path)
 
@@ -608,16 +631,16 @@ def plot_copy_paste_augmentation(
     n_before = len(labels)
     pasted = list(zip(new_boxes[n_before:], new_labels[n_before:]))
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 7.5))
+    fig, axes = plt.subplots(1, 2, figsize=(15, 8.5))
     axes[0].imshow(img_pil)
-    axes[0].set_title("Original", fontsize=11)
+    axes[0].set_title("Original", fontsize=FS_TITLE)
     axes[0].axis("off")
 
     axes[1].imshow(pasted_rgb)
-    axes[1].set_title(f"Copy-paste augmentation\n(+{len(pasted)} rare kanji pasted)", fontsize=11)
+    axes[1].set_title(f"Copy-paste augmentation\n(+{len(pasted)} rare kanji pasted)", fontsize=FS_TITLE)
     axes[1].axis("off")
 
-    jp_fp = _jp_font(size=13)
+    jp_fp = cjk_font_prop(size=17)
     for box, lbl in pasted:
         x1, y1, x2, y2 = box
         axes[1].add_patch(Rectangle(
@@ -625,12 +648,79 @@ def plot_copy_paste_augmentation(
         ))
         char = _label_to_char(lbl)
         # Glyph and codepoint are drawn separately: DroidSansFallback renders
-        # Latin/ASCII as tofu boxes, so the "U+XXXX" part needs the default font.
-        axes[1].text(x1, y1 - 8, char, color="red", fontsize=13,
+        # Latin/ASCII as tofu boxes, so the "U+XXXX" part needs the default
+        # font. They're stacked above/below the box (not side by side) so
+        # the codepoint text doesn't overlap the pasted glyph itself.
+        axes[1].text(x1, y1 - 8, char, color="red", fontsize=17,
                      fontproperties=jp_fp, ha="left", va="bottom")
-        axes[1].text(x1 + 18, y1 - 8, lbl, color="red", fontsize=8,
-                     ha="left", va="bottom")
+        axes[1].text(x1, y2 + 8, lbl, color="red", fontsize=FS_ANNOT,
+                     ha="left", va="top")
 
-    fig.suptitle(f"Rare-kanji copy-paste augmentation — {Path(image_path).name}", fontsize=12)
+    fig.suptitle(f"Rare-kanji copy-paste augmentation — {Path(image_path).name}", fontsize=FS_SUPTITLE)
+    fig.tight_layout()
+    return savefig(fig, out_path)
+
+
+# ---------------------------------------------------------------------------
+# 9. Handwriting-variant gallery — one column per character, many crops each
+# ---------------------------------------------------------------------------
+
+def plot_char_variant_gallery(
+    crops_by_label: "dict[str, list[np.ndarray]]",
+    out_path: "str | Path" = "char_variant_gallery.png",
+    cell_size: int = 72,
+    char_order: "list[str] | None" = None,
+) -> "Path | None":
+    """
+    Contact-sheet gallery of handwriting variants: one column per character,
+    stacked with as many example crops as were collected for it, shown in
+    the source pages' original color. Illustrates how much a single
+    kuzushiji character's shape varies by writer/context — the reason OCR
+    here has to learn shape variation rather than a fixed glyph per class.
+
+    Args:
+        crops_by_label: {U+XXXX label: [HxWx3 uint8 RGB crop, ...]}, e.g.
+                         from a targeted annotation scan (see
+                         scripts/analyse_dataset.py's
+                         _build_char_variant_crop_db).
+        cell_size:       side length (px) each crop is letterboxed into.
+        char_order:      display order (U+XXXX labels); defaults to most-
+                          illustrated character first.
+
+    Returns None (and prints why) if no label has any crops.
+    """
+    from PIL import Image
+
+    from utils.letterbox import letterbox_pil
+
+    labels = char_order or sorted(crops_by_label, key=lambda l: -len(crops_by_label.get(l, [])))
+    labels = [l for l in labels if crops_by_label.get(l)]
+    if not labels:
+        print("Char variant gallery: no crops available, skipping.")
+        return None
+
+    n_cols = len(labels)
+    max_rows = max(len(crops_by_label[l]) for l in labels)
+    label_h = int(cell_size * 0.7)  # header strip for the printed glyph
+
+    canvas = Image.new("RGB", (n_cols * cell_size, label_h + max_rows * cell_size), color=PAPER_BG_COLOR)
+    for col, lbl in enumerate(labels):
+        for row, crop_arr in enumerate(crops_by_label[lbl]):
+            crop_img = Image.fromarray(crop_arr).convert("RGB")
+            cell, _, _ = letterbox_pil(crop_img, cell_size, fill=PAPER_BG_COLOR)
+            canvas.paste(cell, (col * cell_size, label_h + row * cell_size))
+
+    fig_w = max(6.0, n_cols * cell_size / 72)
+    fig_h = max(4.0, (label_h + max_rows * cell_size) / 72)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.imshow(np.array(canvas))
+    ax.axis("off")
+
+    jp_fp = cjk_font_prop(size=max(24, cell_size // 2))
+    for col, lbl in enumerate(labels):
+        ax.text((col + 0.5) * cell_size, label_h * 0.5, _label_to_char(lbl),
+                 color="black", fontproperties=jp_fp, ha="center", va="center")
+
+    # fig.suptitle(f"Handwriting variation across {n_cols} characters", fontsize=13)
     fig.tight_layout()
     return savefig(fig, out_path)

@@ -100,11 +100,11 @@ from utils.training_helpers.logging_stage2 import (
 def get_warmup_settings(overrides: Optional[dict] = None) -> dict:
     overrides = overrides or {}
     return {
-        "epochs": int(WARMUP_EPOCHS),
-        "lambda_box": float(WARMUP_LAMBDA_BOX),
-        "lambda_delta": float(WARMUP_LAMBDA_DELTA),
-        "lambda_score": float(WARMUP_LAMBDA_SCORE),
-        "lambda_aux": float(WARMUP_LAMBDA_AUX),
+        "epochs": int(overrides.get("epochs", WARMUP_EPOCHS)),
+        "lambda_box": float(overrides.get("lambda_box", WARMUP_LAMBDA_BOX)),
+        "lambda_delta": float(overrides.get("lambda_delta", WARMUP_LAMBDA_DELTA)),
+        "lambda_score": float(overrides.get("lambda_score", WARMUP_LAMBDA_SCORE)),
+        "lambda_aux": float(overrides.get("lambda_aux", WARMUP_LAMBDA_AUX)),
         "train_context_encoder": True,
         "use_context_aux_for_loss": True,
         "raw_aux_weight": 0.0,
@@ -625,7 +625,14 @@ def train_stage2_hybrid(
         if not resume_model_ckpt.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_model_ckpt}")
         resume_ckpt = torch.load(resume_model_ckpt, map_location=DEVICE)
-        _load_compatible_state_dict(model, resume_ckpt["model_state_dict"])
+        resume_ckpt_context_mode = resume_ckpt.get("stage2_config", {}).get("context_mode")
+        resume_ckpt_vocab_hash = resume_ckpt.get("vocab_hash")
+        _load_compatible_state_dict(
+            model, resume_ckpt["model_state_dict"],
+            ckpt_context_mode=resume_ckpt_context_mode,
+            ckpt_vocab_hash=resume_ckpt_vocab_hash,
+            current_vocab_hash=vocab.content_hash(),
+        )
         print(f"Loaded resume checkpoint: {resume_model_ckpt}")
     set_trainable_modules_for_phase(model)
     trainable_params = get_trainable_parameters(model)
@@ -830,6 +837,7 @@ def train_stage2_hybrid(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "vocab_size": vocab.vocab_size,
+            "vocab_hash": vocab.content_hash(),
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
             "is_best": is_best,
@@ -872,6 +880,7 @@ def train_stage2_hybrid(
         "model": model,
         "best_val_score": float(best_val) if best_val is not None else None,
         "best_val_metrics": best_val_metrics,
+        "best_val_loss": best_val_metrics.get("val_loss") if best_val_metrics else None,
     }
 
 

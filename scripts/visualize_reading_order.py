@@ -46,11 +46,14 @@ sys.path.insert(0, str(ROOT))
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-from config import DATA_DIR, SUMINANET_BG_SCORE_GATE, SUMINANET_CER_SCORE_THRESH
+from config import DATA_DIR, SUMINANET_BG_SCORE_GATE, SUMINANET_CER_SCORE_THRESH, WEBSITE_CHECKPOINT_DIR
 from model.suminanet.roi.roi_ordering import ROIReadingOrder
 from utils.training_helpers.helper_translation import _detect_block_breaks, _detect_column_breaks
 
-SAMPLE_ANNOTATION = ROOT / "assets" / "data" / "annotations" / "200022050_00005_2.json"
+# SAMPLE_ANNOTATION = ROOT / "assets" / "data" / "annotations" / "200021660_00003_2.json"
+# SAMPLE_ANNOTATION = ROOT / "assets" / "data" / "annotations" / "200021660_00003_1.json"
+# SAMPLE_ANNOTATION = ROOT / "assets" / "data" / "annotations" / "brsk004_014.json"
+SAMPLE_ANNOTATION = ROOT / "assets" / "data" / "annotations" / "200021925_00012_2.json"
 OUTPUT_DIR = ROOT / "results" / "reading_order_viz"
 
 
@@ -192,7 +195,7 @@ def _run_model_panel(
     into the same original-image pixel space the GT boxes are already in.
     """
     from model.translation.infer import (
-        _DEFAULT_SUMINANET_CKPT,
+        WEBSITE_CHECKPOINT_DIR,
         _unletterbox_boxes,
         load_image,
         load_suminanet,
@@ -200,7 +203,7 @@ def _run_model_panel(
     )
     from train_stage2_suminanet import load_vocab
 
-    ckpt = Path(args.ckpt) if args.ckpt else _DEFAULT_SUMINANET_CKPT
+    ckpt = Path(args.ckpt) if args.ckpt else WEBSITE_CHECKPOINT_DIR
     print(f"Loading vocab + SuminaNet checkpoint: {ckpt}")
     vocab = load_vocab()
     model = load_suminanet(ckpt, vocab)

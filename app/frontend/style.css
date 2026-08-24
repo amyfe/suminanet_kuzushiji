@@ -434,8 +434,10 @@ a { color: inherit; }
   background: var(--paper);
   border: 1px solid var(--border);
   border-radius: 8px;
-  overflow: hidden;
+  overflow: visible;
   box-shadow: 0 12px 34px rgba(60, 46, 24, 0.1);
+  position: relative;
+  z-index: 0;
 }
 
 .panel-bar {
@@ -453,12 +455,16 @@ a { color: inherit; }
 
 .panel-body {
   padding: 1.4rem;
+  position: relative;
+  z-index: 1;
 }
 
 /* Image + box overlay */
 .image-overlay-container {
   position: relative;
   display: block;
+  overflow: visible;
+  z-index: 1;
 }
 
 .overlay-image {
@@ -497,6 +503,8 @@ a { color: inherit; }
   border-radius: 2px;
   cursor: default;
   transition: background 0.1s;
+  overflow: visible;
+  z-index: 3;
 }
 
 .char-box:hover {
@@ -528,6 +536,9 @@ a { color: inherit; }
   bottom: 100%;
   left: 50%;
   transform: translateX(-50%);
+  width: max-content;
+  max-width: min(22rem, calc(100vw - 2rem));
+  min-width: 0;
   background: var(--ink-2);
   color: #fff;
   padding: 3px 7px;
@@ -541,7 +552,8 @@ a { color: inherit; }
   display: flex;
   flex-direction: column;
   gap: 3px;
-  z-index: 10;
+  z-index: 30;
+  box-sizing: border-box;
 }
 
 .tooltip-main {
@@ -557,10 +569,15 @@ a { color: inherit; }
 
 .tooltip-alternates {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
+  max-width: 100%;
 }
 
 .tooltip-alt-char {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   font-family: var(--font-mono);
   color: #f2b34d;
   font-size: 0.7rem;
@@ -570,6 +587,7 @@ a { color: inherit; }
   border-radius: 3px;
   cursor: pointer;
   transition: background 0.12s;
+  white-space: nowrap;
 }
 
 .tooltip-alt-char:hover,

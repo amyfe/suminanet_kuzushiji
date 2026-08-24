@@ -94,6 +94,17 @@ const Home = () => {
             </button>
           ))}
         </div>
+        <p className="section-sub">
+          {t('home.furtherExamplesPre')}{' '}
+          <a
+            href="https://codh.rois.ac.jp/char-shape/"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {t('home.furtherExamplesLink')}
+          </a>
+          .
+        </p>
       </section>
 
       <div className="site-footer">

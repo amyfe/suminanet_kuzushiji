@@ -19,8 +19,11 @@ import sys
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import torch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,6 +44,9 @@ from config import (
     DEVICE,
     IMAGE_SIZE,
     SUMINANET_CER_SCORE_THRESH,
+    SUMINANET_CHECKPOINT_DIR,
+    GPU_LOAD_MAX_RETRIES,
+    GPU_LOAD_RETRY_DELAY_SEC,
     MAX_UPLOAD_SIZE_BYTES,
     TRANSCRIBE_INFERENCE_TIMEOUT_SEC,
     TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
@@ -55,11 +61,30 @@ from train_stage2_suminanet import load_vocab
 
 # ---------------------------------------------------------------------------
 # Global model state (loaded once at startup)
+#
+# On a shared GPU node (as opposed to a dedicated one), other processes can
+# saturate the card at any time -- so both a GPU-resident and a CPU-resident
+# copy of the model are kept loaded, and a per-request CUDA OOM falls back to
+# the CPU copy instead of failing the request (see transcribe()).
 # ---------------------------------------------------------------------------
 
-_state: dict = {"model": None, "vocab": None, "ready": False, "error": None}
+_state: dict = {
+    "model_gpu": None,
+    "model_cpu": None,
+    "vocab": None,
+    "ready": False,
+    "error": None,
+    "device_mode": None,       # "gpu" or "cpu-only", fixed once at startup
+    "last_gpu_oom_at": None,   # ISO timestamp of the most recent per-request CPU fallback, or None
+}
 
 _translation_pipeline = None
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
 def _get_translation_pipeline():
@@ -90,6 +115,33 @@ def _require_api_key(x_api_key: Optional[str] = Header(default=None)):
         raise HTTPException(401, detail="Missing or invalid API key.")
 
 
+def _warn_if_stale_checkpoint() -> None:
+    """Compare WEBSITE_CHECKPOINT_DIR's best_score against the live
+    SUMINANET_CHECKPOINT_DIR retrain's best_score and warn (does not block
+    startup) if the live retrain has since surpassed the pinned checkpoint --
+    WEBSITE_CHECKPOINT_DIR is a manually curated pointer to whichever
+    archived/live checkpoint is currently best-validated, and nothing else
+    keeps it in sync as new training runs complete.
+    """
+    live_best = Path(SUMINANET_CHECKPOINT_DIR) / "suminanet_best.pt"
+    if not live_best.exists() or live_best.resolve() == Path(WEBSITE_CHECKPOINT_DIR).resolve():
+        return
+    try:
+        served_score = torch.load(WEBSITE_CHECKPOINT_DIR, map_location="cpu", weights_only=False).get("best_score")
+        live_score = torch.load(live_best, map_location="cpu", weights_only=False).get("best_score")
+    except Exception as exc:
+        print(f"[WARNING] Could not compare checkpoint scores for staleness check: {exc}", flush=True)
+        return
+    if served_score is not None and live_score is not None and live_score > served_score:
+        print(
+            f"[WARNING] WEBSITE_CHECKPOINT_DIR ({WEBSITE_CHECKPOINT_DIR}) has "
+            f"best_score={served_score:.4f}, but the live retrain at {live_best} "
+            f"now scores higher ({live_score:.4f}). If this is a genuinely better "
+            f"model, update WEBSITE_CHECKPOINT_DIR in config.py to point at it.",
+            flush=True,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not os.environ.get("OPENROUTER_API_KEY"):
@@ -104,20 +156,46 @@ async def lifespan(app: FastAPI):
             "open to anyone. Set API_KEY in .env before deploying outside localhost.",
             flush=True,
         )
+    _warn_if_stale_checkpoint()
     print("Loading vocab...", flush=True)
     try:
         vocab = load_vocab()
-        print(f"Loading SuminaNet from {WEBSITE_CHECKPOINT_DIR}...", flush=True)
-        model = load_suminanet(WEBSITE_CHECKPOINT_DIR, vocab)
         _state["vocab"] = vocab
-        _state["model"] = model
+
+        # CPU copy first: always cheap to build and never touches CUDA, so it
+        # can't itself fail because of GPU contention from another process.
+        print(f"Loading CPU-resident SuminaNet from {WEBSITE_CHECKPOINT_DIR}...", flush=True)
+        _state["model_cpu"] = load_suminanet(WEBSITE_CHECKPOINT_DIR, vocab, device="cpu")
         _state["ready"] = True
-        print(f"Model ready on {DEVICE}.", flush=True)
+
+        if DEVICE == "cuda":
+            for attempt in range(1, GPU_LOAD_MAX_RETRIES + 1):
+                try:
+                    print(f"Loading GPU-resident SuminaNet (attempt {attempt}/{GPU_LOAD_MAX_RETRIES})...", flush=True)
+                    _state["model_gpu"] = load_suminanet(WEBSITE_CHECKPOINT_DIR, vocab, device=DEVICE)
+                    _state["device_mode"] = "gpu"
+                    print("Model ready on GPU (CPU fallback also loaded).", flush=True)
+                    break
+                except Exception as exc:
+                    is_oom = _is_cuda_oom(exc)
+                    reason = "CUDA OOM (likely another process on this shared node)" if is_oom else f"unexpected error: {exc}"
+                    print(f"[WARNING] GPU load attempt {attempt}/{GPU_LOAD_MAX_RETRIES} failed ({reason}).", flush=True)
+                    if not is_oom:
+                        break  # not transient contention -- retrying won't help
+                    if attempt < GPU_LOAD_MAX_RETRIES:
+                        await asyncio.sleep(GPU_LOAD_RETRY_DELAY_SEC)
+            if _state["device_mode"] != "gpu":
+                _state["device_mode"] = "cpu-only"
+                print("[WARNING] Could not load the model onto the GPU -- serving from "
+                      "CPU only until the next restart.", flush=True)
+        else:
+            _state["device_mode"] = "cpu-only"
+            print("Model ready on CPU (no CUDA device available).", flush=True)
     except Exception as exc:
         _state["error"] = str(exc)
         print(f"[ERROR] Model failed to load: {exc}", flush=True)
     yield
-    # cleanup (nothing to do for a CPU model)
+    # cleanup (nothing to do for CPU/GPU tensors -- process exit reclaims them)
 
 
 app = FastAPI(title="Kuzushiji Transcription API", lifespan=lifespan)
@@ -197,8 +275,9 @@ _transcribe_request_log: dict[str, deque] = defaultdict(deque)
 def health():
     return {
         "ready": _state["ready"],
-        "device": str(DEVICE),
+        "device": _state["device_mode"] or str(DEVICE),
         "error": _state["error"],
+        "last_gpu_oom_fallback_at": _state["last_gpu_oom_at"],
     }
 
 
@@ -235,12 +314,11 @@ async def transcribe(
     except Exception as exc:
         raise HTTPException(400, detail=f"Could not decode image: {exc}")
 
-    inference_start = time.perf_counter()
-    try:
-        result = await asyncio.wait_for(
+    async def _run_on(model):
+        return await asyncio.wait_for(
             asyncio.to_thread(
                 run_inference,
-                _state["model"],
+                model,
                 image_tensor,
                 _state["vocab"],
                 orientation=orientation,
@@ -248,14 +326,40 @@ async def transcribe(
             ),
             timeout=TRANSCRIBE_INFERENCE_TIMEOUT_SEC,
         )
+
+    inference_start = time.perf_counter()
+    primary_model = _state["model_gpu"] if _state["model_gpu"] is not None else _state["model_cpu"]
+    try:
+        result = await _run_on(primary_model)
     except asyncio.TimeoutError:
         raise HTTPException(
             504,
             detail=f"Inference timed out after {TRANSCRIBE_INFERENCE_TIMEOUT_SEC}s.",
         )
-    except Exception:
-        logger.exception("run_inference failed")
-        raise HTTPException(500, detail="Transcription failed. Please try again.")
+    except Exception as exc:
+        # On a shared GPU node, another process saturating the card looks
+        # identical to a real bug from here -- only retry on CPU when it's
+        # actually a CUDA OOM and a CPU copy exists (i.e. we weren't already
+        # running on CPU).
+        if primary_model is not _state["model_cpu"] and _state["model_cpu"] is not None and _is_cuda_oom(exc):
+            _state["last_gpu_oom_at"] = datetime.now(timezone.utc).isoformat()
+            logger.warning(
+                "CUDA OOM during transcribe (likely GPU contention from another "
+                "process on this shared node) -- retrying on CPU."
+            )
+            try:
+                result = await _run_on(_state["model_cpu"])
+            except asyncio.TimeoutError:
+                raise HTTPException(
+                    504,
+                    detail=f"Inference timed out after {TRANSCRIBE_INFERENCE_TIMEOUT_SEC}s (CPU fallback).",
+                )
+            except Exception:
+                logger.exception("run_inference failed on CPU fallback")
+                raise HTTPException(500, detail="Transcription failed. Please try again.")
+        else:
+            logger.exception("run_inference failed")
+            raise HTTPException(500, detail="Transcription failed. Please try again.")
     logger.info("run_inference took %.2fs (%d chars)", time.perf_counter() - inference_start, result["n_chars"])
 
     # Map boxes from letterboxed model coords → original image coords

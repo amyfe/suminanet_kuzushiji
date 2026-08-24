@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@400;500;600;700;800&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f3ecdd;font-family:'Newsreader',Georgia,serif}
+textarea{font-family:inherit}
+@keyframes inkIn{from{opacity:0;filter:blur(7px);transform:translateY(9px)}to{opacity:1;filter:blur(0);transform:none}}
+</style>
+</helmet>
+
+<div style="min-height:100vh;background:#f3ecdd;background-image:radial-gradient(circle at 18% 10%,rgba(168,150,118,.10),transparent 40%),radial-gradient(circle at 84% 76%,rgba(150,120,86,.09),transparent 44%);color:#211d18">
+<div style="max-width:1280px;margin:0 auto">
+
+  <sc-if value="{{ isHome }}" hint-placeholder-val="{{ true }}">
+
+  <!-- nav -->
+  <header style="display:flex;align-items:center;justify-content:space-between;padding:24px 48px;border-bottom:1px solid rgba(33,29,24,.10)">
+    <div style="display:flex;align-items:center;gap:13px">
+      <span style="font-family:'Shippori Mincho',serif;font-weight:700;font-size:26px;color:#b23a2b;letter-spacing:.04em">墨奈</span>
+      <span style="display:flex;flex-direction:column;line-height:1.05">
+        <span style="font-family:'Shippori Mincho',serif;font-weight:600;font-size:19px;letter-spacing:.02em">Sumina</span>
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:8.5px;letter-spacing:.22em;color:#7c6a55">TRANSCRIBE · TRANSLATE EDO</span>
+      </span>
+    </div>
+    <nav style="display:flex;align-items:center;gap:32px;font-size:15px;color:#4a4035">
+      <span onClick="{{ goHow }}" style="cursor:pointer">How it works</span><span onClick="{{ goExamples }}" style="cursor:pointer">Examples</span><span onClick="{{ goAbout }}" style="cursor:pointer">About</span>
+      <span style="font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.04em;padding:10px 18px;border:1px solid #211d18;border-radius:2px;color:#211d18;cursor:pointer" onClick="{{ goTry }}">Try it →</span>
+    </nav>
+  </header>
+
+  <!-- hero -->
+  <section style="padding:64px 48px 32px;text-align:center">
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.28em;color:#b23a2b;margin-bottom:24px">墨 SUMI · BUILT ON SUMINANET 黒</div>
+    <h1 style="font-family:'Shippori Mincho',serif;font-weight:600;font-size:64px;line-height:1.08;margin:0 auto;max-width:14ch;letter-spacing:.005em">Read the hand of Edo.</h1>
+    <p style="font-size:21px;line-height:1.55;color:#5a4f41;max-width:52ch;margin:26px auto 0">Sumina reads the cursive <em>kuzushiji</em> in your scans of woodblock prints and manuscripts, lets you correct the draft, and renders four centuries of Japanese into English you can actually read.</p>
+    <div style="margin-top:32px;display:flex;justify-content:center">
+      <button onClick="{{ goTry }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;letter-spacing:.04em;color:#fbf7ec;background:#b23a2b;border:none;border-radius:3px;padding:14px 30px;cursor:pointer">Try it now →</button>
+    </div>
+  </section>
+
+  <!-- demo -->
+  <section style="padding:16px 48px 60px">
+    <div style="background:#fbf7ec;border:1px solid rgba(33,29,24,.13);border-radius:8px;box-shadow:0 2px 0 rgba(33,29,24,.04),0 16px 44px rgba(60,46,24,.11);overflow:hidden">
+
+      <!-- header -->
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid rgba(33,29,24,.10);background:#f4ecdb">
+        <div style="display:flex;align-items:center;gap:11px">
+          <span style="width:9px;height:9px;border-radius:50%;background:#b23a2b;display:inline-block;flex:none"></span>
+          <span onClick="{{ onBrowse }}" style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:#3c342a;cursor:pointer;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ fileName }}</span>
+          <sc-if value="{{ isSample }}" hint-placeholder-val="{{ true }}">
+            <span onClick="{{ onBrowse }}" style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:#9b8a72;cursor:pointer">— drop or click to replace</span>
+          </sc-if>
+          <sc-if value="{{ isUpload }}" hint-placeholder-val="{{ false }}">
+            <span onClick="{{ resetSample }}" style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:#b23a2b;cursor:pointer">↺ use sample</span>
+          </sc-if>
+        </div>
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.12em;color:{{ stepColorA }}">{{ stepLabelA }}</span>
+      </div>
+
+      <!-- panels -->
+      <div style="display:flex;align-items:stretch;gap:0;padding:30px 24px">
+
+        <!-- original / drop zone -->
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;padding:0 16px">
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.2em;color:#9b8a72;margin-bottom:18px">ORIGINAL · 原文</div>
+          <div onDragOver="{{ onDragOver }}" onDragLeave="{{ onDragLeave }}" onDrop="{{ onDrop }}" onClick="{{ onBrowse }}" title="Drop a scan, or click to browse" style="position:relative;cursor:pointer;background:#efe3c8;background-image:linear-gradient(105deg,rgba(120,96,60,.07),transparent 60%),repeating-linear-gradient(90deg,rgba(120,96,60,.05) 0 1px,transparent 1px 4px);border:1px solid rgba(120,96,60,.28);border-radius:3px;padding:24px 22px;box-shadow:inset 0 0 30px rgba(150,120,70,.14)">
+
+            <sc-if value="{{ isSample }}" hint-placeholder-val="{{ true }}">
+              <div style="display:flex;flex-direction:row;gap:7px">
+                <sc-for list="{{ cols }}" as="col" hint-placeholder-count="3">
+                  <div style="display:flex;flex-direction:column;gap:3px">
+                    <sc-for list="{{ col }}" as="ch" hint-placeholder-count="3">
+                      <span style="position:relative;display:grid;place-items:center;width:40px;height:45px;font-family:'Shippori Mincho',serif;font-weight:500;font-size:30px;color:#221c12;line-height:1">{{ ch }}<span style="{{ boxA }}"></span></span>
+                    </sc-for>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ isUpload }}" hint-placeholder-val="{{ false }}">
+              <div style="position:relative;line-height:0">
+                {{ uploadedImg }}
+                <sc-if value="{{ aTrans }}" hint-placeholder-val="{{ true }}">
+                  <div style="position:absolute;inset:0;pointer-events:none">
+                    <sc-for list="{{ detBoxStyles }}" as="bx" hint-placeholder-count="8">
+                      <span style="{{ bx }}"></span>
+                    </sc-for>
+                  </div>
+                </sc-if>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ dragOver }}" hint-placeholder-val="{{ false }}">
+              <div style="position:absolute;inset:0;display:grid;place-items:center;background:rgba(251,247,236,.9);border:2px dashed #b23a2b;border-radius:3px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;letter-spacing:.06em;color:#b23a2b">DROP SCAN TO UPLOAD</div>
+            </sc-if>
+          </div>
+
+          <sc-if value="{{ isSample }}" hint-placeholder-val="{{ true }}">
+            <div style="font-family:'Shippori Mincho',serif;font-size:12.5px;color:#8a7860;margin-top:15px">{{ curCaption }}</div>
+          </sc-if>
+          <sc-if value="{{ isUpload }}" hint-placeholder-val="{{ false }}">
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:#8a7860;margin-top:15px">your scan · click to replace</div>
+          </sc-if>
+
+          <input ref="{{ fileRef }}" onChange="{{ onFile }}" type="file" accept="image/*" style="display:none" />
+        </div>
+
+        <div style="display:flex;align-items:center;padding:0 4px;color:{{ arrow1ColorA }};font-size:23px;transition:color .4s">→</div>
+
+        <!-- transcription -->
+        <div style="flex:1.25;min-width:0;display:flex;flex-direction:column;padding:0 16px">
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.2em;color:#9b8a72;margin-bottom:18px;text-align:center">TRANSCRIPTION · 翻刻</div>
+          <sc-if value="{{ aTrans }}" hint-placeholder-val="{{ true }}">
+            <div style="animation:inkIn .55s ease both">
+              <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#b23a2b;letter-spacing:.1em;margin-bottom:7px">{{ transLabel }}</div>
+              <textarea value="{{ textA }}" onChange="{{ onTextA }}" rows="2" placeholder="Type or correct the reading…" style="width:100%;resize:none;font-family:'Shippori Mincho',serif;font-size:23px;line-height:1.5;color:#221c12;background:#fff;border:1px solid rgba(33,29,24,.22);border-radius:4px;padding:12px 14px;outline:none"></textarea>
+              <sc-if value="{{ isSample }}" hint-placeholder-val="{{ true }}">
+                <div style="margin-top:15px;border-top:1px dashed rgba(33,29,24,.18);padding-top:13px">
+                  <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#9b8a72;letter-spacing:.18em;margin-bottom:7px">ROMAJI</div>
+                  <sc-for list="{{ romaji }}" as="r" hint-placeholder-count="3">
+                    <div style="font-family:'Newsreader',serif;font-style:italic;font-size:17px;color:#5a4f41;line-height:1.55">{{ r }}</div>
+                  </sc-for>
+                </div>
+              </sc-if>
+              <sc-if value="{{ isUpload }}" hint-placeholder-val="{{ false }}">
+                <div style="margin-top:14px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;line-height:1.5;color:#9b8a72">Detection boxes are illustrative. Connect the SuminaNet backend to auto-read your own scan — then this field fills with the draft.</div>
+              </sc-if>
+            </div>
+          </sc-if>
+          <sc-if value="{{ aNotTrans }}" hint-placeholder-val="{{ true }}">
+            <div style="flex:1;display:grid;place-items:center;border:1px dashed rgba(33,29,24,.2);border-radius:5px;min-height:160px;padding:22px;text-align:center;color:#9b8a72;font-size:14.5px">Press <b style="color:#b23a2b">Transcribe</b> to detect every character, then edit the draft.</div>
+          </sc-if>
+        </div>
+
+        <div style="display:flex;align-items:center;padding:0 4px;color:{{ arrow2ColorA }};font-size:23px;transition:color .4s">→</div>
+
+        <!-- english -->
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;padding:0 16px">
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.2em;color:#9b8a72;margin-bottom:18px;text-align:center">ENGLISH · 英訳</div>
+          <sc-if value="{{ aDone }}" hint-placeholder-val="{{ true }}">
+            <sc-if value="{{ isSample }}" hint-placeholder-val="{{ true }}">
+              <div style="animation:inkIn .6s ease both;background:#fff;border:1px solid rgba(33,29,24,.13);border-left:3px solid #b23a2b;border-radius:4px;padding:18px">
+                <sc-for list="{{ english }}" as="e" hint-placeholder-count="3">
+                  <div style="font-family:'Newsreader',serif;font-size:22px;line-height:1.5;color:#221c12">{{ e }}</div>
+                </sc-for>
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#9b8a72;margin-top:15px;letter-spacing:.04em">{{ curCite }}</div>
+              </div>
+            </sc-if>
+            <sc-if value="{{ isUpload }}" hint-placeholder-val="{{ false }}">
+              <div style="animation:inkIn .6s ease both;background:#fff;border:1px solid rgba(33,29,24,.13);border-left:3px solid #b23a2b;border-radius:4px;padding:18px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;line-height:1.6;color:#6a5d4c">Demo build. Wire the Python backend to translate your own scan; the Bashō sample is fully wired end-to-end as a reference.</div>
+            </sc-if>
+          </sc-if>
+          <sc-if value="{{ aNotDone }}" hint-placeholder-val="{{ true }}">
+            <div style="flex:1;display:grid;place-items:center;border:1px dashed rgba(33,29,24,.2);border-radius:5px;min-height:160px;padding:22px;text-align:center;color:#9b8a72;font-size:14.5px">English appears here once you translate.</div>
+          </sc-if>
+        </div>
+      </div>
+
+      <!-- actions -->
+      <div style="display:flex;align-items:center;gap:13px;padding:17px 24px;border-top:1px solid rgba(33,29,24,.10);background:#f4ecdb">
+        <sc-if value="{{ aIdle }}" hint-placeholder-val="{{ true }}">
+          <button onClick="{{ transcribeA }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;letter-spacing:.04em;color:#fbf7ec;background:#b23a2b;border:none;border-radius:3px;padding:12px 24px;cursor:pointer">Transcribe</button>
+          <button onClick="{{ directA }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#3c342a;background:transparent;border:1px solid rgba(33,29,24,.3);border-radius:3px;padding:12px 22px;cursor:pointer">Translate directly →</button>
+          <span style="margin-left:auto;font-size:13.5px;font-style:italic;color:#8a7860">{{ idleHint }}</span>
+        </sc-if>
+        <sc-if value="{{ aTransOnly }}" hint-placeholder-val="{{ true }}">
+          <button onClick="{{ translateA }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;letter-spacing:.04em;color:#fbf7ec;background:#b23a2b;border:none;border-radius:3px;padding:12px 24px;cursor:pointer">Translate</button>
+          <button onClick="{{ resetA }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#7c6a55;background:transparent;border:none;cursor:pointer">↺ Start over</button>
+          <span style="margin-left:auto;font-size:13.5px;font-style:italic;color:#8a7860">Looks right? Tweak the draft above, then translate.</span>
+        </sc-if>
+        <sc-if value="{{ aDone }}" hint-placeholder-val="{{ true }}">
+          <button onClick="{{ resetA }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#3c342a;background:transparent;border:1px solid rgba(33,29,24,.3);border-radius:3px;padding:12px 22px;cursor:pointer">↺ Start over</button>
+          <span style="margin-left:auto;font-size:13.5px;font-style:italic;color:#8a7860">Original → corrected reading → English, in one pass.</span>
+        </sc-if>
+      </div>
+    </div>
+  </section>
+
+  <!-- how it works -->
+  <section id="how" style="padding:54px 48px 64px;border-top:1px solid rgba(33,29,24,.10)">
+    <h2 style="font-family:'Shippori Mincho',serif;font-weight:600;font-size:32px;text-align:center;margin:0 0 44px">How it works</h2>
+    <div style="display:flex;gap:32px">
+      <sc-for list="{{ steps }}" as="s" hint-placeholder-count="3">
+        <div style="flex:1;text-align:center">
+          <div style="font-family:'Shippori Mincho',serif;font-size:32px;color:#b23a2b;margin-bottom:15px">{{ s.kanji }}</div>
+          <div style="font-family:'Shippori Mincho',serif;font-weight:600;font-size:20px;margin-bottom:10px">{{ s.title }}</div>
+          <div style="font-size:15.5px;line-height:1.55;color:#5a4f41;max-width:30ch;margin:0 auto">{{ s.body }}</div>
+        </div>
+      </sc-for>
+    </div>
+  </section>
+
+  <!-- examples -->
+  <section id="examples" style="padding:58px 48px 18px;border-top:1px solid rgba(33,29,24,.10)">
+    <div style="text-align:center">
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.26em;color:#b23a2b;margin-bottom:16px">SELECT A TEXT · 用例</div>
+      <h2 style="font-family:'Shippori Mincho',serif;font-weight:600;font-size:32px;margin:0 0 12px">Examples to try</h2>
+      <p style="font-size:17px;line-height:1.5;color:#5a4f41;max-width:50ch;margin:0 auto">Public-domain Edo-period verse. Pick one and it opens in the workspace, ready to transcribe and translate.</p>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:22px;margin-top:40px">
+      <sc-for list="{{ galleryItems }}" as="ex" hint-placeholder-count="6">
+        <div onClick="{{ ex.open }}" style="cursor:pointer;background:#fbf7ec;border:1px solid rgba(33,29,24,.13);border-radius:8px;overflow:hidden;box-shadow:0 2px 0 rgba(33,29,24,.03);transition:transform .18s ease,box-shadow .18s ease" style-hover="transform:translateY(-3px);box-shadow:0 16px 34px rgba(60,46,24,.15)">
+          <div style="padding:26px;display:flex;justify-content:center;align-items:center;min-height:180px;background:#efe3c8;background-image:linear-gradient(105deg,rgba(120,96,60,.06),transparent 60%),repeating-linear-gradient(90deg,rgba(120,96,60,.04) 0 1px,transparent 1px 5px);border-bottom:1px solid rgba(120,96,60,.22)">
+            <div style="background:#f3ead2;border:1px solid rgba(120,96,60,.28);border-radius:2px;padding:16px 13px;box-shadow:inset 0 0 22px rgba(150,120,70,.16)">
+              <div style="display:flex;flex-direction:row;gap:5px">
+                <sc-for list="{{ ex.thumbCols }}" as="col" hint-placeholder-count="3">
+                  <div style="display:flex;flex-direction:column;gap:2px">
+                    <sc-for list="{{ col }}" as="ch" hint-placeholder-count="4">
+                      <span style="display:grid;place-items:center;width:25px;height:28px;font-family:'Shippori Mincho',serif;font-size:19px;color:#221c12;line-height:1">{{ ch }}</span>
+                    </sc-for>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+          <div style="padding:16px 18px">
+            <div style="font-family:'Shippori Mincho',serif;font-weight:600;font-size:17px;margin-bottom:4px">{{ ex.en_title }}</div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:#8a7860;letter-spacing:.03em">{{ ex.author }} · {{ ex.year }}</div>
+            <div style="margin-top:11px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.04em;color:#b23a2b">Open in workspace →</div>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+  </section>
+
+  <!-- about -->
+  <section id="about" style="background:#efe5cf;background-image:radial-gradient(circle at 82% 22%,rgba(150,120,86,.12),transparent 52%);padding:76px 48px;border-top:1px solid rgba(33,29,24,.10)">
+    <div style="display:flex;gap:56px;align-items:center;flex-wrap:wrap">
+      <div style="flex:0 0 196px;display:flex;justify-content:center">
+        <div style="background:#f3ead2;border:1px solid rgba(120,96,60,.3);border-radius:3px;padding:32px 28px;box-shadow:inset 0 0 36px rgba(150,120,70,.16),0 14px 32px rgba(60,46,24,.12)">
+          <div style="writing-mode:vertical-rl;font-family:'Shippori Mincho',serif;font-weight:600;font-size:30px;line-height:2;color:#221c12;letter-spacing:.12em">古きを読み、<br>今に渡す</div>
+        </div>
+      </div>
+      <div style="flex:1;min-width:330px;max-width:62ch">
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.26em;color:#b23a2b;margin-bottom:18px">ABOUT · 沿革</div>
+        <h2 style="font-family:'Shippori Mincho',serif;font-weight:600;font-size:34px;line-height:1.2;margin:0 0 22px">Why Sumina exists</h2>
+        <p style="font-size:18px;line-height:1.62;color:#4a4035;margin:0 0 18px">Most people — even fluent readers of modern Japanese — cannot read <em>kuzushiji</em>, the flowing cursive in which nearly every Edo-period book, letter, and ledger was written. Centuries of literature, science, and ordinary life sit locked behind a hand almost no one is trained to decipher.</p>
+        <p style="font-size:18px;line-height:1.62;color:#4a4035;margin:0 0 26px">Sumina pairs <b>SuminaNet</b>, an in-house character-recognition model inspired by KuroNet — the pioneering system built by Tarin Clanuwat and collaborators — with a human correction step and translation, so a scan becomes a reading, and a reading becomes English. Made for researchers, students, and anyone curious enough to look closely.</p>
+        <div style="border-top:1px dashed rgba(33,29,24,.2);padding-top:18px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;line-height:1.75;color:#7c6a55">
+          墨奈 Sumina — 幸 by Amina Felic.<br>
+          The name fuses 墨 <span style="color:#3c342a">sumi</span> (“ink”, after KuroNet’s 黒 <span style="color:#3c342a">kuro</span>, “black”) with <span style="color:#3c342a">Amina</span>; 幸 <span style="color:#3c342a">sachi</span> (“fortune”) for Felic.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- footer -->
+  <footer style="margin-top:58px;padding:28px 48px;border-top:1px solid rgba(33,29,24,.10);display:flex;align-items:center;justify-content:space-between;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#8a7860">
+    <span>墨奈 Sumina — 幸 by Amina Felic</span>
+    <span>Recognition powered by SuminaNet, inspired by KuroNet (Clanuwat et al.)</span>
+  </footer>
+
+  </sc-if>
+
+  <!-- ============================ TRY IT WORKSPACE ============================ -->
+  <sc-if value="{{ isTry }}" hint-placeholder-val="{{ false }}">
+
+    <header style="display:flex;align-items:center;justify-content:space-between;padding:20px 48px;border-bottom:1px solid rgba(33,29,24,.10)">
+      <div onClick="{{ goHome }}" style="display:flex;align-items:center;gap:13px;cursor:pointer">
+        <span style="font-family:'Shippori Mincho',serif;font-weight:700;font-size:24px;color:#b23a2b;letter-spacing:.04em">墨奈</span>
+        <span style="font-family:'Shippori Mincho',serif;font-weight:600;font-size:18px">Sumina</span>
+      </div>
+      <nav style="display:flex;align-items:center;gap:24px;font-size:14px;color:#4a4035">
+        <span onClick="{{ goHome }}" style="cursor:pointer">← Home</span>
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.12em;padding:6px 13px;border-radius:999px;background:#efe3c8;color:{{ stepColorA }}">{{ stepLabelA }}</span>
+      </nav>
+    </header>
+
+    <div style="padding:36px 48px 72px">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px">
+        <h1 style="font-family:'Shippori Mincho',serif;font-weight:600;font-size:30px;margin:0">Workspace</h1>
+        <span style="font-size:14px;color:#8a7860;font-style:italic">{{ fileName }}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:13px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.14em;margin:18px 0 30px">
+        <span style="color:{{ ws1Color }}">① UPLOAD</span><span style="color:#cdbfa6">——</span>
+        <span style="color:{{ ws2Color }}">② TRANSCRIBE &amp; CORRECT</span><span style="color:#cdbfa6">——</span>
+        <span style="color:{{ ws3Color }}">③ TRANSLATE</span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:minmax(0,0.85fr) minmax(0,1.12fr);gap:30px;align-items:start">
+
+        <!-- LEFT : scan -->
+        <div style="background:#fbf7ec;border:1px solid rgba(33,29,24,.13);border-radius:8px;overflow:hidden;box-shadow:0 12px 34px rgba(60,46,24,.10)">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:13px 18px;background:#f4ecdb;border-bottom:1px solid rgba(33,29,24,.1)">
+            <span style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.2em;color:#9b8a72">ORIGINAL · 原文</span>
+            <div style="display:flex;gap:13px;font-family:'IBM Plex Mono',monospace;font-size:10.5px">
+              <span onClick="{{ onBrowse }}" style="color:#b23a2b;cursor:pointer">Replace</span>
+              <sc-if value="{{ isUpload }}" hint-placeholder-val="{{ false }}"><span onClick="{{ resetSample }}" style="color:#9b8a72;cursor:pointer">↺ sample</span></sc-if>
+            </div>
+          </div>
+          <div onDragOver="{{ onDragOver }}" onDragLeave="{{ onDragLeave }}" onDrop="{{ onDrop }}" onClick="{{ onBrowse }}" title="Drop a scan, or click to browse" style="position:relative;cursor:pointer;min-height:380px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:30px;background:#efe3c8;background-image:linear-gradient(105deg,rgba(120,96,60,.06),transparent 60%),repeating-linear-gradient(90deg,rgba(120,96,60,.04) 0 1px,transparent 1px 5px)">
+
+            <sc-if value="{{ isSample }}" hint-placeholder-val="{{ true }}">
+              <div style="background:#f3ead2;border:1px solid rgba(120,96,60,.3);border-radius:3px;padding:26px 24px;box-shadow:inset 0 0 36px rgba(150,120,70,.16)">
+                <div style="display:flex;flex-direction:row;gap:9px">
+                  <sc-for list="{{ cols }}" as="col" hint-placeholder-count="3">
+                    <div style="display:flex;flex-direction:column;gap:4px">
+                      <sc-for list="{{ col }}" as="ch" hint-placeholder-count="3">
+                        <span style="position:relative;display:grid;place-items:center;width:50px;height:56px;font-family:'Shippori Mincho',serif;font-weight:500;font-size:38px;color:#221c12;line-height:1">{{ ch }}<span style="{{ boxA }}"></span></span>
+                      </sc-for>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+              <div style="font-family:'Shippori Mincho',serif;font-size:12.5px;color:#8a7860;text-align:center">{{ curCaption }} — drop your own scan to replace</div>
+            </sc-if>
+
+            <sc-if value="{{ isUpload }}" hint-placeholder-val="{{ false }}">
+              <div style="position:relative;line-height:0">
+                {{ uploadedImgLg }}
+                <sc-if value="{{ aTrans }}" hint-placeholder-val="{{ true }}">
+                  <div style="position:absolute;inset:0;pointer-events:none">
+                    <sc-for list="{{ detBoxStyles }}" as="bx" hint-placeholder-count="8"><span style="{{ bx }}"></span></sc-for>
+                  </div>
+                </sc-if>
+              </div>
+              <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:#8a7860">your scan · click to replace</div>
+            </sc-if>
+
+            <sc-if value="{{ dragOver }}" hint-placeholder-val="{{ false }}">
+              <div style="position:absolute;inset:0;display:grid;place-items:center;background:rgba(251,247,236,.92);border:2px dashed #b23a2b;font-family:'IBM Plex Mono',monospace;font-size:13px;letter-spacing:.06em;color:#b23a2b">DROP SCAN TO UPLOAD</div>
+            </sc-if>
+          </div>
+          <input ref="{{ fileRef }}" onChange="{{ onFile }}" type="file" accept="image/*" style="display:none" />
+        </div>
+
+        <!-- RIGHT : results -->
+        <div style="display:flex;flex-direction:column;gap:20px">
+
+          <!-- transcription -->
+          <div style="background:#fff;border:1px solid rgba(33,29,24,.13);border-radius:8px;padding:22px;box-shadow:0 12px 34px rgba(60,46,24,.08)">
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.2em;color:#9b8a72;margin-bottom:14px">TRANSCRIPTION · 翻刻</div>
+            <sc-if value="{{ aTrans }}" hint-placeholder-val="{{ true }}">
+              <div style="animation:inkIn .5s ease both">
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#b23a2b;letter-spacing:.1em;margin-bottom:8px">{{ transLabel }}</div>
+                <textarea value="{{ textA }}" onChange="{{ onTextA }}" rows="3" placeholder="Type or correct the reading…" style="width:100%;resize:vertical;font-family:'Shippori Mincho',serif;font-size:27px;line-height:1.55;color:#221c12;background:#fbf7ec;border:1px solid rgba(33,29,24,.2);border-radius:5px;padding:14px 16px;outline:none"></textarea>
+                <sc-if value="{{ isSample }}" hint-placeholder-val="{{ true }}">
+                  <div style="margin-top:16px;border-top:1px dashed rgba(33,29,24,.16);padding-top:14px">
+                    <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#9b8a72;letter-spacing:.18em;margin-bottom:8px">ROMAJI</div>
+                    <sc-for list="{{ romaji }}" as="r" hint-placeholder-count="3"><div style="font-family:'Newsreader',serif;font-style:italic;font-size:18px;color:#5a4f41;line-height:1.6">{{ r }}</div></sc-for>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ isUpload }}" hint-placeholder-val="{{ false }}">
+                  <div style="margin-top:14px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;line-height:1.55;color:#9b8a72">Boxes are illustrative. Connect the SuminaNet backend to auto-read your scan into this field.</div>
+                </sc-if>
+              </div>
+            </sc-if>
+            <sc-if value="{{ aNotTrans }}" hint-placeholder-val="{{ true }}">
+              <div style="display:grid;place-items:center;border:1px dashed rgba(33,29,24,.2);border-radius:6px;min-height:130px;padding:24px;text-align:center;color:#9b8a72;font-size:15px">Run <b style="color:#b23a2b">Transcribe</b> to generate the editable draft.</div>
+            </sc-if>
+          </div>
+
+          <!-- english -->
+          <sc-if value="{{ aDone }}" hint-placeholder-val="{{ false }}">
+            <div style="background:#fff;border:1px solid rgba(33,29,24,.13);border-left:3px solid #b23a2b;border-radius:8px;padding:22px;animation:inkIn .55s ease both;box-shadow:0 12px 34px rgba(60,46,24,.08)">
+              <div style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.2em;color:#9b8a72;margin-bottom:14px">ENGLISH · 英訳</div>
+              <sc-if value="{{ isSample }}" hint-placeholder-val="{{ true }}">
+                <sc-for list="{{ english }}" as="e" hint-placeholder-count="3"><div style="font-family:'Newsreader',serif;font-size:24px;line-height:1.5;color:#221c12">{{ e }}</div></sc-for>
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#9b8a72;margin-top:16px;letter-spacing:.04em">{{ curCite }}</div>
+              </sc-if>
+              <sc-if value="{{ isUpload }}" hint-placeholder-val="{{ false }}">
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;line-height:1.6;color:#6a5d4c">Demo build — wire the Python backend to translate your scan. The Bashō sample is fully wired as a reference.</div>
+              </sc-if>
+            </div>
+          </sc-if>
+
+          <!-- actions -->
+          <div style="display:flex;align-items:center;gap:13px;flex-wrap:wrap">
+            <sc-if value="{{ aIdle }}" hint-placeholder-val="{{ true }}">
+              <button onClick="{{ transcribeA }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#fbf7ec;background:#b23a2b;border:none;border-radius:3px;padding:13px 26px;cursor:pointer">Transcribe</button>
+              <button onClick="{{ directA }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#3c342a;background:transparent;border:1px solid rgba(33,29,24,.3);border-radius:3px;padding:13px 24px;cursor:pointer">Translate directly →</button>
+            </sc-if>
+            <sc-if value="{{ aTransOnly }}" hint-placeholder-val="{{ false }}">
+              <button onClick="{{ translateA }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#fbf7ec;background:#b23a2b;border:none;border-radius:3px;padding:13px 26px;cursor:pointer">Translate</button>
+              <button onClick="{{ resetA }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#7c6a55;background:transparent;border:none;cursor:pointer">↺ Start over</button>
+            </sc-if>
+            <sc-if value="{{ aDone }}" hint-placeholder-val="{{ false }}">
+              <button onClick="{{ resetA }}" style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#3c342a;background:transparent;border:1px solid rgba(33,29,24,.3);border-radius:3px;padding:13px 24px;cursor:pointer">↺ Start over</button>
+            </sc-if>
+          </div>
+
+          <!-- export -->
+          <sc-if value="{{ aDone }}" hint-placeholder-val="{{ false }}">
+            <div style="display:flex;align-items:center;gap:12px;padding:16px 18px;background:#f4ecdb;border:1px solid rgba(33,29,24,.12);border-radius:8px;flex-wrap:wrap">
+              <span style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.2em;color:#9b8a72">EXPORT</span>
+              <button onClick="{{ copyResult }}" style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#3c342a;background:#fff;border:1px solid rgba(33,29,24,.2);border-radius:3px;padding:9px 16px;cursor:pointer;min-width:96px">{{ copyLabel }}</button>
+              <button onClick="{{ downloadTxt }}" style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#3c342a;background:#fff;border:1px solid rgba(33,29,24,.2);border-radius:3px;padding:9px 16px;cursor:pointer">Download .txt</button>
+              <button onClick="{{ exportPdf }}" style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#3c342a;background:#fff;border:1px solid rgba(33,29,24,.2);border-radius:3px;padding:9px 16px;cursor:pointer">Export PDF</button>
+            </div>
+          </sc-if>
+
+        </div>
+      </div>
+    </div>
+
+  </sc-if>
+
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  fileRef = React.createRef();
+  samples = [
+    { id: 'furuike', en_title: 'The Old Pond', author: '松尾芭蕉 · Bashō', year: 'c.1686', text: '古池や蛙飛び込む水の音',
+      romaji: ['furuike ya', 'kawazu tobikomu', 'mizu no oto'], english: ['An old pond—', 'a frog leaps in:', 'the sound of water.'] },
+    { id: 'natsukusa', en_title: 'Summer Grasses', author: '松尾芭蕉 · Bashō', year: '1689', text: '夏草や兵どもが夢の跡',
+      romaji: ['natsukusa ya', 'tsuwamonodomo ga', 'yume no ato'], english: ['Summer grasses—', 'all that remains', 'of warriors’ dreams.'] },
+    { id: 'shizukasa', en_title: 'Cicada in Stone', author: '松尾芭蕉 · Bashō', year: '1689', text: '閑さや岩にしみ入る蝉の声',
+      romaji: ['shizukasa ya', 'iwa ni shimiiru', 'semi no koe'], english: ['Such stillness—', 'sinking into the rocks,', 'a cicada’s cry.'] },
+    { id: 'asagao', en_title: 'Morning Glory', author: '加賀千代女 · Chiyo-jo', year: 'c.1740', text: '朝顔に釣瓶とられてもらひ水',
+      romaji: ['asagao ni', 'tsurube torarete', 'morai mizu'], english: ['A morning glory', 'has seized my well bucket—', 'I go to beg for water.'] },
+    { id: 'suzume', en_title: 'Little Sparrow', author: '小林一茶 · Issa', year: 'c.1819', text: '雀の子そこのけそこのけ御馬が通る',
+      romaji: ['suzume no ko', 'soko noke soko noke', 'o-uma ga tōru'], english: ['Little sparrow—', 'move aside, move aside!', 'the great horse passes.'] },
+    { id: 'nanakorobi', en_title: 'Fall Seven, Rise Eight', author: '江戸の諺 · Edo proverb', year: 'Edo period', text: '七転び八起き',
+      romaji: ['nana korobi', 'ya oki'], english: ['Fall down seven times,', 'rise up eight.'] },
+  ];
+  state = { view: 'home', sampleIdx: 0, stepA: 0, textA: '古池や蛙飛び込む水の音', uploadedSrc: null, fileName: 'furuike.jpg', dragOver: false, copied: false };
+
+  loadFile(f) {
+    if (!f || !f.type || f.type.indexOf('image') !== 0) return;
+    const r = new FileReader();
+    r.onload = () => this.setState({ uploadedSrc: r.result, fileName: f.name, stepA: 0, textA: '' });
+    r.readAsDataURL(f);
+  }
+  resetSample() {
+    this.setState({ uploadedSrc: null, fileName: 'basho_furuike.jpg', stepA: 0, textA: '古池や蛙飛び込む水の音' });
+  }
+  scrollToId(id) {
+    const el = document.getElementById(id);
+    if (el) window.scrollTo({ top: window.scrollY + el.getBoundingClientRect().top - 18, behavior: 'smooth' });
+  }
+  loadExample(i) {
+    const s = this.samples[i];
+    this.setState({ sampleIdx: i, textA: s.text, stepA: 0, uploadedSrc: null, fileName: s.id + '.jpg', view: 'try' });
+    window.scrollTo({ top: 0 });
+  }
+
+  renderVals() {
+    const cur = this.samples[this.state.sampleIdx] || this.samples[0];
+    const colsOf = (text, maxCols) => {
+      const ch = Array.from(text);
+      const numCols = Math.min(maxCols, Math.max(1, Math.ceil(ch.length / 3)));
+      const per = Math.ceil(ch.length / numCols);
+      const groups = [];
+      for (let i = 0; i < ch.length; i += per) groups.push(ch.slice(i, i + per));
+      return groups.reverse();
+    };
+    const cols = colsOf(cur.text, 3);
+    const romaji = cur.romaji;
+    const english = cur.english;
+    const curCaption = cur.author + ' · ' + cur.year;
+    const curCite = '— ' + cur.author;
+    const steps = [
+      { kanji: '一', title: 'Upload a scan', body: 'Drop in a photograph or scan of any woodblock print or handwritten manuscript — modern or Edo-era.' },
+      { kanji: '二', title: 'Transcribe & correct', body: 'SuminaNet detects each cursive character and proposes a reading. You review and fix anything it misjudged.' },
+      { kanji: '三', title: 'Translate', body: 'Get fluent English alongside the original and its romaji — ready to read, cite, or quote.' },
+    ];
+    const A = this.state.stepA;
+    const up = this.state.uploadedSrc;
+    const isSample = !up, isUpload = !!up;
+    const box = (on, color) => ({ position: 'absolute', inset: '-2px', border: '1.6px solid ' + (on ? color : 'transparent'), borderRadius: '2px', transition: 'border-color .5s ease', pointerEvents: 'none' });
+    const detRaw = [
+      { l: '50%', t: '7%',  w: '31%', h: '12%' }, { l: '52%', t: '21%', w: '27%', h: '11%' },
+      { l: '49%', t: '34%', w: '30%', h: '12%' }, { l: '52%', t: '48%', w: '27%', h: '11%' },
+      { l: '50%', t: '61%', w: '29%', h: '11%' }, { l: '16%', t: '10%', w: '31%', h: '12%' },
+      { l: '18%', t: '24%', w: '27%', h: '11%' }, { l: '15%', t: '38%', w: '30%', h: '12%' },
+      { l: '18%', t: '52%', w: '27%', h: '11%' }, { l: '17%', t: '66%', w: '28%', h: '11%' },
+    ];
+    const detBoxStyles = detRaw.map((b) => ({ position: 'absolute', left: b.l, top: b.t, width: b.w, height: b.h, border: '1.6px solid rgba(178,58,43,.8)', borderRadius: '2px', boxShadow: '0 0 0 1px rgba(255,255,255,.35)', animation: 'inkIn .5s ease both' }));
+
+    const buildResult = () => {
+      const head = ['墨奈 Sumina — transcription & translation', 'Source: ' + this.state.fileName, '', 'TRANSCRIPTION (翻刻):', this.state.textA || '(none)'];
+      const tail = isSample
+        ? ['', 'ROMAJI:', romaji.join(' / '), '', 'ENGLISH:', english.join('\n'), '', curCite]
+        : ['', '(Demo build — connect the SuminaNet / Python backend for romaji + English on your own scans.)'];
+      return head.concat(tail).join('\n');
+    };
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    return {
+      cols, romaji, english, steps,
+      textA: this.state.textA, onTextA: (e) => this.setState({ textA: e.target.value }),
+      aTrans: A >= 1, aDone: A >= 2, aIdle: A === 0, aTransOnly: A === 1, aNotTrans: A < 1, aNotDone: A < 2,
+      boxA: box(A >= 1, 'rgba(178,58,43,.6)'),
+      arrow1ColorA: A >= 1 ? '#b23a2b' : '#d8cbb0', arrow2ColorA: A >= 2 ? '#b23a2b' : '#d8cbb0',
+      stepLabelA: A === 0 ? 'READY' : A === 1 ? 'TRANSCRIBED' : 'TRANSLATED',
+      stepColorA: A === 0 ? '#9b8a72' : '#b23a2b',
+      transcribeA: () => this.setState({ stepA: 1 }),
+      translateA: () => this.setState({ stepA: 2 }),
+      directA: () => this.setState({ stepA: 2 }),
+      resetA: () => this.setState({ stepA: 0 }),
+      // upload
+      uploadedSrc: up,
+      uploadedImg: up ? React.createElement('img', { src: up, alt: 'uploaded scan', style: { display: 'block', maxWidth: '210px', maxHeight: '248px', borderRadius: '2px' } }) : null,
+      isSample, isUpload, dragOver: this.state.dragOver,
+      fileName: this.state.fileName, fileRef: this.fileRef, detBoxStyles,
+      transLabel: isSample ? (Array.from(cur.text).length + ' CHARACTERS · EDITABLE — CORRECT ANY MISREADS') : (detBoxStyles.length + ' REGIONS DETECTED · EDITABLE DRAFT'),
+      idleHint: isSample ? 'Sample loaded — or drop your own scan on the page at left.' : 'Your scan is loaded. Run detection to see regions.',
+      onBrowse: () => { if (this.fileRef.current) this.fileRef.current.click(); },
+      onFile: (e) => this.loadFile(e.target.files && e.target.files[0]),
+      onDrop: (e) => { e.preventDefault(); this.setState({ dragOver: false }); const dt = e.dataTransfer; this.loadFile(dt && dt.files && dt.files[0]); },
+      onDragOver: (e) => { e.preventDefault(); if (!this.state.dragOver) this.setState({ dragOver: true }); },
+      onDragLeave: (e) => { e.preventDefault(); this.setState({ dragOver: false }); },
+      resetSample: () => this.resetSample(),
+      // view switching
+      isHome: this.state.view === 'home', isTry: this.state.view === 'try',
+      goHome: () => this.setState({ view: 'home' }), goTry: () => this.setState({ view: 'try' }),
+      goHow: () => this.scrollToId('how'), goAbout: () => this.scrollToId('about'),
+      goExamples: () => this.scrollToId('examples'),
+      curCaption, curCite,
+      galleryItems: this.samples.map((s, i) => ({ id: s.id, en_title: s.en_title, author: s.author, year: s.year, thumbCols: colsOf(s.text, 4), open: () => this.loadExample(i) })),
+      // workspace
+      ws1Color: '#b23a2b', ws2Color: A >= 1 ? '#b23a2b' : '#c4b59a', ws3Color: A >= 2 ? '#b23a2b' : '#c4b59a',
+      uploadedImgLg: up ? React.createElement('img', { src: up, alt: 'uploaded scan', style: { display: 'block', maxWidth: '300px', maxHeight: '380px', borderRadius: '3px', boxShadow: '0 8px 24px rgba(0,0,0,.18)' } }) : null,
+      copyLabel: this.state.copied ? 'Copied ✓' : 'Copy text',
+      copyResult: () => {
+        const done = () => { this.setState({ copied: true }); setTimeout(() => this.setState({ copied: false }), 1600); };
+        const txt = buildResult();
+        if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(txt).then(done, done); } else { done(); }
+      },
+      downloadTxt: () => {
+        const blob = new Blob([buildResult()], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = (this.state.fileName.replace(/\.[^.]+$/, '') || 'sumina') + '-sumina.txt';
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      },
+      exportPdf: () => {
+        const body = isSample
+          ? '<p class="ja">' + esc(this.state.textA) + '</p><div class="lbl">ROMAJI</div>' + romaji.map((r) => '<p class="rom">' + esc(r) + '</p>').join('') + '<div class="lbl">ENGLISH</div>' + english.map((e) => '<p class="en">' + esc(e) + '</p>').join('') + '<p class="cite">' + esc(curCite) + '</p>'
+          : '<p class="ja">' + esc(this.state.textA) + '</p><p class="note">Demo build — connect the backend for romaji + English on your own scans.</p>';
+        const html = '<!doctype html><html><head><meta charset="utf-8"><title>Sumina export</title><style>@page{margin:48px}body{font-family:Georgia,"Times New Roman",serif;color:#211d18;padding:40px}h1{font-size:21px;letter-spacing:.02em;margin:0 0 4px}.src{font-family:monospace;font-size:11px;color:#8a7860;margin:0 0 28px}.ja{font-size:30px;line-height:1.65;margin:0 0 8px}.lbl{font-family:monospace;font-size:10px;letter-spacing:.2em;color:#9b8a72;margin:24px 0 6px}.rom{font-style:italic;font-size:16px;margin:2px 0;color:#5a4f41}.en{font-size:18px;margin:2px 0}.cite{font-family:monospace;font-size:11px;color:#9b8a72;margin-top:18px}.note{font-family:monospace;font-size:12px;color:#6a5d4c}</style></head><body><h1>墨奈 Sumina</h1><p class="src">Source: ' + esc(this.state.fileName) + '</p>' + body + '</body></html>';
+        const f = document.createElement('iframe');
+        f.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0';
+        document.body.appendChild(f);
+        const doc = f.contentWindow.document; doc.open(); doc.write(html); doc.close();
+        setTimeout(() => { try { f.contentWindow.focus(); f.contentWindow.print(); } catch (e) {} setTimeout(() => f.remove(), 1500); }, 400);
+      },
+    };
+  }
+}
+</script>
+</body>
+</html>

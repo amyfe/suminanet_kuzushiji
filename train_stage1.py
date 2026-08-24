@@ -206,8 +206,8 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
                     if raw_illus.shape[-2:] != (Hf, Wf):
                         raw_illus = F.interpolate(
                             raw_illus.float(), size=(Hf, Wf), mode="nearest"
-                        ).bool()
-                    illus_mask_feat = raw_illus  # (B, 1, Hf, Wf)
+                        )
+                    illus_mask_feat = raw_illus.bool()  # (B, 1, Hf, Wf)
 
                 # Compute losses with detailed tracking
                 loss_heatmap = focal_loss_heatmap(
@@ -324,6 +324,7 @@ def train_detector_stage(num_epochs=10, lr=None, checkpoint_dir=None, patience=3
         if patience > 0 and patience_ctr >= patience:
             print(f"Early stopping: no val improvement for {patience} epochs. best={best_val:.4f}")
             break
+        prune_to_keep_last_n(CHECKPOINT_DIR, keep=2)
     
     print(f"\n{'='*60}")
     print(f"Stage 1 training complete!")

@@ -17,8 +17,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+# Allow running as `python model/translation/infer.py` (not just
+# `python -m model.translation.infer`) — Python only puts this script's own
+# directory on sys.path, not the repo root, so the `config` import below
+# fails without this.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import torch
@@ -40,6 +47,7 @@ from model.suminanet.suminanet_recognizer import SuminaNetRecognizer
 from model.suminanet.roi.roi_ordering import infer_reading_orientation_from_boxes
 from train_stage2_suminanet import build_suminanet_model, load_vocab
 from utils.detection_utils import _extract_all_peaks
+from utils.letterbox import letterbox_pil, unletterbox_boxes as _unletterbox_boxes
 from utils.training_helpers.helper_stage2 import _normalize_orientation_label
 from utils.text_normalization import unicode_token_to_char
 
@@ -88,9 +96,19 @@ def _align_compile_keys(model_state: dict, ckpt_state: dict) -> dict:
     return out
 
 
-def load_suminanet(suminanet_ckpt: str | Path, vocab) -> torch.nn.Module:
-    model = build_suminanet_model(vocab, load_stage1_weights=False)
-    ckpt = torch.load(suminanet_ckpt, map_location=DEVICE)
+def load_suminanet(suminanet_ckpt: str | Path, vocab, device: str | torch.device = DEVICE) -> torch.nn.Module:
+    model = build_suminanet_model(vocab, load_stage1_weights=False, device=device)
+    ckpt = torch.load(suminanet_ckpt, map_location=device)
+    ckpt_vocab_hash = ckpt.get("vocab_hash")
+    current_vocab_hash = vocab.content_hash()
+    if ckpt_vocab_hash is not None and ckpt_vocab_hash != current_vocab_hash:
+        raise ValueError(
+            f"Vocab mismatch: checkpoint {suminanet_ckpt} was trained with "
+            f"vocab_hash='{ckpt_vocab_hash}' but the current vocab hashes to "
+            f"'{current_vocab_hash}'. Even when vocab_size matches, differing "
+            f"character-to-ID mappings would silently produce wrong predictions "
+            f"instead of failing loudly."
+        )
     state = ckpt.get("model_state_dict", ckpt)
     state = _align_compile_keys(model.state_dict(), state)
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -127,35 +145,9 @@ def load_image(
     img = Image.open(image_path).convert("RGB")
     orig_size = img.size  # PIL: (W, H)
     size = IMAGE_SIZE if isinstance(IMAGE_SIZE, int) else IMAGE_SIZE[0]
-    orig_w, orig_h = orig_size
-    scale  = size / max(orig_w, orig_h)
-    new_w  = round(orig_w * scale)
-    new_h  = round(orig_h * scale)
-    img_resized = img.resize((new_w, new_h), Image.LANCZOS)
-    pad_x  = (size - new_w) // 2
-    pad_y  = (size - new_h) // 2
-    canvas = Image.new("RGB", (size, size), (128, 128, 128))
-    canvas.paste(img_resized, (pad_x, pad_y))
+    canvas, scale, pad = letterbox_pil(img, size)
     tensor = _TRANSFORM(canvas).unsqueeze(0)
-    return tensor, orig_size, scale, (pad_x, pad_y)
-
-
-def _unletterbox_boxes(
-    chars: list[dict],
-    orig_size: tuple[int, int],
-    scale: float,
-    pad: tuple[int, int],
-) -> None:
-    """Convert boxes in-place from letterboxed model coords to original image coords."""
-    orig_w, orig_h = orig_size
-    pad_x, pad_y   = pad
-    for c in chars:
-        x1, y1, x2, y2 = c["box"]
-        x1 = max(0.0, min((x1 - pad_x) / scale, float(orig_w)))
-        y1 = max(0.0, min((y1 - pad_y) / scale, float(orig_h)))
-        x2 = max(0.0, min((x2 - pad_x) / scale, float(orig_w)))
-        y2 = max(0.0, min((y2 - pad_y) / scale, float(orig_h)))
-        c["box"] = [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)]
+    return tensor, orig_size, scale, pad
 
 
 # ---------------------------------------------------------------------------
@@ -337,9 +329,13 @@ def _infer_orientation_from_s1(
     )
 
     if raw_boxes:
+        scores_t = torch.tensor(raw_scores, dtype=torch.float32)
         boxes_t = torch.tensor(raw_boxes, dtype=torch.float32)
+        confident = boxes_t[scores_t >= model.det_score_thresh]
         orientation = _normalize_orientation_label(
-            infer_reading_orientation_from_boxes(boxes_t)
+            infer_reading_orientation_from_boxes(
+                confident if confident.size(0) >= 2 else boxes_t
+            )
         )
     else:
         orientation = "vertical"  # safe default when no proposals found
@@ -376,7 +372,11 @@ def run_inference(
       orientation   : str
       n_chars       : int
     """
-    image_tensor = image_tensor.to(DEVICE)
+    # Derived from the model itself (not the global DEVICE) so the same function
+    # works unmodified against either a GPU-resident or CPU-resident copy of the
+    # model -- see app.py's per-request CPU fallback on CUDA OOM.
+    device = next(model.parameters()).device
+    image_tensor = image_tensor.to(device)
 
     # Stage 1: backbone + detector (always run; needed for orientation and gap-filling)
     raw_s1_boxes: Optional[List[List[float]]] = None
@@ -431,8 +431,8 @@ def run_inference(
                 outputs = model(
                     image_tensor,
                     orientations=[orientation],
-                    coarse_boxes_list=[aug_boxes.to(DEVICE)],
-                    coarse_scores_list=[aug_scores.to(DEVICE)],
+                    coarse_boxes_list=[aug_boxes.to(device)],
+                    coarse_scores_list=[aug_scores.to(device)],
                 )
 
     char_logits   = outputs["char_logits"]    # (1, T, V) — sorted order

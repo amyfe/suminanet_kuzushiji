@@ -16,13 +16,16 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from visualization.dataset import (
+    PAPER_BG_COLOR,
     _script,
     plot_augmentation_comparison,
+    plot_char_variant_gallery,
     plot_chars_per_image,
     plot_class_imbalance,
     plot_copy_paste_augmentation,
@@ -180,6 +183,74 @@ def _build_rare_kanji_crop_db(
     return dict(db)
 
 
+def _build_char_variant_crop_db(
+    assets_root: Path,
+    target_labels: set[str],
+    max_per_char: int = 20,
+    max_files_scanned: int = 3000,
+    margin_frac: float = 0.25,
+) -> dict:
+    """
+    Build a database of glyph-crop variants for a fixed set of target
+    character labels (e.g. the most common hiragana) — same annotation-scan
+    pattern as _build_rare_kanji_crop_db, but for characters common enough
+    that a partial scan of the corpus already yields plenty of examples.
+    Stops once every target label has max_per_char crops, or
+    max_files_scanned annotation files have been read, whichever is first.
+    Crops are stored as RGB uint8 arrays, in the source page's original
+    color (no grayscale/inversion) — see plot_char_variant_gallery.
+
+    Each crop gets a blank margin around the tight ground-truth box, filled
+    with PAPER_BG_COLOR (matching the gallery canvas — see
+    plot_char_variant_gallery) rather than the real neighboring page
+    content, sized as margin_frac * max(box_w, box_h) on every side — so
+    very thin/elongated boxes (e.g. cursive し, which is often annotated as
+    a single tall stroke) get visible breathing room without pulling in
+    adjacent characters' strokes.
+    """
+    ann_dir = assets_root / "data" / "annotations"
+    db: dict[str, list] = collections.defaultdict(list)
+    scanned = 0
+
+    for f in sorted(ann_dir.glob("*.json")):
+        if scanned >= max_files_scanned:
+            break
+        if all(len(db[lbl]) >= max_per_char for lbl in target_labels):
+            break
+        d = json.load(open(f, encoding="utf-8"))
+        labels = d.get("labels", [])
+        boxes = d.get("boxes", d.get("bboxes", []))
+        img_rel = d.get("image_path")
+        if not labels or not boxes or not img_rel:
+            continue
+        if not any(lbl in target_labels and len(db[lbl]) < max_per_char for lbl in labels):
+            continue
+        scanned += 1
+
+        img_path = assets_root / "data" / img_rel
+        if not img_path.exists():
+            continue
+        with Image.open(img_path) as im:
+            img = im.convert("RGB")
+            w, h = img.size
+            for lbl, box in zip(labels, boxes):
+                if lbl not in target_labels or len(db[lbl]) >= max_per_char:
+                    continue
+                x1, y1, x2, y2 = (int(round(v)) for v in box)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                tight = img.crop((x1, y1, x2, y2))
+                bw, bh = x2 - x1, y2 - y1
+                margin = max(3, round(margin_frac * max(bw, bh)))
+                padded = Image.new("RGB", (bw + 2 * margin, bh + 2 * margin), color=PAPER_BG_COLOR)
+                padded.paste(tight, (margin, margin))
+                db[lbl].append(np.array(padded))
+
+    return dict(db)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Dataset introduction visualizations for thesis")
     p.add_argument("--assets-root", default="assets",
@@ -201,6 +272,19 @@ def parse_args() -> argparse.Namespace:
                    help="Number of rare-kanji crops to paste in the copy-paste demo plot")
     p.add_argument("--skip-copy-paste-demo", action="store_true",
                    help="Skip the rare-kanji copy-paste augmentation demo plot")
+    p.add_argument("--n-variant-chars", type=int, default=20,
+                   help="Number of characters shown in the handwriting-variant gallery, "
+                        "picked by descending frequency among hiragana (ignored if "
+                        "--variant-chars is given)")
+    p.add_argument("--variant-chars", default=None,
+                   help="Comma-separated characters to show in the handwriting-variant "
+                        "gallery instead of the top-N-by-frequency hiragana, e.g. "
+                        "'あ,い,う,え,お'")
+    p.add_argument("--variant-crops-per-char", type=int, default=20,
+                   help="Max example crops collected per character for the "
+                        "handwriting-variant gallery")
+    p.add_argument("--skip-variant-gallery", action="store_true",
+                   help="Skip the handwriting-variant gallery plot")
     return p.parse_args()
 
 
@@ -279,6 +363,19 @@ def main() -> None:
         out_path=out_dir / "top_characters.png",
     )
 
+    kanji_counts = collections.Counter(
+        {ch: c for ch, c in label_counts.items() if _script(ch) == "Kanji"}
+    )
+    if kanji_counts:
+        print(f"  Plotting top-{args.top_n} Kanji characters …")
+        plots["top_characters_kanji"] = plot_top_characters(
+            kanji_counts,
+            top_n=args.top_n,
+            rare_thresh=args.rare_thresh,
+            out_path=out_dir / "top_characters_kanji.png",
+            title=f"Top-{args.top_n} most frequent Kanji characters in the dataset",
+        )
+
     print("  Plotting characters-per-image distribution …")
     plots["chars_per_image"] = plot_chars_per_image(
         chars_per_image,
@@ -336,6 +433,28 @@ def main() -> None:
                     out_path=out_dir / "copy_paste_augmentation.png",
                 )
 
+    if not args.skip_variant_gallery:
+        if args.variant_chars:
+            variant_labels = {f"U+{ord(c):04X}" for c in args.variant_chars.split(",") if c.strip()}
+        else:
+            hiragana_by_freq = [ch for ch, _ in label_counts.most_common() if _script(ch) == "Hiragana"]
+            variant_labels = set(hiragana_by_freq[:args.n_variant_chars])
+
+        if not variant_labels:
+            print("  Skipping handwriting-variant gallery (no target characters resolved).")
+        else:
+            print(f"  Collecting handwriting variants for {len(variant_labels)} characters …")
+            variant_crop_db = _build_char_variant_crop_db(
+                assets, variant_labels, max_per_char=args.variant_crops_per_char,
+            )
+            if not variant_crop_db:
+                print("  Skipping handwriting-variant gallery (could not collect any crops).")
+            else:
+                print(f"  Plotting handwriting-variant gallery ({len(variant_crop_db)} characters) …")
+                plots["char_variant_gallery"] = plot_char_variant_gallery(
+                    variant_crop_db, out_path=out_dir / "char_variant_gallery.png",
+                )
+
     # ------------------------------------------------------------------
     # 4. Summary
     # ------------------------------------------------------------------
@@ -344,7 +463,6 @@ def main() -> None:
     top10   = label_counts.most_common(10)
     top10_cov = sum(v for _, v in top10) / all_chars * 100
 
-    import numpy as np
     freqs = sorted(label_counts.values(), reverse=True)
     cum   = np.cumsum(freqs)
     k100_cov  = cum[99]  / all_chars * 100 if len(freqs) >= 100  else None

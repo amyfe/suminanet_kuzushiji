@@ -30,18 +30,21 @@ export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onR
       />
       {onReplace && <span className="replace-hint">{t('workspace.replaceImageHint')}</span>}
       {imgDisplaySize && chars.map((c, i) => {
-        const scaleX = imgDisplaySize.w / imgDisplaySize.natW
-        const scaleY = imgDisplaySize.h / imgDisplaySize.natH
         const [x1, y1, x2, y2] = c.box
+        const leftPct = (x1 / imgDisplaySize.natW) * 100
+        const topPct = (y1 / imgDisplaySize.natH) * 100
+        const widthPct = ((x2 - x1) / imgDisplaySize.natW) * 100
+        const heightPct = ((y2 - y1) / imgDisplaySize.natH) * 100
+
         return (
           <div
             key={i}
             className={`char-box char-box--${scoreTier(c.score)}`}
             style={{
-              left: x1 * scaleX,
-              top: y1 * scaleY,
-              width: (x2 - x1) * scaleX,
-              height: (y2 - y1) * scaleY,
+              left: `${leftPct}%`,
+              top: `${topPct}%`,
+              width: `${widthPct}%`,
+              height: `${heightPct}%`,
             }}
             onMouseEnter={() => setHoveredCharIdx(i)}
             onMouseLeave={() => setHoveredCharIdx(null)}
@@ -50,7 +53,7 @@ export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onR
               <div className="char-tooltip">
                 {c.alternates?.length > 0 ? (
                   <div className="tooltip-alternates">
-                    {c.alternates.map((alt, ai) => (
+                    {c.alternates.slice(0, 3).map((alt, ai) => (
                       <button
                         type="button"
                         // Backend guarantees all candidates in c.alternates are

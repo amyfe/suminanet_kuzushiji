@@ -11,7 +11,7 @@ Usage:
     python scripts/analyse_stage1.py --ckpt checkpoints/stage1_detection/detector_best.pt \\
         [--out-dir results/stage1_analysis] \\
         [--split val] \\
-        [--log logs/train_stage1.log] \\
+        [--log checkpoints/stage1_detection/training-14046.out] \\
         [--sam2-dir assets/sam2_proposals] \\
         [--optuna-db checkpoints/optuna_stage1/optuna_stage1.db]
 """
@@ -165,8 +165,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt", required=True, default="checkpoints/stage1_detection/detector_best.pt", help="Stage 1 detector checkpoint (.pt)")
     p.add_argument("--out-dir", default="results/stage1_analysis")
     p.add_argument("--split", default="val", choices=["train", "val"])
-    p.add_argument("--log", default="logs/train_stage1.log",
-                   help="Training log file for learning curves (skipped if not found)")
+    p.add_argument("--log", default="checkpoints/stage1_detection/training-14046.out",
+                   help="Training log file for learning curves (skipped if not found). "
+                        "Defaults to the SLURM stdout capture for the current "
+                        "detector_best.pt run — logs/train_stage1.log is a stale, "
+                        "append-mode file mixing many unrelated past runs, not this "
+                        "checkpoint's history. After a retrain, pass --log pointing "
+                        "at the new checkpoints/stage1_detection/training-<job>.out.")
     p.add_argument("--sam2-dir", default="assets/sam2_proposals",
                    help="Directory of SAM2 proposal .pt files")
     p.add_argument("--iou-threshold", type=float, default=0.5,

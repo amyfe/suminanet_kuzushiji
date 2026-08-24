@@ -71,7 +71,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import SUMINANET_DELTA_SCALE_XY, SUMINANET_DELTA_SCALE_WH
+from config import DET_MIN_BOX_SIZE, SUMINANET_DELTA_SCALE_XY, SUMINANET_DELTA_SCALE_WH
 
 
 class ROIRefinementHead(nn.Module):
@@ -288,6 +288,7 @@ class ROIRefinementHead(nn.Module):
             image_size=image_size,
             delta_scale_xy=SUMINANET_DELTA_SCALE_XY,
             delta_scale_wh=SUMINANET_DELTA_SCALE_WH,
+            min_box_size=DET_MIN_BOX_SIZE,
         )                                                                   # (B, T, 4)
 
         refine_scores = self.refine_score_head(refined_feats).squeeze(-1)   # (B, T)

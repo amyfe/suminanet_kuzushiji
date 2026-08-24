@@ -14,11 +14,12 @@ export default function LoadingIndicator({ label }) {
   )
 }
 
-// TranscriptionLoader.html is a self-contained bundled page (React + assets)
-// that replaces its own document on load. It must run in its own document,
-// so we embed it via an iframe pointing at the file served verbatim from
-// public/. No sandbox: the bundle needs allow-scripts and same-origin blob
-// URLs, and it is our own first-party file.
+// TranscriptionLoader.html is a plain, self-contained static page (inline
+// SVG/CSS/JS, no React, no build step) served verbatim from public/. It
+// needs its own document (own <style>/<script> scope) to run its looping
+// animation independently of the React tree, so it is embedded via an
+// iframe rather than rendered inline. No sandbox: it is our own
+// first-party file.
 export function Animation({ label, className, title }) {
   const [failed, setFailed] = useState(false)
 

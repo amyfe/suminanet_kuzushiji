@@ -46,7 +46,6 @@ from config import (
     FREEZE_BACKBONE,
     FREEZE_DETECTOR,
     GRAD_CLIP,
-    GRADIENT_ACCUMULATION_STEPS,
     IMAGE_SIZE,
     SUMINANET_CHECKPOINT_DIR,
     SUMINANET_CLASSIFIER_HIDDEN,
@@ -60,6 +59,7 @@ from config import (
     SUMINANET_RARE_CHAR_THRESH,
     SUMINANET_HARD_NEG_WEIGHT,
     SUMINANET_HARD_NEG_TOP_K,
+    SUMINANET_HARD_NEG_START_EPOCH,
     SUMINANET_BG_WEIGHT,
     SUMINANET_STRONG_BG_WEIGHT,
     SUMINANET_LAMBDA_BOX,
@@ -192,14 +192,6 @@ def build_dataloaders(vocab: VocabManager, world_size: int = 1):
         boost_scale=1.5,
     )
     # Under DDP, each rank gets its own independent WeightedRandomSampler
-    # rather than a DistributedSampler wrapping a shared weighting scheme --
-    # PyTorch has no built-in DistributedWeightedRandomSampler, and since
-    # replacement=True already means this isn't a strict one-full-pass
-    # shuffle, per-rank independent weighted sampling is a reasonable, low-
-    # risk simplification. num_samples is a fixed Python int identical on
-    # every rank, which is what actually keeps len(train_loader) (and thus
-    # collective-op step counts) in lockstep across ranks -- not the
-    # replacement semantics.
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(train_dataset) // world_size,
@@ -242,6 +234,9 @@ def build_suminanet_model(
     vocab: VocabManager,
     warmup_ckpt: Optional[str | Path] = None,
     load_stage1_weights: bool = True,
+    backbone_type_override: Optional[str] = None,
+    context_mode_override: Optional[str] = None,
+    device: str | torch.device = DEVICE,
 ) -> SuminaNetRecognizer:
     """
     Build SuminaNetRecognizer.
@@ -250,26 +245,51 @@ def build_suminanet_model(
     load_stage1_weights=False, e.g. at inference/eval, where a full SuminaNet
     checkpoint is loaded on top right after and would overwrite them anyway).
     Optionally warm-starts shared ROI pipeline from warmup checkpoint.
+
+    backbone_type_override, if given, takes precedence over both the Stage 1
+    checkpoint's saved backbone_type and the global config.BACKBONE_TYPE --
+    needed when building a model to receive a SuminaNet checkpoint whose
+    backbone architecture differs from whatever's currently configured (e.g.
+    validating an archived 'unet' checkpoint while config.py is set to
+    'efficientnet_b2'). The resolved value is stashed on the returned model
+    as `.backbone_type` so callers loading a state dict on top can verify it
+    matches (see _load_compatible_state_dict's ckpt_backbone_type guard).
+
+    context_mode_override, if given, takes precedence over the global
+    config.STAGE2_CONTEXT_MODE -- needed when building a model to receive a
+    SuminaNet checkpoint trained with a different context_mode than whatever
+    is currently configured (e.g. validating an archived 'bigru' checkpoint
+    while config.py is set to 'gru'). Without this, _load_compatible_state_dict
+    raises rather than silently corrupting the mismatched RNN layer (see its
+    ckpt_context_mode guard) -- so the failure mode is a hard error, not wrong
+    numbers, but building with the matching mode from the start avoids the
+    error entirely.
+
+    device defaults to the global config.DEVICE but can be overridden -- e.g.
+    to build a CPU-resident copy alongside the GPU one without ever touching
+    CUDA (see app.py's per-request CPU fallback on CUDA OOM).
     """
     vocab_size = vocab.vocab_size
 
-    if load_stage1_weights:
-        stage1_ckpt = CHECKPOINT_DIR / "stage1_detection" / "detector_best.pt"
-        if not stage1_ckpt.exists():
-            raise FileNotFoundError(f"Stage 1 checkpoint not found: {stage1_ckpt}")
-        ckpt = torch.load(stage1_ckpt, map_location=DEVICE)
+    stage1_ckpt = CHECKPOINT_DIR / "stage1_detection" / "detector_best.pt"
+    if not stage1_ckpt.exists():
+        raise FileNotFoundError(f"Stage 1 checkpoint not found: {stage1_ckpt}")
+    ckpt = torch.load(stage1_ckpt, map_location=device)
+    if backbone_type_override is not None:
+        backbone_type = backbone_type_override
+    elif load_stage1_weights:
         backbone_type = ckpt.get("backbone_type", BACKBONE_TYPE)
     else:
         backbone_type = BACKBONE_TYPE
 
-    backbone = build_backbone(backbone_type, BACKBONE_BASE_FEATURES, pretrained=False).to(DEVICE)
+    backbone = build_backbone(backbone_type, BACKBONE_BASE_FEATURES, pretrained=False).to(device)
     detector = DetectorHead(
         in_ch=BACKBONE_BASE_FEATURES,
         num_classes=vocab_size,
         dropout_rate=STAGE2_DROPOUT_RATE,
         predict_boxes=True,
         predict_classes=False,
-    ).to(DEVICE)
+    ).to(device)
 
     if load_stage1_weights:
         state_key = "backbone_state_dict" if "backbone_state_dict" in ckpt else "unet_state_dict"
@@ -301,7 +321,7 @@ def build_suminanet_model(
         use_context=SUMINANET_USE_CONTEXT,
         context_hidden_dim=STAGE2_CONTEXT_HIDDEN_DIM,
         context_num_layers=STAGE2_CONTEXT_NUM_LAYERS,
-        context_mode=STAGE2_CONTEXT_MODE,
+        context_mode=context_mode_override if context_mode_override is not None else STAGE2_CONTEXT_MODE,
         context_block_gap_factor=SUMINANET_CONTEXT_BLOCK_GAP_FACTOR,
 
         classifier_hidden_dim=SUMINANET_CLASSIFIER_HIDDEN,
@@ -322,7 +342,8 @@ def build_suminanet_model(
         crop_encoder_size=SUMINANET_CROP_ENCODER_SIZE,
         freeze_crop_encoder=SUMINANET_FREEZE_CROP_ENCODER,
         crop_encoder_chunk_size=SUMINANET_CROP_ENCODER_CHUNK_SIZE,
-    ).to(DEVICE, memory_format=torch.channels_last)
+    ).to(device)
+    model.backbone_type = backbone_type
 
     if FREEZE_BACKBONE:
         for p in model.backbone.parameters():
@@ -334,12 +355,6 @@ def build_suminanet_model(
             p.requires_grad = False
         model.detector.eval()
 
-    # Guard: warmup aux_head_context → SuminaNet classifier weight transfer.
-    # aux_head_context is Linear(STAGE2_CONTEXT_HIDDEN_DIM, STAGE2_REFINE_HIDDEN_DIM).
-    # classifier   is Linear(STAGE2_CONTEXT_HIDDEN_DIM, SUMINANET_CLASSIFIER_HIDDEN).
-    # The first layer transfers only if both hidden dims match.
-    # This is only relevant when a warmup checkpoint is provided; a plain resume or
-    # fresh-start training with SUMINANET_CLASSIFIER_HIDDEN != STAGE2_REFINE_HIDDEN_DIM is fine.
     if warmup_ckpt is not None and STAGE2_REFINE_HIDDEN_DIM != SUMINANET_CLASSIFIER_HIDDEN:
         print(
             f"WARNING: STAGE2_REFINE_HIDDEN_DIM ({STAGE2_REFINE_HIDDEN_DIM}) != "
@@ -355,12 +370,18 @@ def build_suminanet_model(
         else:
             ckpt_a = torch.load(warmup_ckpt, map_location=DEVICE)
             state = ckpt_a.get("model_state_dict", ckpt_a)
-            _load_compatible_state_dict(model, state)
+            ckpt_context_mode = ckpt_a.get("stage2_config", {}).get("context_mode")
+            ckpt_vocab_hash = ckpt_a.get("vocab_hash")
+            _load_compatible_state_dict(
+                model, state,
+                ckpt_context_mode=ckpt_context_mode,
+                ckpt_vocab_hash=ckpt_vocab_hash,
+                current_vocab_hash=vocab.content_hash(),
+                ckpt_backbone_type=ckpt_a.get("backbone_type"),
+            )
 
             # Warmup trained aux_head_context (Linear(384,256)→ReLU→Dropout→Linear(256,V))
-            # which maps exactly to SuminaNet's classifier when SUMINANET_CLASSIFIER_HIDDEN=256.
-            # _load_compatible_state_dict cannot map them because the key names differ,
-            # so copy the weights explicitly here.
+            # _load_compatible_state_dict cannot map them because the key names differ, so copy the weights explicitly here.
             _AUX_TO_CLASSIFIER = {
                 "classifier.0.weight": "aux_head_context.0.weight",
                 "classifier.0.bias":   "aux_head_context.0.bias",
@@ -507,8 +528,6 @@ def compute_suminanet_loss(
     )
 
     # Hard negative mining: extra CE penalty for previously-confused pairs.
-    # hn_keys is a pre-encoded int64 tensor (gt * V + pred), built once per epoch
-    # in train_epoch so this inner loop does only a single torch.isin GPU call.
     if hn_keys is not None and hn_keys.numel() > 0:
         logits_flat = outputs["char_logits"][pos_mask_sorted]   # (N_pos, V)
         labels_flat = gt_labels_sorted[pos_mask_sorted]          # (N_pos,)
@@ -525,17 +544,10 @@ def compute_suminanet_loss(
                 loss_char = loss_char + SUMINANET_HARD_NEG_WEIGHT * loss_hn
 
     # Background supervision: FP proposals learn to predict <BG>.
-    # Only applied to truly isolated negatives (small group / oversized box) — likely
-    # illustration regions.  Furigana sub-column negatives are excluded: they are real
-    # kana characters whose proposals may have low IoU due to small size, so pushing
-    # them toward <BG> would silently drop glosses from the transcription.
     if bg_id is not None:
         iso_mask  = outputs.get("isolation_mask", None)   # small/oversized FPs only
         furi_mask = outputs.get("furigana_mask",  None)   # furigana sub-columns — excluded
         if iso_mask is not None:
-            # Exclude furigana from BG supervision even if they also triggered the
-            # size/group-count isolation criterion (a single furigana glyph near a
-            # larger column satisfies both conditions).
             not_furi = ~furi_mask if furi_mask is not None else torch.ones_like(iso_mask)
             iso_neg  = iso_mask & not_furi & neg_mask_sorted
             loss_bg = SUMINANET_STRONG_BG_WEIGHT * background_classification_loss(
@@ -1511,56 +1523,16 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_distributed = world_size > 1
     if is_distributed:
-        # Must run before any .to(DEVICE)/model construction: every bare
-        # "cuda" string in this file resolves to "this process's current
-        # device", which is only correct once set_device has run.
         torch.cuda.set_device(local_rank)
         dist.init_process_group("nccl")
+        if rank != 0:
+            sys.stdout = open(os.devnull, "w")
+            sys.stderr = open(os.devnull, "w")
 
-    # Non-zero ranks stay silent: one rank's worth of logs/progress bars,
-    # not world_size copies racing on the same log file / interleaving stdout.
-    if is_distributed and rank != 0:
-        sys.stdout = open(os.devnull, "w")
-        sys.stderr = open(os.devnull, "w")
-
-    # Setup logging — tee stdout so every print() also lands in the log file
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True, parents=True)
-
-    class _Tee:
-        def __init__(self, *streams):
-            self._streams = streams
-        def write(self, data):
-            for s in self._streams:
-                s.write(data)
-                s.flush()
-        def flush(self):
-            for s in self._streams:
-                s.flush()
-
-    # sys.__stdout__/__stderr__ are the process's ORIGINAL streams, unaffected by the
-    # devnull reassignment above -- so this tee must be skipped on non-zero ranks, or
-    # it silently undoes that reassignment and every rank ends up writing to the same
-    # log file / console again (world_size copies of every line).
-    if rank == 0:
-        _log_fh = open(log_dir / "train_stage2_suminanet.log", "a")
-        sys.stdout = _Tee(sys.__stdout__, _log_fh)
-        sys.stderr = _Tee(sys.__stderr__, _log_fh)
-
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_dir / 'train_stage2_suminanet.log'),
-                logging.StreamHandler()
-            ]
-        )
-    else:
-        logging.basicConfig(level=logging.CRITICAL + 1, handlers=[logging.NullHandler()])
     logger = logging.getLogger(__name__)
 
-    # Fixed input sizes → cuDNN finds optimal kernels once and reuses them.
-    # float32 matmul uses TF32 on Ampere+, slightly lower precision but 8× faster.
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
 
@@ -1602,7 +1574,13 @@ def main():
         resume_path = Path(args.resume)
         if resume_path.exists():
             ckpt = torch.load(resume_path, map_location=DEVICE)
-            _load_compatible_state_dict(model, ckpt["model_state_dict"])
+            _load_compatible_state_dict(
+                model, ckpt["model_state_dict"],
+                ckpt_context_mode=ckpt.get("context_mode"),
+                ckpt_vocab_hash=ckpt.get("vocab_hash"),
+                current_vocab_hash=vocab.content_hash(),
+                ckpt_backbone_type=ckpt.get("backbone_type"),
+            )
             start_epoch  = int(ckpt.get("epoch", 0)) + 1
             best_score   = float(ckpt.get("best_score", -float("inf")))
             patience_ctr = int(ckpt.get("patience_ctr", 0))
@@ -1611,21 +1589,31 @@ def main():
             print(f"WARNING: resume checkpoint not found: {resume_path}")
 
     set_trainable_modules(model)
+
+    # If resuming past the crop-encoder freeze point, start already frozen instead
+    # of waiting for the in-loop freeze trigger to catch up on the first resumed
+    # epoch (set_trainable_modules() above unconditionally re-enables requires_grad
+    # on every param, including the crop encoder, so this must run after it).
+    if (
+        SUMINANET_FREEZE_CROP_ENCODER_AFTER > 0
+        and start_epoch > SUMINANET_FREEZE_CROP_ENCODER_AFTER
+        and model.roi_crop_encoder is not None
+        and not model.roi_crop_encoder.freeze_encoder
+    ):
+        for p in model.roi_crop_encoder.encoder.parameters():
+            p.requires_grad_(False)
+        model.roi_crop_encoder.encoder.eval()
+        model.roi_crop_encoder.freeze_encoder = True
+        print(
+            f"Resuming at epoch {start_epoch} (past freeze-after epoch "
+            f"{SUMINANET_FREEZE_CROP_ENCODER_AFTER}): crop encoder starts frozen."
+        )
+
     trainable_params = get_trainable_params(model)
     print(f"Trainable params: {sum(p.numel() for p in trainable_params):,}")
     print("=" * 70)
 
     if is_distributed:
-        # Must wrap after set_trainable_modules: DDP snapshots which params
-        # require grad at construction time to build its reduction buckets.
-        # trainable_params above already holds direct references to the same
-        # tensor objects (DDP wraps, never clones), so the optimizer stays
-        # correctly attached regardless of wrap order relative to this line.
-        # find_unused_parameters=True: this model's active parameter subset
-        # varies per forward pass (variable ROI counts, hard-negative-mining
-        # masking, optional SAM2 bypass), so some trainable params legitimately
-        # get no gradient on a given step -- without this flag DDP's reducer
-        # hangs/errors expecting every bucketed param to be touched every step.
         model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
 
     optimizer = optim.AdamW(
@@ -1634,16 +1622,11 @@ def main():
         weight_decay=args.weight_decay,
     )
     # Ensure optimizer param groups include 'initial_lr' so schedulers can be
-    # constructed when resuming from a checkpoint. Older PyTorch checkpoints
-    # or manually-constructed optimizers may lack this key which causes
-    # KeyError in _LRScheduler when last_epoch != -1.
+    # constructed when resuming from a checkpoint.
     for pg in optimizer.param_groups:
         if "initial_lr" not in pg:
             pg["initial_lr"] = pg.get("lr", args.lr)
     # Warm restarts every 20 epochs so LR never stays near eta_min for long.
-    # T_0=20: restarts at epoch 20, 40, … giving periodic gradient boosts.
-    # _LRScheduler.__init__ calls step() once, advancing last_epoch by 1, so
-    # pass start_epoch - 2 to land at the correct position after construction.
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
         T_0=20,
@@ -1660,11 +1643,11 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         # Load confusion pairs saved by the previous epoch's validation
         hard_neg_pairs: Optional[set] = None
-        # if epoch >= 10 and hard_neg_path.exists():
-        #     with open(hard_neg_path) as f:
-        #         raw = json.load(f)
-        #         hard_neg_pairs = {(int(g), int(p)) for g, p in raw}
-        #     print(f"Loaded {len(hard_neg_pairs)} hard-negative pairs from {hard_neg_path.name}")
+        if epoch >= SUMINANET_HARD_NEG_START_EPOCH and hard_neg_path.exists():
+            with open(hard_neg_path) as f:
+                raw = json.load(f)
+                hard_neg_pairs = {(int(g), int(p)) for g, p in raw}
+            print(f"Loaded {len(hard_neg_pairs)} hard-negative pairs from {hard_neg_path.name}")
 
         train_metrics = train_epoch(
             model=model,
@@ -1690,14 +1673,7 @@ def main():
             f", score={train_metrics.get('train_loss_score', 0):.4f})"
             f" | train_top1={train_metrics.get('train_top1', 0):.4f}"
         )
-
-        # Validation runs on rank 0 only, against the raw (unwrapped) module.
-        # DDP's forward() defaults to broadcast_buffers=True, issuing a
-        # collective on every call to keep the (still-trainable) crop
-        # encoder's BatchNorm running stats synced from rank 0 -- a solo
-        # rank-0 forward through the DDP wrapper would hang waiting for other
-        # ranks to participate. Calling the raw module directly issues no
-        # collective at all, so other ranks need no coordination here.
+        val_metrics = None
         if rank == 0:
             raw_model = model.module if is_distributed else model
             val_metrics = validate_suminanet(
@@ -1722,14 +1698,10 @@ def main():
                 ]
                 print(f"  Mined pairs: {decoded}")
 
-        # Two-phase crop encoder freeze: unfreeze for domain adaptation, then freeze to save compute.
-        # Triggered once when epoch crosses SUMINANET_FREEZE_CROP_ENCODER_AFTER.
-        # Depends only on the plain epoch counter (identical on every rank),
-        # so this runs unconditionally on all ranks -- no broadcast needed.
         raw_model = model.module if is_distributed else model
         if (
             SUMINANET_FREEZE_CROP_ENCODER_AFTER > 0
-            and epoch == SUMINANET_FREEZE_CROP_ENCODER_AFTER
+            and epoch >= SUMINANET_FREEZE_CROP_ENCODER_AFTER
             and raw_model.roi_crop_encoder is not None
             and not raw_model.roi_crop_encoder.freeze_encoder
         ):
@@ -1743,23 +1715,9 @@ def main():
                 f"({n_frozen:,} EfficientNet-B0 params removed from backprop)"
            )
             if is_distributed:
-                # DDP's reducer/bucket bookkeeping is built once, at wrap
-                # time, from the parameters that require grad then -- a set
-                # that shrinks mid-training (like this freeze event) breaks
-                # the pre-registered all-reduce hooks and hangs. Rewrapping
-                # rebuilds that bookkeeping from scratch against the new
-                # trainable-parameter set. DDP never clones parameters (only
-                # stores a reference + broadcasts values at construction), so
-                # the optimizer's param_groups/state (keyed by tensor
-                # identity) stay validly attached across this cycle.
                 model = DistributedDataParallel(raw_model, device_ids=[local_rank], find_unused_parameters=True)
 
-        # Scoring/checkpointing/early-stop decisions are computed on rank 0
-        # (the only rank with val_metrics); only the early-stop decision
-        # needs to reach the other ranks, since that's the only thing
-        # affecting their control flow -- they must `break` together or the
-        # job hangs on the next collective op.
-        if rank == 0:
+        if rank == 0 and val_metrics is not None:
             score   = select_model_score(val_metrics)
             is_best = score > best_score
             if is_best:
@@ -1776,6 +1734,10 @@ def main():
                 "patience_ctr":     patience_ctr,
                 "val_metrics":      val_metrics,
                 "train_metrics":    train_metrics,
+                "context_mode":     STAGE2_CONTEXT_MODE,
+                "vocab_size":       vocab.vocab_size,
+                "vocab_hash":       vocab.content_hash(),
+                "backbone_type":    raw_model.backbone_type,
             }
 
             # Save epoch checkpoint (atomic write: .tmp → final path, safe on crash)

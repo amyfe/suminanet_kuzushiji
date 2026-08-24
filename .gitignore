@@ -164,7 +164,7 @@ assets/data/
 data/
 logs/
 assets/logs/
-assets/
+/assets/
 data_preprocessed/
 submit_scripts/
 submit_training.sh

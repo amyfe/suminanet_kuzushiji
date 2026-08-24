@@ -52,6 +52,7 @@ import torch
 import torch.nn.functional as F
 from torchvision.ops import nms
 
+from config import DET_SCORE_THRESH, DET_TOP_K, DET_NMS_IOU, DET_MIN_BOX_SIZE
 from utils.detection_utils import spatial_density_filter_torch
 
 
@@ -211,10 +212,10 @@ def extract_coarse_proposals(
     heat_logits: torch.Tensor,      # (B, 1, Hf, Wf)
     bbox_reg: torch.Tensor,         # (B, 4, Hf, Wf)
     image_size: Tuple[int, int],
-    score_thresh: float = 0.40,
-    top_k: int = 256,
-    nms_iou: float = 0.5,
-    min_size: float = 1.0,
+    score_thresh: float = DET_SCORE_THRESH,
+    top_k: int = DET_TOP_K,
+    nms_iou: float = DET_NMS_IOU,
+    min_size: float = DET_MIN_BOX_SIZE,
     density_grid: int = 8,
     density_factor: float = 5.0,
     avg_gt_per_image: int = 236,

@@ -80,6 +80,7 @@ def run_two_call(pipeline: EdoPeriodTranslationPipeline, classical_text: str, ch
     elapsed = time.perf_counter() - t0
     return {
         "elapsed_sec": elapsed,
+        "classical_text": classical_text,
         "modern_japanese": result["modern_japanese"],
         "english_translation": result["english_translation"],
         "usage": result["usage"],
@@ -98,6 +99,7 @@ def run_combined(translator: ClaudeTranslator, classical_text: str, chars: list[
     elapsed = time.perf_counter() - t0
     return {
         "elapsed_sec": elapsed,
+        "classical_text": classical_text,
         "modern_japanese": result["modern_japanese"],
         "english_translation": result["english_translation"],
         "usage": usage,
@@ -140,6 +142,7 @@ def print_run(label: str, run: dict) -> None:
     print("=" * 70)
     print(f"Latency:   {run['elapsed_sec']:.2f}s")
     print(f"Usage:     {run['usage']}")
+    print(f"Original Text:\n  {run['classical_text']}")
     print(f"Modern Japanese:\n  {run['modern_japanese']}")
     print(f"English:\n  {run['english_translation']}")
 

@@ -49,7 +49,9 @@ from config import (
     DEVICE,
     GRAD_CLIP,
     SUMINANET_CHECKPOINT_DIR,
+    SUMINANET_EPOCHS,
     SUMINANET_GRAD_ACCUM_STEPS,
+    SUMINANET_HARD_NEG_START_EPOCH,
     SUMINANET_LR_ETA_MIN,
     NUM_WORKERS,
     USE_MIXED_PRECISION,
@@ -69,6 +71,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     bg_base          = trial.suggest_float("bg_base",          0.05, 0.3)
     bg_ratio         = trial.suggest_float("bg_ratio",         2.0,  8.0)
     hard_neg_w       = trial.suggest_float("hard_neg_w",       1.0,  3.0)
+    hard_neg_top_k   = trial.suggest_int("hard_neg_top_k",     10,   40)
     det_score_thresh = trial.suggest_float("det_score_thresh", 0.15, 0.45)
 
     # BG weight fusion: STRONG must always exceed BG — encode as (base, ratio).
@@ -85,7 +88,16 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
     train_module.SUMINANET_BG_WEIGHT         = bg_base
     train_module.SUMINANET_STRONG_BG_WEIGHT  = bg_strong
     train_module.SUMINANET_HARD_NEG_WEIGHT   = hard_neg_w
+    train_module.SUMINANET_HARD_NEG_TOP_K    = hard_neg_top_k
     train_module.SUMINANET_DET_SCORE_THRESH  = det_score_thresh
+
+    # Hard-neg mining reload: each trial gets its own file (trial.number is
+    # unique/stable within the shared study, safe under parallel workers).
+    # Start epoch is derived from the main trainer's schedule (20% of a full
+    # SUMINANET_EPOCHS run) so it scales with --epochs instead of a second
+    # magic number; floored at 2 since pairs only exist after epoch 1's val.
+    hard_neg_start = max(2, round(args.epochs * (SUMINANET_HARD_NEG_START_EPOCH / SUMINANET_EPOCHS)))
+    hard_neg_path  = Path(args.output_dir) / f"trial_{trial.number}_hard_neg_pairs.json"
 
     # ----------------------------------------------------------------
     # Build data, model, optimiser
@@ -119,6 +131,12 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
         val_metrics = {}
 
         for epoch in range(1, args.epochs + 1):
+            hard_neg_pairs = None
+            if epoch >= hard_neg_start and hard_neg_path.exists():
+                with open(hard_neg_path) as f:
+                    raw = json.load(f)
+                hard_neg_pairs = {(int(g), int(p)) for g, p in raw}
+
             train_module.train_epoch(
                 model=model,
                 train_loader=train_loader,
@@ -127,7 +145,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
                 vocab=vocab,
                 epoch=epoch,
                 grad_accum_steps=SUMINANET_GRAD_ACCUM_STEPS,
-                hard_neg_pairs=None,
+                hard_neg_pairs=hard_neg_pairs,
                 vocab_weights=vocab_weights,
                 sam2_dir=None,
             )
@@ -140,6 +158,11 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
                 max_batches=args.val_max_batches or None,
                 vocab_weights=vocab_weights,
             )
+
+            new_pairs = val_metrics.pop("hard_neg_pairs", [])
+            if new_pairs:
+                with open(hard_neg_path, "w") as f:
+                    json.dump(new_pairs, f)
 
             score = train_module.select_model_score(val_metrics)
             trial.report(score, epoch)
@@ -169,6 +192,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace) -> float:
         del train_loader, val_loader, vocab_weights
         del model, trainable_params, optimizer, scheduler, scaler
         release_cuda_memory()
+        hard_neg_path.unlink(missing_ok=True)
 
 
 def _save_matplotlib_plot(plot_obj, output_path: Path) -> None:
@@ -374,6 +398,7 @@ def main() -> None:
     print(f"SUMINANET_BG_WEIGHT         = {p['bg_base']}")
     print(f"SUMINANET_STRONG_BG_WEIGHT  = {p['bg_base'] * p['bg_ratio']:.6f}  # bg_base={p['bg_base']:.4f} × bg_ratio={p['bg_ratio']:.4f}")
     print(f"SUMINANET_HARD_NEG_WEIGHT   = {p['hard_neg_w']}")
+    print(f"SUMINANET_HARD_NEG_TOP_K    = {p['hard_neg_top_k']}")
     print(f"SUMINANET_DET_SCORE_THRESH  = {p['det_score_thresh']}")
 
 

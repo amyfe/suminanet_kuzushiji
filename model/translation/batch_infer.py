@@ -18,8 +18,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import traceback
 from pathlib import Path
+
+# Allow running as `python model/translation/batch_infer.py` (not just
+# `python -m model.translation.batch_infer`) — Python only puts this script's
+# own directory on sys.path, not the repo root, so the `config` import below
+# fails without this.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from config import SUMINANET_CER_SCORE_THRESH, WEBSITE_CHECKPOINT_DIR
 from infer import _unletterbox_boxes, load_image, load_suminanet, run_inference

@@ -138,6 +138,46 @@
         "thirdPartyHeading": "Verarbeitung durch Dritte",
         "thirdPartyText": "Die Übersetzung erfolgt mithilfe des Claude-Modells von Anthropic, das über die OpenRouter-API angebunden ist. Wenn Sie eine Übersetzung anfordern, wird der transkribierte Text an diesen Drittanbieter gesendet, um die Übersetzung zu erzeugen. Mit diesem Anbieter werden keine Bilder geteilt — nur Text.",
         "protectionHeading": "Datenschutzmaßnahmen",
-        "protectionText": "Wir legen keine Benutzerkonten an und erheben weder Namen, E-Mail-Adressen noch andere personenbezogene Identifikatoren. Hochgeladene Bilder werden zu keinem Zeitpunkt über die Dauer Ihrer Anfrage hinaus gespeichert."
+        "protectionText": "Wir legen keine Benutzerkonten an und erheben weder Namen, E-Mail-Adressen noch andere personenbezogene Identifikatoren. Hochgeladene Bilder werden zu keinem Zeitpunkt über die Dauer Ihrer Anfrage hinaus gespeichert.",
+        "detailedSections": [
+            {
+                "heading": "Verantwortlicher",
+                "paragraphs": [
+                    "Amina Felic, Hammarskjöldring 156, 60439 Frankfurt am Main, Deutschland.",
+                    "E-Mail: felic.amina@gmail.com",
+                    "Mit dieser Datenschutzerklärung erklären wir, welche personenbezogenen Daten wir im Rahmen der Bereitstellung der Sumina-Anwendung verarbeiten, zu welchen Zwecken und in welchem Umfang."
+                ]
+            },
+            {
+                "heading": "Übersicht der Verarbeitung",
+                "paragraphs": [
+                    "Wir verarbeiten hochgeladene Bilder zur Erkennung und Transkription von Manuskriptzeichen sowie zur Erstellung von Übersetzungen. Die Bilder werden nur für die Dauer der Anfrage im Server-Arbeitsspeicher verarbeitet und nicht auf der Festplatte gespeichert.",
+                    "Wir verarbeiten transkribierten Text, wenn eine Übersetzung angefordert wird. Der Text kann an einen Übersetzungsdienst weitergegeben werden, um das Ergebnis zu erzeugen. Bilder werden dabei nicht mitgeteilt.",
+                    "Wir verarbeiten IP-Adressen vorübergehend, um Ratenbegrenzungen durchzusetzen. Die Werte werden nur im Arbeitsspeicher gehalten und automatisch gelöscht.",
+                    "Die Sprachauswahl wird ausschließlich im lokalen Browser-Speicher gespeichert und niemals an unsere Server übermittelt."
+                ]
+            },
+            {
+                "heading": "Rechtsgrundlagen und Zwecke",
+                "paragraphs": [
+                    "Die Verarbeitung erfolgt aufgrund unseres berechtigten Interesses an Betrieb und Sicherheit der Anwendung sowie aufgrund des Vertragsverhältnisses zur Bereitstellung der angeforderten Transkriptions- und Übersetzungsfunktionalität.",
+                    "Zwecke sind die Bereitstellung des angeforderten Dienstes, die Verhinderung von Missbrauch und die Gewährleistung der technischen Zuverlässigkeit der Anwendung."
+                ]
+            },
+            {
+                "heading": "Sicherheitsmaßnahmen",
+                "paragraphs": [
+                    "Wir treffen technische und organisatorische Maßnahmen, die dem Schutzbedarf angemessen sind, etwa Zugriffsbeschränkungen, verschlüsselte HTTPS-Verbindungen und kurzlebige Verarbeitung im Arbeitsspeicher. Benutzerkonten, persönliche Profile und dauerhafte Bildspeicherung werden nicht angelegt.",
+                    "Wir erheben im Standardbetrieb keine Namen, E-Mail-Adressen oder andere identifizierende personenbezogene Daten."
+                ]
+            },
+            {
+                "heading": "Rechte der betroffenen Personen",
+                "paragraphs": [
+                    "Wenn Sie Daten an den Dienst übermitteln, können Sie gemäß der geltenden Datenschutzvorschriften Auskunft, Berichtigung, Löschung, Einschränkung der Verarbeitung oder die Bestätigung der Verarbeitung verlangen.",
+                    "Wenn Sie der Ansicht sind, dass Ihre Rechte verletzt wurden, können Sie sich zudem an die zuständige Datenschutzbehörde wenden."
+                ]
+            }
+        ]
     }
 }

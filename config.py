@@ -39,9 +39,9 @@ IMAGE_SIZE = (512, 512)
 USE_MIXED_PRECISION = True
 NUM_WORKERS = 8
 
-STAGE1_BATCH_SIZE = 32
+STAGE1_BATCH_SIZE = 4
 STAGE2_BATCH_SIZE = 8
-GRADIENT_ACCUMULATION_STEPS = 1
+GRADIENT_ACCUMULATION_STEPS = 8  # used by train_stage1.py, train_stage1_optuna.py, train_stage2_warmup.py -- SuminaNet training uses the separate SUMINANET_GRAD_ACCUM_STEPS below instead
 GRAD_CLIP = 1.0
 
 NUM_EPOCHS = 30
@@ -218,7 +218,7 @@ SUMINANET_USE_CONTEXT          = True
 SUMINANET_CONTEXT_BLOCK_GAP_FACTOR = 2.5
 SUMINANET_COPY_PASTE_PROB      = 0.4
 
-SUMINANET_CLASSIFIER_HIDDEN    = 512
+SUMINANET_CLASSIFIER_HIDDEN    = 512 
 SUMINANET_USE_CROP_ENCODER     = True
 SUMINANET_CROP_ENCODER_SIZE    = (112, 112)
 # Two-phase freeze schedule:
@@ -227,7 +227,7 @@ SUMINANET_CROP_ENCODER_SIZE    = (112, 112)
 #   Drops ~5.3M params from backprop → no longer bottleneck at 112px.
 SUMINANET_FREEZE_CROP_ENCODER       = False  # start unfrozen
 SUMINANET_FREEZE_CROP_ENCODER_AFTER = 5      # freeze EfficientNet-B0 weights after this epoch
-SUMINANET_CROP_ENCODER_CHUNK_SIZE   = 512
+SUMINANET_CROP_ENCODER_CHUNK_SIZE   = 8192 #512
 SUMINANET_ROI_POOL_OUTPUT_SIZE = (4, 4)
 SUMINANET_DET_SCORE_THRESH     = 0.33821750481132784
 SUMINANET_DELTA_SCALE_XY       = 0.25
@@ -235,7 +235,7 @@ SUMINANET_DELTA_SCALE_WH       = 0.20
 
 SUMINANET_CER_SCORE_THRESH     = 0.35
 
-SUMINANET_NUM_ALTERNATES        = 3
+SUMINANET_NUM_ALTERNATES        = 2
 
 # Furigana / noise-box filter: proposals whose area is below this fraction of the
 # median character area are discarded.  Only applied when at least SUMINANET_FURIGANA_MIN_SAMPLES
@@ -257,8 +257,9 @@ SUMINANET_RESIDUAL_SCALE_INIT  = 0.5
 
 SUMINANET_FOCAL_GAMMA          = 1.203618254887657
 SUMINANET_RARE_CHAR_THRESH     = 50
-SUMINANET_HARD_NEG_WEIGHT      = 1.231901422995889   
-SUMINANET_HARD_NEG_TOP_K       = 20    
+SUMINANET_HARD_NEG_WEIGHT      = 1.231901422995889
+SUMINANET_HARD_NEG_TOP_K       = 20
+SUMINANET_HARD_NEG_START_EPOCH = 40    # epoch at which hard-neg confusion-pair reload begins
 SUMINANET_LAMBDA_SCRIPT        = 0.2627635863899684
 
 SUMINANET_LR                   = 0.0004789618199206086
@@ -267,6 +268,8 @@ SUMINANET_WEIGHT_DECAY         = 0.0003042318888471685
 
 
 # Effective batch = STAGE2_BATCH_SIZE * SUMINANET_GRAD_ACCUM_STEPS * GPU count
+# Independent of the generic GRADIENT_ACCUMULATION_STEPS above -- only used by
+# train_stage2_suminanet.py and its Optuna script; tuning one does not affect the other.
 SUMINANET_GRAD_ACCUM_STEPS     = 1
 SUMINANET_ENABLE_TQDM          = True
 SUMINANET_PROGRESS_POSTFIX_N   = 70
@@ -297,7 +300,7 @@ SAM2_PROPOSALS_DIR = ROOT / "assets/sam2_proposals"
 # ============================================================
 # Translation Pipeline (Claude API resilience + OCR-confidence handling)
 # ============================================================
-WEBSITE_CHECKPOINT_DIR = CHECKPOINT_DIR / "C_gru_efficientnet_sam2"  / "suminanet_recognizer" / "suminanet_best.pt"
+WEBSITE_CHECKPOINT_DIR = CHECKPOINT_DIR / "suminanet_recognizer" / "suminanet_best.pt"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 MODEL ="claude-sonnet-4-6"
 OPENROUTER_MODEL = "anthropic/" + MODEL
@@ -319,6 +322,12 @@ TRANSLATION_MAX_TOKENS_CEILING = 8000
 TRANSLATION_MAX_TOKENS_CHARS_MULTIPLIER = 4
 TRANSLATION_MAX_INPUT_CHARS = 1500
 
+# Anthropic first-party rate for MODEL (claude-sonnet-4-6), checked 2026-08-24.
+# OpenRouter (the usual runtime backend, see anthropic.py) typically mirrors
+# first-party provider rates for Anthropic models but isn't guaranteed exact.
+TRANSLATION_PRICE_PER_1M_INPUT_USD = 3.00
+TRANSLATION_PRICE_PER_1M_OUTPUT_USD = 15.00
+
 # ============================================================
 # Backend API — Rate Limiting
 # ============================================================
@@ -329,4 +338,11 @@ TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = 10
 TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = 60
 MAX_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024
 TRANSCRIBE_INFERENCE_TIMEOUT_SEC = 60.0
+
+# On a shared GPU node, another process can OOM the card between startup and
+# any given request. Retry the initial GPU load a few times before falling
+# back to CPU-only; a CPU-resident copy is always loaded too so a per-request
+# CUDA OOM can be retried on CPU instead of failing the request outright.
+GPU_LOAD_MAX_RETRIES = 3
+GPU_LOAD_RETRY_DELAY_SEC = 5.0
 
