@@ -272,9 +272,11 @@ def build_suminanet_model(
     vocab_size = vocab.vocab_size
 
     stage1_ckpt = CHECKPOINT_DIR / "stage1_detection" / "detector_best.pt"
-    if not stage1_ckpt.exists():
-        raise FileNotFoundError(f"Stage 1 checkpoint not found: {stage1_ckpt}")
-    ckpt = torch.load(stage1_ckpt, map_location=device)
+    ckpt = None
+    if load_stage1_weights:
+        if not stage1_ckpt.exists():
+            raise FileNotFoundError(f"Stage 1 checkpoint not found: {stage1_ckpt}")
+        ckpt = torch.load(stage1_ckpt, map_location=device)
     if backbone_type_override is not None:
         backbone_type = backbone_type_override
     elif load_stage1_weights:

@@ -27,6 +27,12 @@ WorkingDirectory=/opt/sumina/repo
 # already-set env vars).
 EnvironmentFile=/opt/sumina/repo/.env
 
+# The system account has no login home directory. Give dependency caches a
+# private writable location instead of /nonexistent.
+Environment=HOME=/var/lib/sumina
+Environment=XDG_CACHE_HOME=/var/lib/sumina/.cache
+Environment=MPLCONFIGDIR=/var/lib/sumina/.cache/matplotlib
+
 # --workers 1 is required: rate-limit and model-ready state live in in-process
 # memory (see app/backend/README.md), a second worker would get its own copy.
 # No --host override: Uvicorn's CLI default (127.0.0.1, loopback-only) is
@@ -60,6 +66,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
+ReadWritePaths=/var/lib/sumina
 
 [Install]
 WantedBy=multi-user.target

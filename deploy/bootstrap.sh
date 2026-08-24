@@ -31,6 +31,8 @@ echo "=== 3. Dedicated non-root system user ==="
 if ! id -u "$APP_USER" >/dev/null 2>&1; then
     adduser --system --group --no-create-home --shell /usr/sbin/nologin "$APP_USER"
 fi
+# Runtime caches must not go under the system user's /nonexistent home.
+install -d -o "$APP_USER" -g "$APP_USER" -m 750 "/var/lib/$APP_USER/.cache"
 
 echo "=== 4. Firewall (22/80/443 only) ==="
 ufw allow OpenSSH

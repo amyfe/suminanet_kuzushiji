@@ -21,17 +21,14 @@
 your-domain.example {
 	encode zstd gzip
 
-	# Unstripped: forwards the full path (/api/transcribe, /api/translate,
-	# /api/health) unchanged, matching FastAPI's actual routes and mirroring
-	# vite.config.js's dev-time proxy (same mental model in dev and prod).
-	reverse_proxy /api/* 127.0.0.1:8000
+	# Mutually-exclusive routes keep /api/* from being rewritten to the SPA.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8000
+	}
 
-	# Static frontend build. dist/ is gitignored and must be built fresh
-	# (npm run build in app/frontend) and scp'd here — see deploy/README.md.
-	root * /opt/sumina/repo/app/frontend/dist
-	file_server
-
-	# SPA fallback: the router has no basename, so every non-file,
-	# non-/api/* path falls through to index.html for client-side routing.
-	try_files {path} /index.html
+	handle {
+		root * /opt/sumina/repo/app/frontend/dist
+		try_files {path} /index.html
+		file_server
+	}
 }
