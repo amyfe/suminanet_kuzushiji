@@ -465,9 +465,11 @@ class SuminaNetRecognizer(nn.Module):
         )
 
         roi_feats_for_refine = roi_out["roi_feats"]
-        if _crop_stream is not None and _crop_feats is not None and self.crop_fusion is not None:
-            # Wait for crop encoder stream before fusing (CUDA only)
-            if torch.cuda.is_available():
+        if _crop_feats is not None and self.crop_fusion is not None:
+            # Wait for crop encoder stream before fusing (CUDA only -- on CPU
+            # _crop_stream is always None since streams don't exist there, but
+            # _crop_feats is still valid and must still be fused in).
+            if _crop_stream is not None and torch.cuda.is_available():
                 torch.cuda.current_stream().wait_stream(_crop_stream)
             # Align T dimension if roi_pool used a different cap (safety, rarely fires)
             T_out = roi_out["roi_feats"].size(1)
