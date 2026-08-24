@@ -17,6 +17,7 @@ const About = () => {
   const p1 = t('about.p1', { returnObjects: true })
   const p2 = t('about.p2', { returnObjects: true })
   const p3 = t('about.p3', { returnObjects: true })
+  const acknowledgments = t('about.acknowledgments', { returnObjects: true })
   const etymology = t('about.etymology', { returnObjects: true })
 
   return (
@@ -35,6 +36,8 @@ const About = () => {
           <p>{renderSegments(p1)}</p>
           <p>{renderSegments(p2)}</p>
           <p>{renderSegments(p3)}</p>
+          <h3>{t('about.acknowledgmentsHeading')}</h3>
+          <p>{renderSegments(acknowledgments)}</p>
           <div className="about-etymology">
             {t('about.creditLine')}
             <br />

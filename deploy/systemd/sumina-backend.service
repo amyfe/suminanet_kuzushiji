@@ -1,0 +1,65 @@
+# Sumina backend — systemd unit
+#
+# Install: see deploy/README.md Phase C. Summary:
+#   sudo cp deploy/systemd/sumina-backend.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sumina-backend
+#
+# After every start/restart, verify readiness via the JSON body, not
+# `systemctl status` — see the note on Restart= below.
+
+[Unit]
+Description=Sumina backend (Kuzushiji transcription/translation API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=sumina
+Group=sumina
+WorkingDirectory=/opt/sumina/repo
+
+# Read by systemd (PID 1, running as root) before it execs the service below —
+# so this file can stay root:root, mode 600, denying the sumina process itself
+# any direct filesystem read of the raw secrets, even if that process were
+# ever compromised. app.py's own load_dotenv() call becomes a harmless no-op
+# for any key already injected here (python-dotenv doesn't override
+# already-set env vars).
+EnvironmentFile=/opt/sumina/repo/.env
+
+# --workers 1 is required: rate-limit and model-ready state live in in-process
+# memory (see app/backend/README.md), a second worker would get its own copy.
+# No --host override: Uvicorn's CLI default (127.0.0.1, loopback-only) is
+# deliberate — the raw process is never exposed externally, only Caddy is.
+# --proxy-headers --forwarded-allow-ips=127.0.0.1 makes explicit what was
+# previously only true because it happens to be Uvicorn's own default —
+# removes the latent risk of a future Uvicorn upgrade silently changing that
+# default and breaking per-IP rate limiting.
+ExecStart=/opt/sumina/repo/.venv/bin/uvicorn app.backend.app:app \
+    --port 8000 \
+    --workers 1 \
+    --proxy-headers \
+    --forwarded-allow-ips=127.0.0.1
+
+# NOTE: Restart=on-failure does NOT cover the one failure mode most likely to
+# actually occur — if model/checkpoint loading throws inside app.py's
+# lifespan(), the exception is caught there, _state["error"] is set, and the
+# process keeps running (exits lifespan() normally, never crashes). systemd
+# sees a healthy, still-running process and will NOT restart it, because
+# there is nothing to restart. The only way to catch this is checking
+# /api/health's JSON `ready` field after every start — see deploy/README.md.
+Restart=on-failure
+RestartSec=5
+
+# Light sandboxing. Nothing in the request handlers writes to disk (no
+# request-scoped temp files, logging goes to stderr only), so this should
+# work with no ReadWritePaths=. If the first live start throws a permission
+# error (e.g. a torch/mecab cache directory wanting write access), loosen to
+# ProtectSystem=full or add an explicit ReadWritePaths=.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

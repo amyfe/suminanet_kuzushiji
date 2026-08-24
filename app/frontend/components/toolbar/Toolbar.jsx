@@ -58,6 +58,11 @@ export default function Navbar() {
               {t('toolbar.policy')}
             </NavLink>
           </li>
+          <li>
+            <NavLink to="/impressum" className={({ isActive }) => (isActive ? 'active' : undefined)} onClick={() => setMenuOpen(false)}>
+              {t('toolbar.impressum')}
+            </NavLink>
+          </li>
           <li className="navbar-lang">
             {LANGUAGES.map((lang) => (
               <button

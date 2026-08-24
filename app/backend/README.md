@@ -109,6 +109,10 @@ of process memory (e.g. Redis) — each Uvicorn worker is a separate process wit
 own copy of `_state`, `_translate_request_log`, etc., and would independently reload
 the model into memory and enforce rate limits per-process instead of globally.
 
+For a production systemd deployment, see
+[`deploy/README.md`](../../deploy/README.md) and
+[`deploy/systemd/sumina-backend.service`](../../deploy/systemd/sumina-backend.service).
+
 ## Hardware requirements
 
 - CPU-only works (either because no CUDA device is present, or as the automatic

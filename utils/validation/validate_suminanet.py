@@ -1573,14 +1573,14 @@ def run_validation(
         gt_total_counter=gt_total_counter,
         vocab=vocab,
         out_path=out_dir / "confusion_matrix.png",
-        top_n=40,
+        top_n=20,
     )
     plot_confusion_matrix_clustered(
         error_counter=error_counter,
         gt_total_counter=gt_total_counter,
         vocab=vocab,
         out_path=out_dir / "confusion_matrix_clustered.png",
-        top_n=40,
+        top_n=20,
     )
 
     # Hard-errors confusion matrix: excludes kana script mixups (ハ↔は etc.).
@@ -1591,14 +1591,14 @@ def run_validation(
             gt_total_counter=gt_total_counter,
             vocab=vocab,
             out_path=out_dir / "confusion_matrix_hard.png",
-            top_n=40,
+            top_n=20,
         )
         plot_confusion_matrix_clustered(
             error_counter=hard_error_counter,
             gt_total_counter=gt_total_counter,
             vocab=vocab,
             out_path=out_dir / "confusion_matrix_hard_clustered.png",
-            top_n=40,
+            top_n=20,
         )
 
     # Confusion gallery: actual glyph crops for the top hard (non-kana-mixup)
@@ -1610,7 +1610,7 @@ def run_validation(
         error_counter=hard_error_counter if hard_error_counter else error_counter,
         vocab=vocab,
         out_path=out_dir / "confusion_gallery.png",
-        top_n=12,
+        top_n=5,
     )
 
     plot_stage_error_attribution(
@@ -1650,14 +1650,14 @@ def run_validation(
             gt_total_counter=gt_total_counter,
             vocab=vocab,
             out_path=out_dir / "confusion_matrix_kanji.png",
-            top_n=40,
+            top_n=20,
         )
         plot_confusion_matrix_clustered(
             error_counter=kanji_error_counter,
             gt_total_counter=gt_total_counter,
             vocab=vocab,
             out_path=out_dir / "confusion_matrix_kanji_clustered.png",
-            top_n=40,
+            top_n=20,
         )
 
     # -----------------------------------------------------------------------

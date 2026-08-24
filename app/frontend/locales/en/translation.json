@@ -6,6 +6,7 @@
         "examples": "Examples",
         "about": "About",
         "policy": "Privacy Policy",
+        "impressum": "Legal Notice",
         "tryIt": "Try it →"
     },
     "home": {
@@ -112,6 +113,14 @@
             { "a": { "href": "/policy" }, "text": "privacy policy" },
             { "text": " for details. The model was trained using data from CODH. Translation is performed using the Mecab and Unidic for normalization and the Claude API (Somnet model) for translation." }
         ],
+        "acknowledgmentsHeading": "Acknowledgments",
+        "acknowledgments": [
+            { "text": "Sumina began as a thesis project at Goethe University Frankfurt, supervised by " },
+            { "b": "Florian Büttner" },
+            { "text": " and his lab, with generous guidance on the historical Japanese side from " },
+            { "b": "Michael Kinski" },
+            { "text": ". Their support made this project possible." }
+        ],
         "etymology": [
             { "text": "The name fuses 墨 " },
             { "b": "sumi" },
@@ -182,12 +191,58 @@
                 ]
             },
             {
+                "heading": "Data retention and deletion",
+                "paragraphs": [
+                    "We delete personal data as soon as the underlying processing purpose no longer applies and no legal retention obligation prevents deletion. Uploaded images and submitted text are processed only in server memory for the duration of the request and discarded afterward — nothing is written to disk.",
+                    "IP addresses are held only briefly in memory to enforce rate limits and are cleared automatically. They are not written to log files on disk."
+                ]
+            },
+            {
+                "heading": "Hosting provider",
+                "paragraphs": [
+                    "To provide this service, we use storage space and computing capacity rented from a server provider (web host). Legal basis: legitimate interests (Art. 6(1)(f) GDPR).",
+                    "Provider: 1&1 IONOS SE, Elgendorfer Str. 57, 56410 Montabaur, Germany. Website: https://www.ionos.de. Privacy policy: https://www.ionos.de/terms-gtc/terms-privacy. Data processing agreement (AVV): https://www.ionos.de/hilfe/datenschutz/allgemeine-informationen-zur-datenschutz-grundverordnung-dsgvo/vereinbarung-zur-auftragsverarbeitung-avv-mit-ionos-abschliessen/."
+                ]
+            },
+            {
+                "heading": "Translation service provider",
+                "paragraphs": [
+                    "To generate the translation, the transcribed text you've corrected (never images) is sent to Anthropic's Claude model, accessed via the OpenRouter API. Legal basis: performance of the contract to provide the translation feature you requested (Art. 6(1)(b) GDPR).",
+                    "Providers: Anthropic PBC (San Francisco, USA) and OpenRouter, Inc. (USA). Because both providers are located outside the EU/EEA, this involves a transfer of data to a third country. For details on their respective safeguards, see their privacy policies: https://www.anthropic.com/legal/privacy and https://openrouter.ai/privacy. We recommend verifying the current state of these before this goes live in real public production, as provider policies can change."
+                ]
+            },
+            {
                 "heading": "Rights of data subjects",
                 "paragraphs": [
                     "If you submit data to the service, you may request confirmation of processing, access to your data, correction, deletion, or restriction of processing in accordance with the applicable data protection law.",
                     "If you believe your rights have been violated, you may also contact the relevant data protection authority."
                 ]
             }
-        ]
+        ],
+        "lastUpdated": "Last updated: August 24, 2026",
+        "credit": "Portions of this privacy policy were drafted with the help of the free Datenschutz-Generator.de by Dr. Thomas Schwenke."
+    },
+    "impressum": {
+        "title": "Legal Notice (Impressum)",
+        "heading": "Information pursuant to Section 5 DDG (German Digital Services Act)",
+        "nameLabel": "Amina Felic",
+        "addressLines": [
+            "Hammarskjöldring 156",
+            "60439 Frankfurt am Main",
+            "Germany"
+        ],
+        "contactHeading": "Contact",
+        "emailLabel": "Email: felic.amina@gmail.com",
+        "natureHeading": "Nature of this offering",
+        "natureText": "Sumina is a non-commercial research prototype developed as part of a thesis project. It is not a commercial offering; company register and VAT ID details therefore do not apply.",
+        "institutionHeading": "Institutional context",
+        "institutionText": "This project is being developed as part of a thesis at Goethe University Frankfurt. Editorial and legal responsibility for this offering rests with the individual named above, not with the university.",
+        "responsibleHeading": "Responsible for content",
+        "responsibleText": "Amina Felic (address as above).",
+        "liabilityContentHeading": "Liability for content",
+        "liabilityContentText": "As a service provider, we are responsible for our own content on these pages in accordance with general law, pursuant to Section 7(1) DDG. However, pursuant to Sections 8 to 10 DDG, we as a service provider are not obligated to monitor transmitted or stored third-party information, or to investigate circumstances indicating illegal activity. Obligations to remove or block the use of information under general law remain unaffected. Liability in this regard is only possible from the point in time at which a specific infringement becomes known. Upon becoming aware of any such infringements, we will remove the relevant content immediately.",
+        "liabilityLinksHeading": "Liability for links",
+        "liabilityLinksText": "Our offering contains links to external third-party websites, over whose content we have no control. We therefore cannot assume any liability for this external content. The respective provider or operator of each linked page is always responsible for its content. The linked pages were checked for possible legal violations at the time of linking. No illegal content was identifiable at that time. Continuous monitoring of the content of linked pages is not reasonable without concrete evidence of a legal violation. Upon becoming aware of any legal violations, we will remove such links immediately.",
+        "policyLinkText": "For information on how we process personal data, see our privacy policy."
     }
 }

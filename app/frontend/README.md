@@ -47,7 +47,9 @@ With both unset (the default), behavior is unchanged from before: relative
 - **Dev**: [`vite.config.js`](vite.config.js) proxies `/api/*` to
   `http://localhost:8000` (the FastAPI dev server); no env vars needed.
 - **Production, same origin**: leave `VITE_API_BASE` unset and route `/api/*` to
-  the backend at the reverse proxy / static host level.
+  the backend at the reverse proxy / static host level. See
+  [`deploy/caddy/Caddyfile`](../../deploy/caddy/Caddyfile) for a concrete
+  implementation of this scenario.
 - **Production, different origin**: set `VITE_API_BASE` to the backend's URL at
   build time. Note this is baked into the static bundle — changing it requires a
   rebuild, not just a redeploy of the same `dist/`.

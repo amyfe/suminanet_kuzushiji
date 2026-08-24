@@ -1,0 +1,37 @@
+# Sumina — Caddyfile
+#
+# Install: see deploy/README.md Phase C. Summary:
+#   sudo cp deploy/caddy/Caddyfile /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# Automatic HTTPS is zero-config here PROVIDED: (1) your-domain.example below
+# is replaced with a real FQDN, not localhost/an IP; (2) DNS A/AAAA for that
+# domain already resolves to this VPS's public IP before Caddy first starts;
+# (3) ufw allows 80 and 443 inbound; (4) Caddy was installed via its official
+# apt repository (see bootstrap.sh), whose packaged caddy.service already has
+# CAP_NET_BIND_SERVICE to bind those ports without running as root.
+#
+# Let's Encrypt rate-limits certificates per domain per week — while first
+# validating DNS/reachability, consider pointing at the ACME staging CA to
+# avoid burning production attempts on troubleshooting:
+#   { acme_ca https://acme-staging-v02.api.letsencrypt.org/directory }
+# Remove that override once reachability is confirmed, then reload again to
+# get the real, browser-trusted certificate.
+
+your-domain.example {
+	encode zstd gzip
+
+	# Unstripped: forwards the full path (/api/transcribe, /api/translate,
+	# /api/health) unchanged, matching FastAPI's actual routes and mirroring
+	# vite.config.js's dev-time proxy (same mental model in dev and prod).
+	reverse_proxy /api/* 127.0.0.1:8000
+
+	# Static frontend build. dist/ is gitignored and must be built fresh
+	# (npm run build in app/frontend) and scp'd here — see deploy/README.md.
+	root * /opt/sumina/repo/app/frontend/dist
+	file_server
+
+	# SPA fallback: the router has no basename, so every non-file,
+	# non-/api/* path falls through to index.html for client-side routing.
+	try_files {path} /index.html
+}

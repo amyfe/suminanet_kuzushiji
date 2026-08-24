@@ -1,0 +1,59 @@
+# Production install list for the backend API server — NOT for training/dev.
+#
+# This is requirements.txt minus sam-2 and its SAM2-only transitive deps.
+# SAM2 is confirmed training-only (never imported by app/backend/app.py or
+# anything it calls at request time — it's used solely by
+# utils/sam2/preprocess_sam2_*.py during dataset preparation). Its `sam-2`
+# git dependency typically attempts a CUDA-extension build on install, which
+# is unnecessary risk on a CPU-only production box for a package the server
+# never loads. Kept as a separate file (not edited into requirements.txt
+# itself) so the dev/training install path is unaffected.
+#
+# Install with the CPU wheel index for torch/torchvision FIRST (see
+# deploy/bootstrap.sh) — this file alone does not prevent pip from resolving
+# GPU/CUDA wheels for torch, since PyPI's default index serves those unless
+# told otherwise:
+#   pip install torch>=2.12.1 torchvision>=0.27.1 --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r deploy/requirements-deploy.txt
+
+# Core scientific packages
+numpy>=2.5.1
+matplotlib>=3.11.0
+pillow>=12.2.0
+pytest>=9.1.1
+
+# PyTorch (CPU version) — installed separately first, see header above.
+torch>=2.12.1
+torchvision>=0.27.1
+
+# Data handling (if used)
+pandas>= 3.0.3
+scikit-learn>=1.9.0
+
+# Python
+opencv-python>=5.0.0
+seaborn>=0.13.2
+torchmetrics>=1.9.0
+transformers>=5.13.0
+
+#Progress bar
+tqdm>=4.68.4
+optuna>=4.9.0
+
+#Translation
+anthropic>=0.116.0
+openai>=2.44.0   # Required for OpenRouter backend (OPENROUTER_API_KEY);
+python-dotenv>=1.2.2
+# fugashi requires MeCab system library (see INSTALL.md)
+fugashi>=1.5.2
+unidic-lite>=1.0.8
+
+timm>=1.0.0
+# sam-2 intentionally omitted — see header above.
+
+# Backend API
+fastapi>=0.139.0
+uvicorn>=0.50.0
+python-multipart>=0.0.29
+pydantic >= 2.13.4
+scipy>=1.18.0

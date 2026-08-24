@@ -3,6 +3,7 @@ import Home from '../../pages/Home'
 import Workspace from '../../pages/Workspace'
 import About from '../../pages/About'
 import Policy from '../../pages/Policy'
+import Impressum from '../../pages/Impressum'
 
 export default function AppRoutes() {
   return (
@@ -11,6 +12,7 @@ export default function AppRoutes() {
       <Route path="/workspace" element={<Workspace />} />
       <Route path="/about" element={<About />} />
       <Route path="/policy" element={<Policy />} />
+      <Route path="/impressum" element={<Impressum />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
