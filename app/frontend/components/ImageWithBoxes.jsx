@@ -3,10 +3,15 @@ import { scoreTier } from '../utils/text'
 import i18next from 'i18next'
 import CharTooltipContent from './CharTooltipContent'
 
-export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onToggleDeleteChar, onReplace, boxesVisible = true, onFile, zoomed = false }) {
+export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onToggleDeleteChar, onReplace, boxesVisible = true, onFile, zoomed = false, hoveredCharIdx, onHoverChar }) {
   const imgRef = useRef(null)
   const [imgDisplaySize, setImgDisplaySize] = useState(null)
-  const [hoveredCharIdx, setHoveredCharIdx] = useState(null)
+  // Local, not the shared hoveredCharIdx prop: this panel's own tooltip
+  // should only appear when the mouse is actually over one of its own
+  // boxes, not just because the OTHER panel reported a hover. The shared
+  // prop still drives this panel's highlight styling below, so hovering
+  // either panel lights up both -- only the tooltip itself stays local.
+  const [localHoveredIdx, setLocalHoveredIdx] = useState(null)
   const [dragOver, setDragOver] = useState(false)
   const t = i18next.t.bind(i18next)
 
@@ -53,17 +58,17 @@ export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onT
         return (
           <div
             key={i}
-            className={`char-box char-box--${scoreTier(c.score)}${boxesVisible ? '' : ' char-box--hidden'}${c.deleted ? ' char-box--deleted' : ''}`}
+            className={`char-box char-box--${scoreTier(c.score)}${boxesVisible ? '' : ' char-box--hidden'}${c.deleted ? ' char-box--deleted' : ''}${hoveredCharIdx === i ? ' char-box--highlighted' : ''}`}
             style={{
               left: `${leftPct}%`,
               top: `${topPct}%`,
               width: `${widthPct}%`,
               height: `${heightPct}%`,
             }}
-            onMouseEnter={() => setHoveredCharIdx(i)}
-            onMouseLeave={() => setHoveredCharIdx(null)}
+            onMouseEnter={() => { setLocalHoveredIdx(i); onHoverChar?.(i) }}
+            onMouseLeave={() => { setLocalHoveredIdx(null); onHoverChar?.(null) }}
           >
-            {hoveredCharIdx === i && (
+            {localHoveredIdx === i && (
               <div className="char-tooltip">
                 <CharTooltipContent
                   char={c.char}

@@ -26,6 +26,8 @@ export default function TranscriptionPanel({
   onReorderColumns,
   onSelectAlternate,
   onToggleDeleteChar,
+  hoveredCharIdx,
+  onHoverChar,
   onTranslate,
   translating,
   translation,
@@ -51,7 +53,12 @@ export default function TranscriptionPanel({
   const [dragOverIdx, setDragOverIdx] = useState(null)
   const [draggedDomIdx, setDraggedDomIdx] = useState(null)
   const [showIntermediate, setShowIntermediate] = useState(false)
-  const [hoveredCharIdx, setHoveredCharIdx] = useState(null)
+  // Local, not the shared hoveredCharIdx prop: this panel's own tooltip
+  // should only appear when the mouse is actually over one of its own
+  // characters, not just because the OTHER panel reported a hover. The
+  // shared prop still drives this panel's highlight styling below, so
+  // hovering either panel lights up both -- only the tooltip stays local.
+  const [localHoveredIdx, setLocalHoveredIdx] = useState(null)
   const translatingRef = useRef(null)
   const translateProgress = useSimulatedProgress(translating, 12000)
 
@@ -165,12 +172,12 @@ export default function TranscriptionPanel({
                           return (
                             <span
                               key={idx}
-                              className={`transcription-char${c.deleted ? ' transcription-char--deleted' : ''}`}
-                              onMouseEnter={() => setHoveredCharIdx(idx)}
-                              onMouseLeave={() => setHoveredCharIdx(null)}
+                              className={`transcription-char${c.deleted ? ' transcription-char--deleted' : ''}${hoveredCharIdx === idx ? ' transcription-char--highlighted' : ''}`}
+                              onMouseEnter={() => { setLocalHoveredIdx(idx); onHoverChar?.(idx) }}
+                              onMouseLeave={() => { setLocalHoveredIdx(null); onHoverChar?.(null) }}
                             >
                               {c.char}
-                              {hoveredCharIdx === idx && (
+                              {localHoveredIdx === idx && (
                                 <div className="char-tooltip char-tooltip--vertical" draggable={false}>
                                   <CharTooltipContent
                                     char={c.char}

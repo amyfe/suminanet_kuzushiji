@@ -35,6 +35,10 @@ const Workspace = () => {
   const [copied, setCopied] = useState(false)
   const [boxesVisible, setBoxesVisible] = useState(true)
   const [zoomed, setZoomed] = useState(false)
+  // Shared between the image and text panels so hovering a character in
+  // either one highlights it in both -- each panel's own tooltip stays
+  // local to itself (see ImageWithBoxes/TranscriptionPanel).
+  const [hoveredCharIdx, setHoveredCharIdx] = useState(null)
   const transcribeProgress = useSimulatedProgress(transcribing, 10000)
 
   useEffect(() => {
@@ -311,6 +315,8 @@ const Workspace = () => {
                         onSelectAlternate={handleAlternateSelect}
                         onToggleDeleteChar={handleToggleDeleteChar}
                         boxesVisible={boxesVisible}
+                        hoveredCharIdx={hoveredCharIdx}
+                        onHoverChar={setHoveredCharIdx}
                         zoomed
                       />
                       <button
@@ -333,6 +339,8 @@ const Workspace = () => {
                     onReplace={replaceImage}
                     boxesVisible={boxesVisible}
                     onFile={handleFile}
+                    hoveredCharIdx={hoveredCharIdx}
+                    onHoverChar={setHoveredCharIdx}
                   />
                 )
               ) : (
@@ -367,6 +375,8 @@ const Workspace = () => {
             onReorderColumns={handleColumnReorder}
             onSelectAlternate={handleAlternateSelect}
             onToggleDeleteChar={handleToggleDeleteChar}
+            hoveredCharIdx={hoveredCharIdx}
+            onHoverChar={setHoveredCharIdx}
             onTranslate={translate}
             translating={translating}
             translation={translation}

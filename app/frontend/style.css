@@ -604,7 +604,11 @@ a { color: inherit; }
   z-index: 3;
 }
 
-.char-box:hover {
+/* --highlighted mirrors :hover so hovering the matching character in the
+   OTHER panel (the text panel) lights this box up too, not just a literal
+   mouse-over -- see Workspace.jsx's shared hoveredCharIdx. */
+.char-box:hover,
+.char-box--highlighted {
   /* Brightens the manuscript pixels behind the (transparent) box, instead
      of tinting them — a colored overlay here made the character harder to
      read, the opposite of what hovering should do. */
@@ -620,7 +624,8 @@ a { color: inherit; }
 /* Fallback for browsers without backdrop-filter support: without this,
    hover would give zero visual feedback there since there's no more tint. */
 @supports not ((backdrop-filter: brightness(1)) or (-webkit-backdrop-filter: brightness(1))) {
-  .char-box:hover {
+  .char-box:hover,
+  .char-box--highlighted {
     background: rgba(255, 255, 255, 0.12);
   }
 }
@@ -855,7 +860,11 @@ a { color: inherit; }
   transition: background 0.1s;
 }
 
-.transcription-char:hover {
+/* --highlighted mirrors :hover so hovering the matching character in the
+   OTHER panel (the image) lights this span up too, not just a literal
+   mouse-over -- see Workspace.jsx's shared hoveredCharIdx. */
+.transcription-char:hover,
+.transcription-char--highlighted {
   background: rgba(178, 58, 43, 0.12);
 }
 
