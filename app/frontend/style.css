@@ -4,6 +4,13 @@
   padding: 0;
 }
 
+html {
+  /* Fixed navbar is 56px tall — keep scrollIntoView() targets (Home.jsx's
+     anchor links, TranscriptionPanel's auto-scroll-on-translate) from
+     landing flush underneath it. */
+  scroll-padding-top: 72px;
+}
+
 :root {
   --font-display: 'Shippori Mincho', serif;
   --font-serif: 'Newsreader', Georgia, serif;
@@ -459,6 +466,29 @@ a { color: inherit; }
   z-index: 1;
 }
 
+.panel-eye-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  cursor: pointer;
+  color: var(--label);
+  padding: 3px;
+  transition: color 0.15s, background 0.15s;
+}
+
+.panel-eye-toggle svg {
+  width: 20px;
+  height: 20px;
+}
+
+.panel-eye-toggle:hover {
+  color: var(--ink-2);
+  background: rgba(33, 29, 24, 0.06);
+}
+
 /* Image + box overlay */
 .image-overlay-container {
   position: relative;
@@ -502,33 +532,51 @@ a { color: inherit; }
   border: 3px solid rgba(178, 58, 43, 0.75);
   border-radius: 2px;
   cursor: default;
-  transition: background 0.1s;
+  transition: -webkit-backdrop-filter 0.1s, backdrop-filter 0.1s;
   overflow: visible;
   z-index: 3;
 }
 
 .char-box:hover {
-  background: rgba(178, 58, 43, 0.15);
+  /* Brightens the manuscript pixels behind the (transparent) box, instead
+     of tinting them — a colored overlay here made the character harder to
+     read, the opposite of what hovering should do. */
+  -webkit-backdrop-filter: brightness(1.35) contrast(1.1);
+  backdrop-filter: brightness(1.35) contrast(1.1);
+  /* Each .char-box is its own stacking context (position + z-index), so a
+     sibling box later in DOM order otherwise paints over this one's tooltip
+     regardless of the tooltip's own z-index. Lift the whole hovered box
+     above all sibling boxes while its tooltip is showing. */
+  z-index: 20;
 }
 
-/* Confidence tiers — mirror utils/text.js's scoreTier() thresholds. */
+/* Fallback for browsers without backdrop-filter support: without this,
+   hover would give zero visual feedback there since there's no more tint. */
+@supports not ((backdrop-filter: brightness(1)) or (-webkit-backdrop-filter: brightness(1))) {
+  .char-box:hover {
+    background: rgba(255, 255, 255, 0.12);
+  }
+}
+
+/* Confidence tiers — mirror utils/text.js's scoreTier() thresholds. The
+   hover brighten effect above is intentionally identical across tiers —
+   it's a legibility aid, not a confidence indicator. */
 .char-box--high {
   border-color: rgba(46, 125, 50, 0.75);
-}
-.char-box--high:hover {
-  background: rgba(46, 125, 50, 0.15);
 }
 .char-box--medium {
   border-color: rgba(224, 160, 0, 0.8);
 }
-.char-box--medium:hover {
-  background: rgba(224, 160, 0, 0.15);
-}
 .char-box--low {
   border-color: rgba(198, 40, 40, 0.8);
 }
-.char-box--low:hover {
-  background: rgba(198, 40, 40, 0.15);
+
+/* Boxes-visibility toggle (Workspace eye button). Only border-color needs
+   overriding — .char-box never sets a resting background of its own, so
+   hover (backdrop-filter + z-index only, no border-color) keeps working
+   even while this class hides the border. */
+.char-box--hidden {
+  border-color: transparent;
 }
 
 .char-tooltip {
@@ -645,6 +693,10 @@ a { color: inherit; }
   letter-spacing: 0.05em;
   border-radius: 3px;
   transition: background 0.12s, outline-color 0.12s;
+}
+
+.transcription-vertical-col:not(:last-child) {
+  border-right: 1px solid var(--border-soft);
 }
 
 /* Manual reading-order fix (6.19): drag a column to move it elsewhere. */
@@ -897,6 +949,7 @@ a { color: inherit; }
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 1.4rem;
   margin-top: 2.5rem;
+  margin-bottom: 1.5rem;
 }
 
 .example-card {

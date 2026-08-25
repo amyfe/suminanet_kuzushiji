@@ -93,31 +93,82 @@
 .navbar-lang {
   display: flex;
   align-items: center;
-  gap: 2px;
   margin-left: 4px;
 }
 
-.lang-btn {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.04em;
-  background: none;
-  border: none;
-  color: #a8987f;
-  padding: 5px 7px;
-  border-radius: 4px;
+.lang-switch {
+  display: inline-flex;
+  align-items: center;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  -webkit-tap-highlight-color: transparent;
 }
 
-.lang-btn:hover {
-  background-color: rgba(255, 255, 255, 0.1);
-  color: #fff;
+/* Visually hidden but keyboard-focusable/AT-visible — standard sr-only
+   pattern, not display:none/opacity:0 (which would break focus). */
+.lang-switch input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
-.lang-btn.active {
+.lang-switch-track {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 56px;
+  height: 24px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  transition: border-color 0.15s;
+}
+
+.lang-switch:hover .lang-switch-track {
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.lang-switch input:focus-visible ~ .lang-switch-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.lang-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 26px;
+  height: 18px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.12);
+  transition: transform 0.18s ease;
+}
+
+.lang-switch input:checked ~ .lang-switch-track .lang-switch-thumb {
+  transform: translateX(26px);
+}
+
+.lang-switch-option {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: #a8987f;
+  transition: color 0.18s ease;
+  pointer-events: none;
+}
+
+.lang-switch input:not(:checked) ~ .lang-switch-track .lang-switch-option:first-child,
+.lang-switch input:checked ~ .lang-switch-track .lang-switch-option:last-child {
   color: #fff;
-  background-color: rgba(255, 255, 255, 0.08);
 }
 
 .navbar-cta {

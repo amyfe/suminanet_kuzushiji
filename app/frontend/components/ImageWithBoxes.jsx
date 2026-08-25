@@ -3,7 +3,7 @@ import { scoreTier } from '../utils/text'
 import i18next from 'i18next'
 import CharTooltipContent from './CharTooltipContent'
 
-export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onReplace }) {
+export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onReplace, boxesVisible = true }) {
   const imgRef = useRef(null)
   const [imgDisplaySize, setImgDisplaySize] = useState(null)
   const [hoveredCharIdx, setHoveredCharIdx] = useState(null)
@@ -40,7 +40,7 @@ export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onR
         return (
           <div
             key={i}
-            className={`char-box char-box--${scoreTier(c.score)}`}
+            className={`char-box char-box--${scoreTier(c.score)}${boxesVisible ? '' : ' char-box--hidden'}`}
             style={{
               left: `${leftPct}%`,
               top: `${topPct}%`,

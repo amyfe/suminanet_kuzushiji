@@ -7,7 +7,7 @@
         "about": "Über uns",
         "policy": "Datenschutz",
         "impressum": "Impressum",
-        "tryIt": "Ausprobieren →"
+        "tryIt": "Jetzt ausprobieren →"
     },
     "home": {
         "heroEyebrow": "墨 SUMI · AUF SUMINANET AUFGEBAUT 黒",
@@ -56,7 +56,9 @@
         "copiedText": "Kopiert ✓",
         "transcribingLabel": "Zeichen werden erkannt…",
         "replaceImageBtn": "Neues Bild hochladen",
-        "replaceImageHint": "Bild anklicken zum Ersetzen"
+        "replaceImageHint": "Bild anklicken zum Ersetzen",
+        "showBoxesLabel": "Erkannte Zeichen einblenden",
+        "hideBoxesLabel": "Erkannte Zeichen ausblenden"
     },
     "transcriptionPanel": {
         "panelHeader": "TRANSKRIPTION · 翻刻",
@@ -72,7 +74,7 @@
         "targetLangAriaLabel": "Übersetzungssprache",
         "exportLabel": "EXPORT",
         "downloadBtn": "Als .txt herunterladen",
-        "includeNotesLabel": "Anmerkungen einschließen (verbraucht mehr Tokens)",
+        "includeNotesLabel": "Anmerkungen einschließen (verbraucht mehr Tokens/ Credits)",
         "showIntermediateLabel": "Zwischenschritte anzeigen",
         "normalizedLabel": "Normalisiertes klassisches Japanisch",
         "modernLabel": "Modernes Japanisch",

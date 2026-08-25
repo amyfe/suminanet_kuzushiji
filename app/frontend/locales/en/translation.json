@@ -13,7 +13,7 @@
         "heroEyebrow": "墨 SUMI · BUILT ON SUMINANET 黒",
         "heroTitle": "Read the hand of Edo.",
         "heroSub": "Sumina reads the cursive kuzushiji in your scans of woodblock prints and manuscripts, lets you correct the draft, and renders centuries of Japanese into English you can actually read.",
-        "heroCta": "Try it now →",
+        "heroCta": "Try it →",
         "howTitle": "How it works",
         "how_steps": [
             { "step": 1, "title": "Upload a scan", "body": "Drop in a photograph or scan of any woodblock print or handwritten manuscript — modern or Edo-era." },
@@ -58,7 +58,9 @@
         "copiedText": "Copied ✓",
         "transcribingLabel": "Detecting characters…",
         "replaceImageBtn": "Upload new image",
-        "replaceImageHint": "Click image to replace"
+        "replaceImageHint": "Click image to replace",
+        "showBoxesLabel": "Show detected characters",
+        "hideBoxesLabel": "Hide detected characters"
     },
     "transcriptionPanel": {
         "panelHeader": "TRANSCRIPTION · 翻刻",
@@ -74,7 +76,7 @@
         "targetLangAriaLabel": "Translation language",
         "exportLabel": "EXPORT",
         "downloadBtn": "Download .txt",
-        "includeNotesLabel": "Include notes (uses more tokens)",
+        "includeNotesLabel": "Include notes (uses more tokens/credits)",
         "showIntermediateLabel": "Show intermediate steps",
         "normalizedLabel": "Normalized classical Japanese",
         "modernLabel": "Modern Japanese",

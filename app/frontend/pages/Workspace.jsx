@@ -4,6 +4,7 @@ import { Animation } from '../components/LoadingIndicator'
 import TranscriptionPanel from './TranscriptionPanel'
 import { useState } from 'react'
 import { useLocation } from 'react-router'
+import { FaEye, FaEyeSlash } from 'react-icons/fa'
 import i18next from 'i18next'
 import { columnsFromChars } from '../utils/text'
 import { apiFetch } from '../utils/api'
@@ -29,6 +30,7 @@ const Workspace = () => {
   const [transcribing, setTranscribing] = useState(false)
   const [translating, setTranslating] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [boxesVisible, setBoxesVisible] = useState(true)
 
   function handleTranscriptionChange(value) {
     setTranscription(value)
@@ -214,7 +216,20 @@ const Workspace = () => {
       <div className="results-layout">
         <div className="image-panel">
           <div className="panel-frame">
-            <div className="panel-bar">{t('workspace.panelOriginal')}</div>
+            <div className="panel-bar">
+              {t('workspace.panelOriginal')}
+              {hasBoxes && (
+                <button
+                  type="button"
+                  className="panel-eye-toggle"
+                  onClick={() => setBoxesVisible((v) => !v)}
+                  aria-pressed={boxesVisible}
+                  aria-label={boxesVisible ? t('workspace.hideBoxesLabel') : t('workspace.showBoxesLabel')}
+                >
+                  {boxesVisible ? <FaEye /> : <FaEyeSlash />}
+                </button>
+              )}
+            </div>
             <div className="panel-body">
               {transcribing ? (
                 <Animation label={t('workspace.transcribingLabel')} />
@@ -224,6 +239,7 @@ const Workspace = () => {
                   chars={chars}
                   onSelectAlternate={handleAlternateSelect}
                   onReplace={replaceImage}
+                  boxesVisible={boxesVisible}
                 />
               ) : (
                 <UploadArea imageUrl={imageUrl} onFile={handleFile} />
@@ -231,13 +247,15 @@ const Workspace = () => {
             </div>
           </div>
           <div className="actions">
-            <button
-              className="btn btn-primary"
-              onClick={transcribe}
-              disabled={!image || transcribing}
-            >
-              {transcribing ? t('workspace.transcribingBtn') : t('workspace.transcribeBtn')}
-            </button>
+            {!transcribing && (
+              <button
+                className="btn btn-primary"
+                onClick={transcribe}
+                disabled={!image}
+              >
+                {t('workspace.transcribeBtn')}
+              </button>
+            )}
             {imageUrl && (
               <button className="btn btn-secondary" onClick={replaceImage} disabled={transcribing}>
                 {t('workspace.replaceImageBtn')}

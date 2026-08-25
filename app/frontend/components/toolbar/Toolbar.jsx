@@ -3,11 +3,6 @@ import { NavLink, useNavigate } from 'react-router'
 import i18next from 'i18next'
 import './Toolbar.css'
 
-const LANGUAGES = [
-  { code: 'en', label: 'EN' },
-  { code: 'de', label: 'DE' },
-]
-
 function changeLanguage(code) {
   localStorage.setItem('i18nextLng', code)
   window.location.reload()
@@ -53,28 +48,31 @@ export default function Navbar() {
               {t('toolbar.about')}
             </NavLink>
           </li>
-          <li>
+          {/* <li>
             <NavLink to="/policy" className={({ isActive }) => (isActive ? 'active' : undefined)} onClick={() => setMenuOpen(false)}>
               {t('toolbar.policy')}
             </NavLink>
-          </li>
+          </li> */}
           <li>
             <NavLink to="/impressum" className={({ isActive }) => (isActive ? 'active' : undefined)} onClick={() => setMenuOpen(false)}>
               {t('toolbar.impressum')}
             </NavLink>
           </li>
           <li className="navbar-lang">
-            {LANGUAGES.map((lang) => (
-              <button
-                key={lang.code}
-                type="button"
-                className={`lang-btn ${i18next.language === lang.code ? 'active' : ''}`}
-                onClick={() => changeLanguage(lang.code)}
-                aria-label={`Switch language to ${lang.label}`}
-              >
-                {lang.label}
-              </button>
-            ))}
+            <label className="lang-switch">
+              <input
+                type="checkbox"
+                role="switch"
+                checked={i18next.language === 'de'}
+                onChange={(e) => changeLanguage(e.target.checked ? 'de' : 'en')}
+                aria-label={i18next.language === 'de' ? 'Switch language to English' : 'Switch language to German'}
+              />
+              <span className="lang-switch-track" aria-hidden="true">
+                <span className="lang-switch-option">EN</span>
+                <span className="lang-switch-option">DE</span>
+                <span className="lang-switch-thumb" />
+              </span>
+            </label>
           </li>
         </ul>
         <NavLink to="/workspace" className="navbar-cta" onClick={() => setMenuOpen(false)}>

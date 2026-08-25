@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { columnsOf, columnsFromChars } from '../utils/text'
 import { Animation } from '../components/LoadingIndicator'
 import CharTooltipContent from '../components/CharTooltipContent'
@@ -48,10 +48,17 @@ export default function TranscriptionPanel({
   const [dragOverIdx, setDragOverIdx] = useState(null)
   const [showIntermediate, setShowIntermediate] = useState(false)
   const [hoveredCharIdx, setHoveredCharIdx] = useState(null)
+  const translatingRef = useRef(null)
 
   useEffect(() => {
     if (!includeNotes) setShowIntermediate(false)
   }, [includeNotes])
+
+  useEffect(() => {
+    if (translating) {
+      translatingRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }, [translating])
 
   // Prefer true column boundaries from the detected char boxes (matches the
   // manuscript's actual layout). Only valid while chars still matches the
@@ -190,13 +197,15 @@ export default function TranscriptionPanel({
       </div>
 
       <div className="translate-row">
-        <button
-          className="btn btn-primary"
-          onClick={onTranslate}
-          disabled={!transcription || translating}
-        >
-          {translating ? t('transcriptionPanel.translatingBtn') : t('transcriptionPanel.translateBtn')}
-        </button>
+        {!translating && (
+          <button
+            className="btn btn-primary"
+            onClick={onTranslate}
+            disabled={!transcription}
+          >
+            {t('transcriptionPanel.translateBtn')}
+          </button>
+        )}
         <div className="lang-select-wrap">
           <span className={`fi fi-${TARGET_LANGUAGES.find((l) => l.code === targetLang)?.country} lang-select-flag`} aria-hidden="true" />
           <select
@@ -225,7 +234,11 @@ export default function TranscriptionPanel({
         {t('transcriptionPanel.includeNotesLabel')}
       </label>
 
-      {translating && <Animation label={t('transcriptionPanel.translatingLabel')} />}
+      {translating && (
+        <div ref={translatingRef}>
+          <Animation label={t('transcriptionPanel.translatingLabel')} />
+        </div>
+      )}
 
       {translation && (
         <div className="result-box translation">
