@@ -58,7 +58,9 @@
         "replaceImageBtn": "Neues Bild hochladen",
         "replaceImageHint": "Bild anklicken zum Ersetzen",
         "showBoxesLabel": "Erkannte Zeichen einblenden",
-        "hideBoxesLabel": "Erkannte Zeichen ausblenden"
+        "hideBoxesLabel": "Erkannte Zeichen ausblenden",
+        "zoomInLabel": "Vergrößern",
+        "zoomOutLabel": "Verkleinern"
     },
     "transcriptionPanel": {
         "panelHeader": "TRANSKRIPTION · 翻刻",
@@ -93,7 +95,9 @@
     },
     "imageWithBoxes": {
         "overlayAlt": "Manuskript mit Anmerkungen",
-        "useAlternate": "Stattdessen {{char}} verwenden"
+        "useAlternate": "Stattdessen {{char}} verwenden",
+        "deleteCharLabel": "Als Hintergrund markieren (kein Text)",
+        "restoreCharLabel": "Wiederherstellen — wieder als Text behandeln"
     },
     "about": {
         "eyebrow": "ÜBER UNS · 沿革",

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { columnsOf, columnsFromChars } from '../utils/text'
 import { Animation } from '../components/LoadingIndicator'
 import CharTooltipContent from '../components/CharTooltipContent'
+import useSimulatedProgress from '../utils/useSimulatedProgress'
 import i18next from 'i18next'
 
 const VERTICAL_TARGET_CHARS_PER_COL = 14
@@ -19,10 +20,12 @@ const DEGRADED_METHODS = new Set(['mecab+unidic', 'mecab+unidic-lite', 'heuristi
 
 export default function TranscriptionPanel({
   transcription,
+  visibleTranscription,
   chars,
   onTranscriptionChange,
   onReorderColumns,
   onSelectAlternate,
+  onToggleDeleteChar,
   onTranslate,
   translating,
   translation,
@@ -46,9 +49,11 @@ export default function TranscriptionPanel({
     de: t('transcriptionPanel.resultLabelDe'),
   }
   const [dragOverIdx, setDragOverIdx] = useState(null)
+  const [draggedDomIdx, setDraggedDomIdx] = useState(null)
   const [showIntermediate, setShowIntermediate] = useState(false)
   const [hoveredCharIdx, setHoveredCharIdx] = useState(null)
   const translatingRef = useRef(null)
+  const translateProgress = useSimulatedProgress(translating, 12000)
 
   useEffect(() => {
     if (!includeNotes) setShowIntermediate(false)
@@ -94,11 +99,11 @@ export default function TranscriptionPanel({
   // user edits, chars/transcription fall out of sync and this reverts to a
   // single unbroken line, same as `reorderable` already does.
   const readingOrderColStrings = charsInSync
-    ? columnsFromChars(chars).map((col) => col.map((c) => c.char).join(''))
+    ? columnsFromChars(chars).map((col) => col.filter((c) => !c.deleted).map((c) => c.char).join(''))
     : null
   const textareaValue = readingOrderColStrings && readingOrderColStrings.length > 1
     ? readingOrderColStrings.join('\n')
-    : transcription
+    : visibleTranscription
 
   // cols is already reversed relative to columnsFromChars' canonical reading
   // order (rightmost/first-read column rendered last in DOM, since a plain
@@ -111,6 +116,7 @@ export default function TranscriptionPanel({
   function handleColDragStart(e, domIdx) {
     e.dataTransfer.setData('text/plain', String(domIdx))
     e.dataTransfer.effectAllowed = 'move'
+    setDraggedDomIdx(domIdx)
   }
 
   function handleColDragOver(e, domIdx) {
@@ -121,10 +127,16 @@ export default function TranscriptionPanel({
   function handleColDrop(e, domIdx) {
     e.preventDefault()
     setDragOverIdx(null)
+    setDraggedDomIdx(null)
     const fromDomIdx = Number(e.dataTransfer.getData('text/plain'))
     if (Number.isNaN(fromDomIdx) || fromDomIdx === domIdx) return
     onReorderColumns?.(domToCanonical(fromDomIdx), domToCanonical(domIdx))
   }
+
+  const dragOverSide =
+    dragOverIdx !== null && draggedDomIdx !== null && dragOverIdx !== draggedDomIdx
+      ? (dragOverIdx > draggedDomIdx ? 'right' : 'left')
+      : null
 
   const normText = normalizationMethod ? normalization[normalizationMethod] : null
   const normDegraded = DEGRADED_METHODS.has(normalizationMethod)
@@ -139,13 +151,13 @@ export default function TranscriptionPanel({
               <div className="transcription-vertical" aria-hidden="true">
                 {cols.map((col, ci) => (
                   <div
-                    className={`transcription-vertical-col${reorderable ? ' reorderable' : ''}${dragOverIdx === ci ? ' drag-over' : ''}`}
+                    className={`transcription-vertical-col${reorderable ? ' reorderable' : ''}${dragOverIdx === ci ? ' drag-over' : ''}${dragOverIdx === ci && dragOverSide ? ` drag-over--${dragOverSide}` : ''}`}
                     key={ci}
                     draggable={reorderable}
                     onDragStart={reorderable ? (e) => handleColDragStart(e, ci) : undefined}
                     onDragOver={reorderable ? (e) => handleColDragOver(e, ci) : undefined}
                     onDrop={reorderable ? (e) => handleColDrop(e, ci) : undefined}
-                    onDragEnd={reorderable ? () => setDragOverIdx(null) : undefined}
+                    onDragEnd={reorderable ? () => { setDragOverIdx(null); setDraggedDomIdx(null) } : undefined}
                   >
                     {charsInSync
                       ? col.map((c) => {
@@ -153,7 +165,7 @@ export default function TranscriptionPanel({
                           return (
                             <span
                               key={idx}
-                              className="transcription-char"
+                              className={`transcription-char${c.deleted ? ' transcription-char--deleted' : ''}`}
                               onMouseEnter={() => setHoveredCharIdx(idx)}
                               onMouseLeave={() => setHoveredCharIdx(null)}
                             >
@@ -164,7 +176,9 @@ export default function TranscriptionPanel({
                                     char={c.char}
                                     score={c.score}
                                     alternates={c.alternates}
+                                    deleted={c.deleted}
                                     onSelect={(altChar) => onSelectAlternate?.(idx, altChar)}
+                                    onToggleDelete={onToggleDeleteChar ? () => onToggleDeleteChar(idx) : undefined}
                                   />
                                 </div>
                               )}
@@ -196,12 +210,20 @@ export default function TranscriptionPanel({
         </div>
       </div>
 
+      {visibleTranscription && !translation && (
+        <div className="export-bar">
+          <span className="export-label">{t('transcriptionPanel.exportLabel')}</span>
+          <button className="btn-export" onClick={onCopy}>{copyLabel}</button>
+          <button className="btn-export" onClick={onDownload}>{t('transcriptionPanel.downloadBtn')}</button>
+        </div>
+      )}
+
       <div className="translate-row">
         {!translating && (
           <button
             className="btn btn-primary"
             onClick={onTranslate}
-            disabled={!transcription}
+            disabled={!visibleTranscription}
           >
             {t('transcriptionPanel.translateBtn')}
           </button>
@@ -236,7 +258,7 @@ export default function TranscriptionPanel({
 
       {translating && (
         <div ref={translatingRef}>
-          <Animation label={t('transcriptionPanel.translatingLabel')} />
+          <Animation label={t('transcriptionPanel.translatingLabel')} progress={translateProgress} />
         </div>
       )}
 

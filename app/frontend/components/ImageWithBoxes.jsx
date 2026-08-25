@@ -3,10 +3,11 @@ import { scoreTier } from '../utils/text'
 import i18next from 'i18next'
 import CharTooltipContent from './CharTooltipContent'
 
-export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onReplace, boxesVisible = true }) {
+export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onToggleDeleteChar, onReplace, boxesVisible = true, onFile, zoomed = false }) {
   const imgRef = useRef(null)
   const [imgDisplaySize, setImgDisplaySize] = useState(null)
   const [hoveredCharIdx, setHoveredCharIdx] = useState(null)
+  const [dragOver, setDragOver] = useState(false)
   const t = i18next.t.bind(i18next)
 
   function onImageLoad() {
@@ -19,8 +20,20 @@ export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onR
     })
   }
 
+  function handleDrop(e) {
+    e.preventDefault()
+    setDragOver(false)
+    const file = e.dataTransfer.files[0]
+    if (file && file.type.startsWith('image/')) onFile?.(file)
+  }
+
   return (
-    <div className="image-overlay-container">
+    <div
+      className={`image-overlay-container${dragOver ? ' drag-over' : ''}${zoomed ? ' zoomed' : ''}`}
+      onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={handleDrop}
+    >
       <img
         ref={imgRef}
         src={imageUrl}
@@ -40,7 +53,7 @@ export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onR
         return (
           <div
             key={i}
-            className={`char-box char-box--${scoreTier(c.score)}${boxesVisible ? '' : ' char-box--hidden'}`}
+            className={`char-box char-box--${scoreTier(c.score)}${boxesVisible ? '' : ' char-box--hidden'}${c.deleted ? ' char-box--deleted' : ''}`}
             style={{
               left: `${leftPct}%`,
               top: `${topPct}%`,
@@ -56,7 +69,9 @@ export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onR
                   char={c.char}
                   score={c.score}
                   alternates={c.alternates}
+                  deleted={c.deleted}
                   onSelect={(altChar) => onSelectAlternate?.(i, altChar)}
+                  onToggleDelete={onToggleDeleteChar ? () => onToggleDeleteChar(i) : undefined}
                 />
               </div>
             )}

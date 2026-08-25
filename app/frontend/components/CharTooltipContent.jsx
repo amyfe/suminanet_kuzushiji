@@ -1,8 +1,25 @@
+import { MdOutlineDeleteOutline, MdOutlineRestoreFromTrash } from 'react-icons/md'
 import i18next from 'i18next'
 import { formatScore } from '../utils/text'
 
-export default function CharTooltipContent({ char, score, alternates, onSelect }) {
+export default function CharTooltipContent({ char, score, alternates, onSelect, onToggleDelete, deleted }) {
   const t = i18next.t.bind(i18next)
+
+  // Reversible toggle, not a removal (a misclick shouldn't be destructive):
+  // marked chars keep showing here so the same button can undo the mark.
+  const deleteButton = onToggleDelete && (
+    <button
+      type="button"
+      className={`tooltip-delete-btn${deleted ? ' tooltip-delete-btn--active' : ''}`}
+      onClick={(e) => {
+        e.stopPropagation()
+        onToggleDelete()
+      }}
+      aria-label={deleted ? t('imageWithBoxes.restoreCharLabel') : t('imageWithBoxes.deleteCharLabel')}
+    >
+      {deleted ? <MdOutlineRestoreFromTrash /> : <MdOutlineDeleteOutline />}
+    </button>
+  )
 
   if (alternates?.length > 0) {
     return (
@@ -25,6 +42,7 @@ export default function CharTooltipContent({ char, score, alternates, onSelect }
             {alt.char} <span className="tooltip-alt-score">{formatScore(alt.prob)}</span>
           </button>
         ))}
+        {deleteButton}
       </div>
     )
   }
@@ -33,6 +51,7 @@ export default function CharTooltipContent({ char, score, alternates, onSelect }
     <div className="tooltip-main">
       <span className="tooltip-char">{char}</span>
       <span className="tooltip-score">{formatScore(score)}</span>
+      {deleteButton}
     </div>
   )
 }

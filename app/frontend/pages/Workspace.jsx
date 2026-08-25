@@ -2,12 +2,15 @@ import UploadArea from '../components/UploadArea'
 import ImageWithBoxes from '../components/ImageWithBoxes'
 import { Animation } from '../components/LoadingIndicator'
 import TranscriptionPanel from './TranscriptionPanel'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { useLocation } from 'react-router'
 import { FaEye, FaEyeSlash } from 'react-icons/fa'
+import { MdOutlineZoomIn, MdOutlineZoomOut } from 'react-icons/md'
 import i18next from 'i18next'
 import { columnsFromChars } from '../utils/text'
 import { apiFetch } from '../utils/api'
+import useSimulatedProgress from '../utils/useSimulatedProgress'
 
 const Workspace = () => {
   const location = useLocation()
@@ -31,6 +34,17 @@ const Workspace = () => {
   const [translating, setTranslating] = useState(false)
   const [copied, setCopied] = useState(false)
   const [boxesVisible, setBoxesVisible] = useState(true)
+  const [zoomed, setZoomed] = useState(false)
+  const transcribeProgress = useSimulatedProgress(transcribing, 10000)
+
+  useEffect(() => {
+    if (!zoomed) return
+    function onKeyDown(e) {
+      if (e.key === 'Escape') setZoomed(false)
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [zoomed])
 
   function handleTranscriptionChange(value) {
     setTranscription(value)
@@ -53,6 +67,7 @@ const Workspace = () => {
     setImageUrl(URL.createObjectURL(file))
     setFileName(file.name)
     resetResults()
+    setZoomed(false)
   }
 
   function replaceImage() {
@@ -60,6 +75,7 @@ const Workspace = () => {
     setImageUrl(null)
     setFileName('')
     resetResults()
+    setZoomed(false)
   }
 
   // chars[i].char is positionally 1:1 with transcription[i] (both built
@@ -77,6 +93,31 @@ const Workspace = () => {
       return codepoints.join('')
     })
   }
+
+  // Marks a detected box as a background element rather than real text --
+  // a reversible flag, not a removal, so a misclick is never destructive.
+  // chars/transcription stay 1:1 in length (nothing spliced out), which
+  // is what every other index-based feature here (alternates, reorder,
+  // hover) relies on; the character is only excluded from what actually
+  // reaches translation/export via `visibleTranscription` below.
+  function handleToggleDeleteChar(index) {
+    setChars((prev) => {
+      const next = [...prev]
+      next[index] = { ...next[index], deleted: !next[index].deleted }
+      return next
+    })
+  }
+
+  // The text actually sent for translation/export excludes chars marked as
+  // background -- this is where that exclusion is applied, on top of the
+  // full chars/transcription that every other index-based feature relies
+  // on. Falls back to the raw transcription once a manual edit has broken
+  // the chars/transcription correspondence (mirrors TranscriptionPanel's
+  // own charsInSync gate).
+  const charsInSync = chars.length > 0 && chars.map((c) => c.char).join('') === transcription
+  const visibleTranscription = charsInSync
+    ? chars.filter((c) => !c.deleted).map((c) => c.char).join('')
+    : transcription
 
   // Manual fix for reading-order mistakes (ticket 6.19): moves a whole
   // column from fromIdx to toIdx. Indices are canonical reading-order
@@ -104,6 +145,7 @@ const Workspace = () => {
   async function transcribe() {
     if (!image) return
     setTranscribing(true)
+    setZoomed(false)
     setChars([])
     setTranscription('')
     try {
@@ -124,7 +166,7 @@ const Workspace = () => {
   }
 
   async function translate() {
-    if (!transcription) return
+    if (!visibleTranscription) return
     setTranslating(true)
     setTranslation('')
     setNormalizedJapanese('')
@@ -136,7 +178,12 @@ const Workspace = () => {
       const res = await apiFetch('/api/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: transcription, chars, lang: targetLang, include_notes: includeNotes }),
+        body: JSON.stringify({
+          text: visibleTranscription,
+          chars: charsInSync ? chars.filter((c) => !c.deleted) : chars,
+          lang: targetLang,
+          include_notes: includeNotes,
+        }),
       })
       const data = await res.json()
       if (!res.ok) {
@@ -161,7 +208,7 @@ const Workspace = () => {
       fileName ? `${t('workspace.resultSourceLabel')}: ${fileName}` : null,
       '',
       t('workspace.resultTranscriptionLabel'),
-      transcription || t('workspace.resultNone'),
+      visibleTranscription || t('workspace.resultNone'),
     ]
     if (translation) {
       const translationLabel = targetLang === 'de' ? t('workspace.resultGermanLabel') : t('workspace.resultEnglishLabel')
@@ -219,28 +266,75 @@ const Workspace = () => {
             <div className="panel-bar">
               {t('workspace.panelOriginal')}
               {hasBoxes && (
-                <button
-                  type="button"
-                  className="panel-eye-toggle"
-                  onClick={() => setBoxesVisible((v) => !v)}
-                  aria-pressed={boxesVisible}
-                  aria-label={boxesVisible ? t('workspace.hideBoxesLabel') : t('workspace.showBoxesLabel')}
-                >
-                  {boxesVisible ? <FaEye /> : <FaEyeSlash />}
-                </button>
+                <div className="panel-bar-actions">
+                  <button
+                    type="button"
+                    className="panel-zoom-toggle"
+                    onClick={() => setZoomed(true)}
+                    aria-label={t('workspace.zoomInLabel')}
+                  >
+                    <MdOutlineZoomIn />
+                  </button>
+                  <button
+                    type="button"
+                    className="panel-eye-toggle"
+                    onClick={() => setBoxesVisible((v) => !v)}
+                    aria-pressed={boxesVisible}
+                    aria-label={boxesVisible ? t('workspace.hideBoxesLabel') : t('workspace.showBoxesLabel')}
+                  >
+                    {boxesVisible ? <FaEye /> : <FaEyeSlash />}
+                  </button>
+                </div>
               )}
             </div>
             <div className="panel-body">
               {transcribing ? (
-                <Animation label={t('workspace.transcribingLabel')} />
+                <Animation label={t('workspace.transcribingLabel')} progress={transcribeProgress} />
               ) : hasBoxes ? (
-                <ImageWithBoxes
-                  imageUrl={imageUrl}
-                  chars={chars}
-                  onSelectAlternate={handleAlternateSelect}
-                  onReplace={replaceImage}
-                  boxesVisible={boxesVisible}
-                />
+                zoomed ? (
+                  // Portaled straight to document.body: .panel-frame/.panel-body
+                  // (here and in the sibling text-panel) each set an explicit
+                  // z-index, which creates a stacking context even at z-index:0.
+                  // A fixed-position overlay nested inside one is trapped
+                  // there for stacking purposes -- it would lose a z-index tie
+                  // against the text-panel's own equally-trapped z-index:0
+                  // context (whichever comes later in the DOM wins ties), so
+                  // rendering it in-place could put the transcription panel on
+                  // top of the "zoomed" image instead of under it. Portaling
+                  // escapes every ancestor's stacking context entirely.
+                  createPortal(
+                    <>
+                      <div className="zoom-backdrop" onClick={() => setZoomed(false)} />
+                      <ImageWithBoxes
+                        imageUrl={imageUrl}
+                        chars={chars}
+                        onSelectAlternate={handleAlternateSelect}
+                        onToggleDeleteChar={handleToggleDeleteChar}
+                        boxesVisible={boxesVisible}
+                        zoomed
+                      />
+                      <button
+                        type="button"
+                        className="zoom-out-btn"
+                        onClick={() => setZoomed(false)}
+                        aria-label={t('workspace.zoomOutLabel')}
+                      >
+                        <MdOutlineZoomOut />
+                      </button>
+                    </>,
+                    document.body
+                  )
+                ) : (
+                  <ImageWithBoxes
+                    imageUrl={imageUrl}
+                    chars={chars}
+                    onSelectAlternate={handleAlternateSelect}
+                    onToggleDeleteChar={handleToggleDeleteChar}
+                    onReplace={replaceImage}
+                    boxesVisible={boxesVisible}
+                    onFile={handleFile}
+                  />
+                )
               ) : (
                 <UploadArea imageUrl={imageUrl} onFile={handleFile} />
               )}
@@ -267,10 +361,12 @@ const Workspace = () => {
         <div className="text-panel">
           <TranscriptionPanel
             transcription={transcription}
+            visibleTranscription={visibleTranscription}
             chars={chars}
             onTranscriptionChange={handleTranscriptionChange}
             onReorderColumns={handleColumnReorder}
             onSelectAlternate={handleAlternateSelect}
+            onToggleDeleteChar={handleToggleDeleteChar}
             onTranslate={translate}
             translating={translating}
             translation={translation}

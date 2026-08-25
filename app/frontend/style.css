@@ -466,7 +466,14 @@ a { color: inherit; }
   z-index: 1;
 }
 
-.panel-eye-toggle {
+.panel-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.panel-eye-toggle,
+.panel-zoom-toggle {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -479,12 +486,14 @@ a { color: inherit; }
   transition: color 0.15s, background 0.15s;
 }
 
-.panel-eye-toggle svg {
+.panel-eye-toggle svg,
+.panel-zoom-toggle svg {
   width: 20px;
   height: 20px;
 }
 
-.panel-eye-toggle:hover {
+.panel-eye-toggle:hover,
+.panel-zoom-toggle:hover {
   color: var(--ink-2);
   background: rgba(33, 29, 24, 0.06);
 }
@@ -497,6 +506,21 @@ a { color: inherit; }
   z-index: 1;
 }
 
+.image-overlay-container.drag-over {
+  outline: 2px dashed var(--accent);
+  outline-offset: 4px;
+}
+
+.image-overlay-container.zoomed {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 200;
+  max-width: 90vw;
+  max-height: 90vh;
+}
+
 .overlay-image {
   width: 100%;
   height: auto;
@@ -505,6 +529,13 @@ a { color: inherit; }
 
 .overlay-image.replaceable {
   cursor: pointer;
+}
+
+.image-overlay-container.zoomed .overlay-image {
+  width: auto;
+  height: auto;
+  max-width: 90vw;
+  max-height: 90vh;
 }
 
 .image-overlay-container .replace-hint {
@@ -525,6 +556,42 @@ a { color: inherit; }
 
 .image-overlay-container:hover .replace-hint {
   opacity: 1;
+}
+
+.zoom-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+  z-index: 199;
+  cursor: zoom-out;
+}
+
+.zoom-out-btn {
+  position: fixed;
+  top: 1.25rem;
+  right: 1.25rem;
+  z-index: 201;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  background: rgba(33, 29, 24, 0.55);
+  border: 1px solid rgba(251, 247, 236, 0.35);
+  border-radius: 50%;
+  color: #fbf7ec;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.zoom-out-btn svg {
+  width: 24px;
+  height: 24px;
+}
+
+.zoom-out-btn:hover {
+  background: rgba(33, 29, 24, 0.75);
+  color: #fff;
 }
 
 .char-box {
@@ -577,6 +644,15 @@ a { color: inherit; }
    even while this class hides the border. */
 .char-box--hidden {
   border-color: transparent;
+}
+
+/* Marked as background/not-text (reversible -- see tooltip-delete-btn).
+   Comes after --hidden so a marked box still reads as dashed red even
+   while the "hide all boxes" eye toggle is off; the mark is a deliberate
+   annotation, not detection clutter. */
+.char-box--deleted {
+  border-style: dashed;
+  border-color: rgba(198, 40, 40, 0.85);
 }
 
 .char-tooltip {
@@ -665,6 +741,43 @@ a { color: inherit; }
   font-size: 0.6rem;
 }
 
+.tooltip-delete-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 2px;
+  background: none;
+  border: none;
+  color: #e07a6b;
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 3px;
+  transition: background 0.12s, color 0.12s;
+}
+
+.tooltip-delete-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.tooltip-delete-btn:hover,
+.tooltip-delete-btn:focus-visible {
+  color: #fff;
+  background: rgba(224, 122, 107, 0.35);
+  outline: none;
+}
+
+/* Currently marked as background -- button now offers to restore it. */
+.tooltip-delete-btn--active {
+  color: #fff;
+  background: rgba(224, 122, 107, 0.45);
+}
+
+.tooltip-delete-btn--active:hover,
+.tooltip-delete-btn--active:focus-visible {
+  background: rgba(224, 122, 107, 0.6);
+}
+
 /* Read-only vertical-column rendering of the transcription, traditional
    right-to-left kanbun layout. Sits above the editable horizontal textarea. */
 .transcription-vertical {
@@ -687,11 +800,19 @@ a { color: inherit; }
 }
 
 /* Each column renders its own chars top-to-bottom; the container's flex row
-   (with columnsOf's already-reversed DOM order) places columns right-to-left. */
+   (with columnsOf's already-reversed DOM order) places columns right-to-left.
+   max-height (not the row's overflow-y) is what makes a too-long column wrap
+   -- browsers naturally continue vertical-rl text on a new line to the left
+   once it runs out of vertical room, exactly like horizontal text wraps at
+   its container's width, so a long column visually breaks into a second
+   line right next to the first instead of requiring the whole panel to
+   scroll. It stays one element/one array entry throughout -- purely a
+   rendering effect, dragging still moves the whole (now wrapped) column. */
 .transcription-vertical-col {
   writing-mode: vertical-rl;
   letter-spacing: 0.05em;
   border-radius: 3px;
+  max-height: 420px;
   transition: background 0.12s, outline-color 0.12s;
 }
 
@@ -715,6 +836,17 @@ a { color: inherit; }
   outline-offset: 2px;
 }
 
+/* Precise insertion-point indicator on top of the general drag-over tint
+   above -- shows exactly which edge the dragged column will land at.
+   box-shadow (not border) so it doesn't shift layout as it toggles. */
+.transcription-vertical-col.drag-over--left {
+  box-shadow: -3px 0 0 0 var(--accent);
+}
+
+.transcription-vertical-col.drag-over--right {
+  box-shadow: 3px 0 0 0 var(--accent);
+}
+
 /* Per-character hover target for viewing/picking top-3 candidates. */
 .transcription-char {
   position: relative;
@@ -725,6 +857,19 @@ a { color: inherit; }
 
 .transcription-char:hover {
   background: rgba(178, 58, 43, 0.12);
+}
+
+/* Marked as background/not-text -- deliberately subtle (pastel tint, muted
+   ink) so it reads as "excluded" without disrupting the reading flow the
+   way the dashed red image box does; reversible via the same tooltip
+   button that marked it. */
+.transcription-char--deleted {
+  background: rgba(198, 40, 40, 0.1);
+  color: rgba(140, 60, 55, 0.55);
+}
+
+.transcription-char--deleted:hover {
+  background: rgba(198, 40, 40, 0.18);
 }
 
 /* A column is one glyph wide, so popping the tooltip above/below (like

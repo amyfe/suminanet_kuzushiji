@@ -13,3 +13,33 @@
   min-height: 200px;
   border: none;
 }
+
+.loading-progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 180px;
+}
+
+.loading-progress {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(33, 29, 24, 0.1);
+  overflow: hidden;
+}
+
+.loading-progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.2s ease;
+}
+
+.loading-progress-pct {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--label);
+  min-width: 2.2em;
+  text-align: right;
+}

@@ -60,7 +60,9 @@
         "replaceImageBtn": "Upload new image",
         "replaceImageHint": "Click image to replace",
         "showBoxesLabel": "Show detected characters",
-        "hideBoxesLabel": "Hide detected characters"
+        "hideBoxesLabel": "Hide detected characters",
+        "zoomInLabel": "Zoom in",
+        "zoomOutLabel": "Zoom out"
     },
     "transcriptionPanel": {
         "panelHeader": "TRANSCRIPTION · 翻刻",
@@ -95,7 +97,9 @@
     },
     "imageWithBoxes": {
         "overlayAlt": "Manuscript with annotations",
-        "useAlternate": "Use {{char}} instead"
+        "useAlternate": "Use {{char}} instead",
+        "deleteCharLabel": "Mark as background (not text)",
+        "restoreCharLabel": "Restore — treat as text again"
     },
     "about": {
         "eyebrow": "ABOUT · 沿革",
