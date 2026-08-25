@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { columnsOf, columnsFromChars } from '../utils/text'
 import { Animation } from '../components/LoadingIndicator'
+import CharTooltipContent from '../components/CharTooltipContent'
 import i18next from 'i18next'
 
 const VERTICAL_TARGET_CHARS_PER_COL = 14
@@ -21,6 +22,7 @@ export default function TranscriptionPanel({
   chars,
   onTranscriptionChange,
   onReorderColumns,
+  onSelectAlternate,
   onTranslate,
   translating,
   translation,
@@ -45,6 +47,7 @@ export default function TranscriptionPanel({
   }
   const [dragOverIdx, setDragOverIdx] = useState(null)
   const [showIntermediate, setShowIntermediate] = useState(false)
+  const [hoveredCharIdx, setHoveredCharIdx] = useState(null)
 
   useEffect(() => {
     if (!includeNotes) setShowIntermediate(false)
@@ -56,15 +59,25 @@ export default function TranscriptionPanel({
   // and characters are no longer in correspondence, so fall back to a naive
   // fixed-length chunking of the string instead.
   const charsInSync = chars && chars.length > 0 && chars.map((c) => c.char).join('') === transcription
+  // Object-reference map from each char back to its position in the flat
+  // chars/transcription arrays (columnsFromChars groups the same object
+  // references, never clones), so a click deep inside a column can still
+  // call onSelectAlternate with the right index.
+  const charIndex = charsInSync ? new Map(chars.map((c, i) => [c, i])) : null
   let cols = []
   if (charsInSync) {
-    cols = columnsFromChars(chars).reverse().map((col) => col.map((c) => c.char))
+    cols = columnsFromChars(chars).reverse()
   } else if (transcription) {
     cols = columnsOf(transcription, Math.max(1, Math.ceil(Array.from(transcription).length / VERTICAL_TARGET_CHARS_PER_COL)))
   }
   // Reordering only makes sense against real box-derived columns (not the
   // naive fallback chunking), and only when there's more than one column.
   const reorderable = charsInSync && cols.length > 1
+  // Same real-columns requirement as reorderable, but no column-count floor
+  // -- a single-column page still benefits from per-character correction.
+  // Only worth advertising when some char actually has a runner-up beyond
+  // its own chosen pick.
+  const hasAlternates = charsInSync && chars.some((c) => c.alternates?.length > 1)
 
   // Ticket 6.8: mirror the vertical-column view's structure in the flat
   // horizontal textarea below it by breaking at the same column boundaries
@@ -127,12 +140,39 @@ export default function TranscriptionPanel({
                     onDrop={reorderable ? (e) => handleColDrop(e, ci) : undefined}
                     onDragEnd={reorderable ? () => setDragOverIdx(null) : undefined}
                   >
-                    {col.join('')}
+                    {charsInSync
+                      ? col.map((c) => {
+                          const idx = charIndex.get(c)
+                          return (
+                            <span
+                              key={idx}
+                              className="transcription-char"
+                              onMouseEnter={() => setHoveredCharIdx(idx)}
+                              onMouseLeave={() => setHoveredCharIdx(null)}
+                            >
+                              {c.char}
+                              {hoveredCharIdx === idx && (
+                                <div className="char-tooltip char-tooltip--vertical" draggable={false}>
+                                  <CharTooltipContent
+                                    char={c.char}
+                                    score={c.score}
+                                    alternates={c.alternates}
+                                    onSelect={(altChar) => onSelectAlternate?.(idx, altChar)}
+                                  />
+                                </div>
+                              )}
+                            </span>
+                          )
+                        })
+                      : col.join('')}
                   </div>
                 ))}
               </div>
               {reorderable && (
                 <p className="transcription-hint">{t('transcriptionPanel.reorderHint')}</p>
+              )}
+              {hasAlternates && (
+                <p className="transcription-hint">{t('transcriptionPanel.alternatesHint')}</p>
               )}
             </>
           )}

@@ -52,6 +52,11 @@ def _num_groups(stem: str) -> int:
     return len(Counter(col_ids.detach().cpu().tolist()))
 
 
+def _orientation(stem: str) -> str:
+    ann = json.loads((ROOT / "assets" / "data" / "annotations" / f"{stem}.json").read_text(encoding="utf-8"))
+    return infer_reading_orientation_from_boxes(ann["boxes"])
+
+
 def test_skewed_dense_page_no_longer_collapses() -> None:
     # Directly reproduces the exact gap distribution measured on brsk004_014
     # (389 deduped GT boxes, 12 true columns): the elbow-argmax already finds
@@ -119,6 +124,36 @@ def test_genuine_single_column_pages_stay_one_group() -> None:
     assert _num_groups("hnsd007_021") == 1
 
 
+def test_short_vertical_columns_no_longer_misclassified_horizontal() -> None:
+    # infer_reading_orientation_from_boxes's mean-nearest-neighbor-distance
+    # heuristic misclassifies short (2-4 char) vertical columns as
+    # "horizontal", because with few characters per column the between-
+    # column jump is comparable to or larger than the within-column step.
+    # A full corpus sweep (5344 annotation files) found 22 pages the
+    # heuristic ever calls "horizontal"; 21 of them are this misclassification
+    # (spot-checked by hand against raw box coordinates). Sample spanning the
+    # affected size range, from the originally-confirmed n=7 caption to a
+    # dense n=56 page.
+    for stem in [
+        "200021925_00012_1",  # n=7, originally-confirmed bug
+        "200019865_00047_1",  # n=24
+        "200021660_00077_2",  # n=56, dense
+    ]:
+        assert _orientation(stem) == "vertical", f"{stem} still misclassified horizontal"
+
+
+def test_genuine_horizontal_stamp_stays_horizontal() -> None:
+    # 200021851_00030_2 is a real printed library-archive stamp
+    # ("国文学研究資料館" + a date) at the bottom of the page -- genuinely
+    # left-to-right, and the one confirmed true positive among the 22 pages
+    # the orientation heuristic ever flags "horizontal". The clustering
+    # corroboration must not flip this one: unlike the misclassified vertical
+    # pages, clustering it as columns does not find more groups than
+    # clustering it as rows (both collapse to a single group), so the
+    # override does not fire.
+    assert _orientation("200021851_00030_2") == "horizontal"
+
+
 def main() -> None:
     test_skewed_dense_page_no_longer_collapses()
     test_skewed_dense_page_model_inference_also_recovers()
@@ -128,6 +163,8 @@ def main() -> None:
     test_brsk005_005_sibling_page_unregressed()
     test_100249537_00062_2_real_page_not_merged()
     test_genuine_single_column_pages_stay_one_group()
+    test_short_vertical_columns_no_longer_misclassified_horizontal()
+    test_genuine_horizontal_stamp_stays_horizontal()
     print("PASS: ROIReadingOrder gap-threshold regression checks")
 
 

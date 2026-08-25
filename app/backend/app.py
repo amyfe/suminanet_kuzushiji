@@ -326,14 +326,7 @@ async def transcribe(
                 _state["vocab"],
                 orientation=orientation,
                 score_thresh=score_thresh,
-                # Column-gap synthesis fabricates placeholder boxes for the
-                # Stage 2 classifier to read, a code path validate_suminanet.py
-                # never exercises -- unlike the rest of the pipeline, it has no
-                # measured accuracy impact. Confirmed via a real transcription
-                # request producing collapsed, repeated characters (e.g. 客客)
-                # that fill_gaps=False resolves cleanly. Leave off until the
-                # heuristic is validated against ground truth.
-                fill_gaps=False,
+                fill_gaps=True,
             ),
             timeout=TRANSCRIBE_INFERENCE_TIMEOUT_SEC,
         )

@@ -59,6 +59,48 @@ import torch
 from config import SUMINANET_READING_ORDER_CONFIDENCE, STAGE2_READING_ORDER_LINE_THRESH_RATIO
 
 
+def _corroborate_horizontal_with_clustering(boxes, debug: bool = False) -> str:
+    """
+    Second opinion for a tentative "horizontal" call from the nearest-neighbor
+    dx/dy heuristic above, which was found to misclassify short vertical
+    columns (2-4 chars/column) as horizontal: with few characters per column,
+    the between-column jump distance is comparable to or larger than the
+    within-column step, making the page's mean nearest-neighbor dx look
+    "row-like" even though it's genuinely a right-to-left column layout. A
+    full sweep of every page the heuristic ever calls "horizontal" (22/5344)
+    found this misclassifies 21/22 of them; the one confirmed genuine case
+    (a printed library-archive stamp) is a single tight text block that does
+    not cluster into multiple short columns.
+
+    Re-clusters the same boxes both ways -- as columns (the real vertical
+    sort path) and as rows (the real horizontal sort path) -- via
+    ROIReadingOrder's own column/row detection, and checks which axis finds
+    genuine multi-group structure. Short vertical columns cluster cleanly
+    into several small column-groups while collapsing into few/degenerate
+    row-groups (rows and columns are order-independent of self here -- see
+    ROIReadingOrder._vertical_sort_indices/_horizontal_sort_indices, neither
+    of which reads any instance state). A real horizontal block does the
+    reverse or ties. Only overrides toward "vertical"; never overrides
+    toward "horizontal" -- the nearest-neighbor heuristic already handles the
+    dominant vertical case correctly, so this stays scoped to the one
+    confirmed failure direction.
+    """
+    boxes_t = torch.as_tensor(boxes, dtype=torch.float32)
+    ror = ROIReadingOrder()
+    _, col_ids = ror._vertical_sort_indices(boxes_t)
+    _, row_ids = ror._horizontal_sort_indices(boxes_t)
+    num_cols = int(col_ids.max().item()) + 1 if col_ids.numel() else 0
+    num_rows = int(row_ids.max().item()) + 1 if row_ids.numel() else 0
+
+    orientation = "vertical" if num_cols > num_rows else "horizontal"
+    if debug:
+        print(
+            f"[ROI ORI DEBUG] clustering corroboration | num_cols={num_cols} | "
+            f"num_rows={num_rows} -> {orientation}"
+        )
+    return orientation
+
+
 def infer_reading_orientation_from_boxes(boxes, debug: bool = False) -> str:
     """Infer reading direction from nearest-neighbor center distances."""
     if boxes is None or len(boxes) < 2:
@@ -93,6 +135,9 @@ def infer_reading_orientation_from_boxes(boxes, debug: bool = False) -> str:
     # Vertical pages tend to form tight x-aligned columns (small nearest-neighbor dx),
     # while horizontal pages tend to form tight y-aligned rows (small nearest-neighbor dy).
     orientation = "vertical" if mean_min_dx <= mean_min_dy else "horizontal"
+
+    if orientation == "horizontal":
+        orientation = _corroborate_horizontal_with_clustering(boxes, debug=debug)
 
     if debug:
         print(

@@ -305,7 +305,7 @@ class KuzushijiDataset(Dataset):
         # Sequence for ATTENTION Decoder
         # ---------------------------
         if self.use_sequences and self.vocab is not None:
-            seq = labels  # already sorted
+            seq = labels  # raw annotation-array order (see comment above)
             seq_ids = self.vocab.encode(seq, add_sos=True, add_eos=True)
 
             sample["text_ids"] = torch.tensor(seq_ids, dtype=torch.long)

@@ -63,6 +63,7 @@
         "placeholder": "Lesung eingeben oder korrigieren…",
         "hint": "Führen Sie „Transkribieren\" für einen Scan aus, oder geben Sie klassisches Japanisch direkt ein, und übersetzen Sie anschließend.",
         "reorderHint": "Lesereihenfolge falsch? Ziehen Sie eine Spalte an eine andere Stelle.",
+        "alternatesHint": "Zeichen falsch erkannt? Fahren Sie mit der Maus darüber, um andere Kandidaten zu sehen.",
         "translateBtn": "Übersetzen",
         "translatingBtn": "Übersetze...",
         "translatingLabel": "Klassisches Japanisch wird übersetzt…",
@@ -152,7 +153,7 @@
             {
                 "heading": "Verantwortlicher",
                 "paragraphs": [
-                    "Amina Felic, Hammarskjöldring 156, 60439 Frankfurt am Main, Deutschland.",
+                    "Amina Felic, Goethe Universität, Bockenheimer Landstraße 133, Frankfurt am Main, Deutschland.",
                     "E-Mail: felic.amina@gmail.com",
                     "Mit dieser Datenschutzerklärung erklären wir, welche personenbezogenen Daten wir im Rahmen der Bereitstellung der Sumina-Anwendung verarbeiten, zu welchen Zwecken und in welchem Umfang."
                 ]
@@ -217,8 +218,9 @@
         "heading": "Angaben gemäß § 5 DDG",
         "nameLabel": "Amina Felic",
         "addressLines": [
-            "Hammarskjöldring 156",
-            "60439 Frankfurt am Main",
+            "Goethe Universität",
+            "Bockenheimer Landstraße 133",
+            "Frankfurt am Main",
             "Deutschland"
         ],
         "contactHeading": "Kontakt",

@@ -1,6 +1,7 @@
 import { useState, useRef } from 'react'
-import { scoreTier, formatScore } from '../utils/text'
+import { scoreTier } from '../utils/text'
 import i18next from 'i18next'
+import CharTooltipContent from './CharTooltipContent'
 
 export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onReplace }) {
   const imgRef = useRef(null)
@@ -51,33 +52,12 @@ export default function ImageWithBoxes({ imageUrl, chars, onSelectAlternate, onR
           >
             {hoveredCharIdx === i && (
               <div className="char-tooltip">
-                {c.alternates?.length > 0 ? (
-                  <div className="tooltip-alternates">
-                    {c.alternates.slice(0, 3).map((alt, ai) => (
-                      <button
-                        type="button"
-                        // Backend guarantees all candidates in c.alternates are
-                        // distinct chars (vocab is a char<->id bijection, and the
-                        // chosen id is excluded when collecting runner-ups), so
-                        // char equality is a safe way to mark the active pick.
-                        className={`tooltip-alt-char${alt.char === c.char ? ' tooltip-alt-char--active' : ''}`}
-                        key={ai}
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          onSelectAlternate?.(i, alt.char)
-                        }}
-                        aria-label={t('imageWithBoxes.useAlternate', { char: alt.char })}
-                      >
-                        {alt.char} <span className="tooltip-alt-score">{formatScore(alt.prob)}</span>
-                      </button>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="tooltip-main">
-                    <span className="tooltip-char">{c.char}</span>
-                    <span className="tooltip-score">{formatScore(c.score)}</span>
-                  </div>
-                )}
+                <CharTooltipContent
+                  char={c.char}
+                  score={c.score}
+                  alternates={c.alternates}
+                  onSelect={(altChar) => onSelectAlternate?.(i, altChar)}
+                />
               </div>
             )}
           </div>

@@ -17,7 +17,7 @@
         "howTitle": "How it works",
         "how_steps": [
             { "step": 1, "title": "Upload a scan", "body": "Drop in a photograph or scan of any woodblock print or handwritten manuscript — modern or Edo-era." },
-            { "step": 2, "title": "Transcribe & correct", "body": "SuminaNet detects each cursive character and proposes a reading. You review and fix anything it misjudged." },
+            { "step": 2, "title": "Transcribe & correct", "body": "SuminaNet detects each cursive character and proposes a reading. You review the results and correct anything it missclassified." },
             { "step": 3, "title": "Translate", "body": "Get fluent English alongside the original, drawn straight from the corrected transcription." }
         ],
         "examplesEyebrow": "SELECT A TEXT · 用例",
@@ -65,6 +65,7 @@
         "placeholder": "Type or correct the reading…",
         "hint": "Run Transcribe on a scan, or type/paste classical Japanese directly, then Translate.",
         "reorderHint": "Reading order looks wrong? Drag a column to move it.",
+        "alternatesHint": "Character looks wrong? Hover it to see other candidates.",
         "translateBtn": "Translate",
         "translatingBtn": "Translating...",
         "translatingLabel": "Translating classical Japanese…",
@@ -162,7 +163,7 @@
             {
                 "heading": "Responsible party",
                 "paragraphs": [
-                    "Amina Felic, Hammarskjöldring 156, 60439 Frankfurt am Main, Germany.",
+                    "Amina Felic, Goethe Universität, Bockenheimer Landstraße 133, Frankfurt am Main, Deutschland.",
                     "Email: felic.amina@gmail.com",
                     "This privacy policy explains which personal data we process, for what purposes, and to what extent as part of providing the Sumina application."
                 ]
@@ -227,8 +228,9 @@
         "heading": "Information pursuant to Section 5 DDG (German Digital Services Act)",
         "nameLabel": "Amina Felic",
         "addressLines": [
-            "Hammarskjöldring 156",
-            "60439 Frankfurt am Main",
+            "Goethe Universität",
+            "Bockenheimer Landstraße 133",
+            "Frankfurt am Main",
             "Germany"
         ],
         "contactHeading": "Contact",

@@ -252,6 +252,7 @@ const Workspace = () => {
             chars={chars}
             onTranscriptionChange={handleTranscriptionChange}
             onReorderColumns={handleColumnReorder}
+            onSelectAlternate={handleAlternateSelect}
             onTranslate={translate}
             translating={translating}
             translation={translation}
