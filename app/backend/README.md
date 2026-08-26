@@ -112,26 +112,3 @@ the model into memory and enforce rate limits per-process instead of globally.
 For a production systemd deployment, see
 [`deploy/README.md`](../../deploy/README.md) and
 [`deploy/systemd/sumina-backend.service`](../../deploy/systemd/sumina-backend.service).
-
-## Hardware requirements
-
-- CPU-only works (either because no CUDA device is present, or as the automatic
-  per-request/startup fallback described above) but is slow for transcription; a
-  CUDA GPU is recommended for the detector/recognizer forward pass.
-- No GPU is required for the translation step (that's an API call to Claude).
-- See [`../../INSTALL.md`](../../INSTALL.md) for full system dependencies (MeCab,
-  UniDic download, SAM2 weights — SAM2 is training-only, **not** loaded at inference).
-
-## Not yet production-hardened
-
-Flagging for visibility before going live:
-- Rate limiting is per-process, in-memory — resets on restart, and only enforces
-  correctly with exactly one Uvicorn worker/replica (see **Running** above). If this
-  ever needs to scale horizontally, the rate-limit and model-state dicts need to
-  move to a shared store (e.g. Redis) first.
-- Auth is a shared API key readable in the frontend bundle (see `API_KEY` above) —
-  a deterrent against bots/scraping, not real access control. A targeted actor can
-  read the key out of the built JS and call the API directly.
-- No HTTPS/TLS termination in this app itself — expected to sit behind a reverse
-  proxy (nginx, Caddy, cloud load balancer) that terminates TLS.
-- No structured request logging/metrics beyond Python's `logging` module.
